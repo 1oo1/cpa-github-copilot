@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
 type recordedHostCall struct {
@@ -15,11 +17,20 @@ type recordedHostCall struct {
 type fakeBridge struct {
 	mu      sync.Mutex
 	calls   []recordedHostCall
+	logs    []rpcHostLogRequest
 	handler func(string, any) (any, error)
 }
 
 func (f *fakeBridge) Call(method string, payload any) (json.RawMessage, error) {
 	f.mu.Lock()
+	if method == pluginabi.MethodHostLog {
+		request, ok := payload.(rpcHostLogRequest)
+		if ok {
+			f.logs = append(f.logs, request)
+		}
+		f.mu.Unlock()
+		return json.RawMessage(`{}`), nil
+	}
 	f.calls = append(f.calls, recordedHostCall{Method: method, Payload: payload})
 	handler := f.handler
 	f.mu.Unlock()
@@ -38,6 +49,12 @@ func (f *fakeBridge) snapshot() []recordedHostCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]recordedHostCall(nil), f.calls...)
+}
+
+func (f *fakeBridge) snapshotLogs() []rpcHostLogRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]rpcHostLogRequest(nil), f.logs...)
 }
 
 func decodePluginResult[T any](t *testing.T, raw []byte) T {

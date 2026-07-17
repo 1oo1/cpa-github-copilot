@@ -22,6 +22,7 @@ type preparedInference struct {
 	upstreamFormat   string
 	translatorFormat string
 	upstreamURL      string
+	upstreamPath     string
 	upstreamPayload  []byte
 	headers          http.Header
 }
@@ -33,8 +34,10 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 	}
 	prepared, failure := s.prepareInference(req.ExecutorRequest, false)
 	if failure != nil {
+		s.logFailure(req.HostCallbackID, "inference.rejected", failure, inferenceRequestLogFields(req.ExecutorRequest, false, s.now().UTC()))
 		return nil, failure
 	}
+	s.logEvent(req.HostCallbackID, "debug", "inference.started", preparedInferenceLogFields(prepared, false))
 	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     prepared.upstreamURL,
@@ -42,10 +45,14 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		Body:    prepared.upstreamPayload,
 	})
 	if errHTTP != nil {
-		return nil, &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		failure = &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		s.logFailure(req.HostCallbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
+		return nil, failure
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, upstreamFailure("upstream_http_error", "GitHub Copilot request failed", resp.StatusCode)
+		failure = upstreamFailure("upstream_http_error", "GitHub Copilot request failed", resp.StatusCode)
+		s.logFailure(req.HostCallbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
+		return nil, failure
 	}
 	payload := append([]byte(nil), resp.Body...)
 	if prepared.translatorFormat != prepared.outputFormat {
@@ -78,6 +85,10 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		}
 	}
 	headers := cloneResponseHeaders(resp.Headers, "application/json")
+	completedFields := preparedInferenceLogFields(prepared, false)
+	completedFields["upstream_status"] = resp.StatusCode
+	completedFields["output_bytes"] = len(payload)
+	s.logEvent(req.HostCallbackID, "debug", "inference.completed", completedFields)
 	return okEnvelope(pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: headers,
@@ -161,9 +172,48 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 		upstreamFormat:   route.Format,
 		translatorFormat: translationTarget,
 		upstreamURL:      baseURL + route.Path,
+		upstreamPath:     route.Path,
 		upstreamPayload:  payload,
 		headers:          inferenceHeaders(storage.CopilotSessionToken, route.Format, payload, req.Headers),
 	}, nil
+}
+
+func inferenceRequestLogFields(req pluginapi.ExecutorRequest, stream bool, now time.Time) map[string]any {
+	model := normalizeModelID(req.Model)
+	if model == "" {
+		model = modelFromPayload(req.Payload)
+	}
+	fields := map[string]any{
+		"auth_id":       req.AuthID,
+		"model":         model,
+		"format":        normalizeFormat(req.Format),
+		"source_format": normalizeFormat(req.SourceFormat),
+		"stream":        stream,
+		"input_bytes":   len(req.Payload),
+	}
+	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
+	fields["storage_valid"] = errStorage == nil
+	if errStorage == nil {
+		for key, value := range authLogFields(storage, now) {
+			fields[key] = value
+		}
+	}
+	return fields
+}
+
+func preparedInferenceLogFields(prepared preparedInference, stream bool) map[string]any {
+	return map[string]any{
+		"auth_id":            prepared.request.AuthID,
+		"model":              prepared.model,
+		"input_format":       prepared.inputFormat,
+		"output_format":      prepared.outputFormat,
+		"upstream_format":    prepared.upstreamFormat,
+		"translator_format":  prepared.translatorFormat,
+		"translation_needed": prepared.translatorFormat != prepared.outputFormat,
+		"endpoint_path":      prepared.upstreamPath,
+		"stream":             stream,
+		"upstream_bytes":     len(prepared.upstreamPayload),
+	}
 }
 
 func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([]byte, error) {
@@ -288,16 +338,22 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 	}
 	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil || strings.TrimSpace(storage.CopilotSessionToken) == "" {
-		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
+		failure := &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "credential_validation"})
+		return nil, failure
 	}
 	githubHost, errHost := normalizeGitHubHost(storage.GitHubHost)
 	if errHost != nil || githubHost != s.loadedConfig().GitHubHost ||
 		(storage.ExpiresAt > 0 && !s.now().UTC().Before(timeFromUnixMilli(storage.ExpiresAt))) {
-		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is not valid for this configuration", httpStatus: http.StatusUnauthorized}
+		failure := &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is not valid for this configuration", httpStatus: http.StatusUnauthorized}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, authLogFields(storage, s.now().UTC()))
+		return nil, failure
 	}
 	baseURL := apiBaseFromSessionToken(storage.CopilotSessionToken, storage.GitHubHost)
 	if baseURL == "" || !sameOrigin(req.URL, baseURL) {
-		return nil, &pluginFailure{code: "invalid_request", message: "GitHub Copilot HTTP request must target the credential API origin", httpStatus: http.StatusBadRequest}
+		failure := &pluginFailure{code: "invalid_request", message: "GitHub Copilot HTTP request must target the credential API origin", httpStatus: http.StatusBadRequest}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "origin_validation"})
+		return nil, failure
 	}
 	model := modelFromPayload(req.Body)
 	format := inferModelFormat(model)
@@ -309,8 +365,16 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 		Body:    append([]byte(nil), req.Body...),
 	})
 	if errHTTP != nil {
-		return nil, &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot HTTP request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		failure := &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot HTTP request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		s.logFailure(req.HostCallbackID, "http_request.failed", failure, map[string]any{"model": model})
+		return nil, failure
 	}
+	s.logEvent(req.HostCallbackID, "debug", "http_request.completed", map[string]any{
+		"model":           model,
+		"upstream_format": format,
+		"upstream_status": resp.StatusCode,
+		"output_bytes":    len(resp.Body),
+	})
 	return okEnvelope(pluginapi.ExecutorHTTPResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    cloneResponseHeaders(resp.Headers, "application/json"),

@@ -170,8 +170,9 @@ success/error/cancellation path.
 - Errors use stable categories and HTTP status only. JSON decoder errors are
   wrapped with field/context names but never the source payload.
 - Tests will scan emitted host-log requests and error strings with sentinel
-  secrets. The implementation does not need operational token-bearing logs;
-  request logging remains the host bridge's responsibility and policy.
+  secrets. Structured operational diagnostics use `host.log` for lifecycle,
+  auth freshness, model discovery/cache, routing, and stream outcomes; request
+  and response body logging remains the host bridge's responsibility and policy.
 
 ## 8. Verification matrix
 

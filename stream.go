@@ -23,8 +23,10 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 	}
 	prepared, failure := s.prepareInference(req.ExecutorRequest, true)
 	if failure != nil {
+		s.logFailure(req.HostCallbackID, "inference.rejected", failure, inferenceRequestLogFields(req.ExecutorRequest, true, s.now().UTC()))
 		return nil, failure
 	}
+	s.logEvent(req.HostCallbackID, "debug", "inference.stream.started", preparedInferenceLogFields(prepared, true))
 	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
 	upstream, errOpen := client.openStream(pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
@@ -33,12 +35,19 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 		Body:    prepared.upstreamPayload,
 	})
 	if errOpen != nil {
-		return nil, &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot stream request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		failure = &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot stream request failed", retryable: true, httpStatus: http.StatusBadGateway}
+		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		return nil, failure
 	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		client.closeStream(upstream.StreamID)
-		return nil, upstreamFailure("upstream_http_error", "GitHub Copilot stream request failed", upstream.StatusCode)
+		failure = upstreamFailure("upstream_http_error", "GitHub Copilot stream request failed", upstream.StatusCode)
+		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		return nil, failure
 	}
+	openedFields := preparedInferenceLogFields(prepared, true)
+	openedFields["upstream_status"] = upstream.StatusCode
+	s.logEvent(req.HostCallbackID, "debug", "inference.stream.opened", openedFields)
 	go s.forwardCopilotStream(client, streamID, upstream.StreamID, prepared)
 	headers := cloneResponseHeaders(http.Header(upstream.Headers), "text/event-stream")
 	headers.Set("Content-Type", "text/event-stream")
@@ -48,25 +57,47 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
 	errorMessage := ""
 	defer func() {
-		if recover() != nil {
+		panicked := recover() != nil
+		if panicked {
 			errorMessage = "GitHub Copilot stream forwarding failed"
+		}
+		fields := preparedInferenceLogFields(prepared, true)
+		fields["success"] = errorMessage == ""
+		fields["panicked"] = panicked
+		if errorMessage == "" {
+			s.logEvent(client.callbackID, "debug", "inference.stream.completed", fields)
+		} else {
+			s.logEvent(client.callbackID, "warn", "inference.stream.forward_failed", fields)
 		}
 		client.closeStream(upstreamStreamID)
 		client.closePluginStream(pluginStreamID, errorMessage)
 	}()
+	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		if errForward := forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID); errForward != nil {
+		if errForward := forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer); errForward != nil {
 			errorMessage = errForward.Error()
 		}
 		return
 	}
-	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if errForward := forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer); errForward != nil {
 		errorMessage = errForward.Error()
 	}
 }
 
-func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string) error {
+func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string, maxBuffer int) error {
+	framer := newSSEFramer(maxBuffer)
+	emitFrame := func(frame []byte) error {
+		if len(frame) == 0 {
+			return nil
+		}
+		payload := make([]byte, 0, len(frame)+2)
+		payload = append(payload, frame...)
+		payload = append(payload, '\n', '\n')
+		if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
+			return fmt.Errorf("GitHub Copilot downstream stream closed")
+		}
+		return nil
+	}
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
 		if errRead != nil {
@@ -75,12 +106,21 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 		if chunk.Error != "" {
 			return fmt.Errorf("GitHub Copilot upstream stream failed")
 		}
-		if len(chunk.Payload) > 0 {
-			if errEmit := client.emit(pluginStreamID, chunk.Payload); errEmit != nil {
-				return fmt.Errorf("GitHub Copilot downstream stream closed")
+		frames, errFrame := framer.Push(chunk.Payload)
+		if errFrame != nil {
+			return errFrame
+		}
+		for _, frame := range frames {
+			if errEmit := emitFrame(frame); errEmit != nil {
+				return errEmit
 			}
 		}
 		if chunk.Done {
+			if tail := framer.Flush(); len(tail) > 0 {
+				if errEmit := emitFrame(tail); errEmit != nil {
+					return errEmit
+				}
+			}
 			return nil
 		}
 	}

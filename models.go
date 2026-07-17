@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -86,14 +87,21 @@ func (s *pluginService) modelsForAuth(raw []byte) ([]byte, error) {
 	}
 	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil || strings.TrimSpace(storage.CopilotSessionToken) == "" {
-		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential requires refresh", httpStatus: http.StatusUnauthorized}
+		failure := &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential requires refresh", httpStatus: http.StatusUnauthorized}
+		s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "credential_validation"})
+		return nil, failure
 	}
 	if host, errHost := normalizeGitHubHost(storage.GitHubHost); errHost != nil || host != s.loadedConfig().GitHubHost {
-		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
+		failure := &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
+		s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "github_host_validation"})
+		return nil, failure
 	}
 	models := append([]storedModel(nil), storage.Models...)
 	fetched := false
-	if !s.modelCacheFresh(storage) {
+	cacheFresh := s.modelCacheFresh(storage)
+	source := "cache"
+	if !cacheFresh {
+		source = "discovery"
 		discovered, failure := s.discoverModels(hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}, storage)
 		if failure == nil {
 			models = discovered
@@ -101,10 +109,25 @@ func (s *pluginService) modelsForAuth(raw []byte) ([]byte, error) {
 			storage.ModelsFetchedAt = s.now().UTC().UnixMilli()
 			fetched = true
 		} else if len(models) == 0 {
+			s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
 			return nil, failure
+		} else {
+			source = "stale_cache"
+			s.logFailure(req.HostCallbackID, "models.discovery.fallback", failure, map[string]any{
+				"auth_id":            req.AuthID,
+				"cached_model_count": len(models),
+				"cached_model_ids":   storedModelIDs(models),
+			})
 		}
 	}
 	s.setModelRoutes(req.AuthID, models)
+	s.logEvent(req.HostCallbackID, "info", "models.resolved", map[string]any{
+		"auth_id":        req.AuthID,
+		"catalog_source": source,
+		"cache_fresh":    cacheFresh,
+		"model_count":    len(models),
+		"model_ids":      storedModelIDs(models),
+	})
 	response := pluginapi.ModelResponse{Provider: pluginIdentifier, Models: modelInfos(models)}
 	if fetched {
 		response.AuthUpdate = authDataFromStorage(storage, authDataDefaults{
@@ -131,23 +154,36 @@ func (s *pluginService) modelCacheFresh(storage copilotStorage) bool {
 func (s *pluginService) discoverModels(client hostClient, storage copilotStorage) ([]storedModel, *pluginFailure) {
 	baseURL := apiBaseFromSessionToken(storage.CopilotSessionToken, storage.GitHubHost)
 	if baseURL == "" {
-		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot API endpoint is invalid"}
+		failure := &pluginFailure{code: "invalid_auth", message: "GitHub Copilot API endpoint is invalid"}
+		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "endpoint_validation"})
+		return nil, failure
 	}
+	s.logEvent(client.callbackID, "debug", "models.discovery.started", map[string]any{"github_host": storage.GitHubHost})
 	headers := copilotIdentityHeaders()
 	headers.Set("Accept", "application/json")
 	headers.Set("Authorization", "Bearer "+storage.CopilotSessionToken)
 	headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
 	resp, errHTTP := client.do(pluginapi.HTTPRequest{Method: http.MethodGet, URL: baseURL + "/models", Headers: headers})
 	if errHTTP != nil {
-		return nil, &pluginFailure{code: "model_discovery_network_error", message: "GitHub Copilot model discovery is temporarily unavailable", retryable: true}
+		failure := &pluginFailure{code: "model_discovery_network_error", message: "GitHub Copilot model discovery is temporarily unavailable", retryable: true}
+		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "host_http"})
+		return nil, failure
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, upstreamFailure("model_discovery_http_error", "GitHub Copilot model discovery failed", resp.StatusCode)
+		failure := upstreamFailure("model_discovery_http_error", "GitHub Copilot model discovery failed", resp.StatusCode)
+		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "upstream_http"})
+		return nil, failure
 	}
 	models, errParse := parseDiscoveredModels(resp.Body)
 	if errParse != nil {
-		return nil, &pluginFailure{code: "model_discovery_invalid", message: errParse.Error(), httpStatus: http.StatusBadGateway}
+		failure := &pluginFailure{code: "model_discovery_invalid", message: errParse.Error(), httpStatus: http.StatusBadGateway}
+		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "response_validation"})
+		return nil, failure
 	}
+	s.logEvent(client.callbackID, "info", "models.discovery.completed", map[string]any{
+		"model_count": len(models),
+		"model_ids":   storedModelIDs(models),
+	})
 	return models, nil
 }
 
@@ -338,10 +374,12 @@ func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilo
 func (s *pluginService) enableKnownModels(client hostClient, storage copilotStorage) {
 	baseURL := apiBaseFromSessionToken(storage.CopilotSessionToken, storage.GitHubHost)
 	if baseURL == "" {
+		s.logEvent(client.callbackID, "warn", "models.policy_enable.skipped", map[string]any{"reason": "invalid_endpoint"})
 		return
 	}
 	jobs := make(chan string)
 	var wait sync.WaitGroup
+	var enabled atomic.Int64
 	for range 4 {
 		wait.Add(1)
 		go func() {
@@ -352,12 +390,15 @@ func (s *pluginService) enableKnownModels(client hostClient, storage copilotStor
 				headers.Set("Authorization", "Bearer "+storage.CopilotSessionToken)
 				headers.Set("Openai-Intent", "chat-policy")
 				headers.Set("X-Interaction-Type", "chat-policy")
-				_, _ = client.do(pluginapi.HTTPRequest{
+				resp, errHTTP := client.do(pluginapi.HTTPRequest{
 					Method:  http.MethodPost,
 					URL:     baseURL + "/models/" + modelID + "/policy",
 					Headers: headers,
 					Body:    []byte(`{"state":"enabled"}`),
 				})
+				if errHTTP == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					enabled.Add(1)
+				}
 			}
 		}()
 	}
@@ -366,6 +407,11 @@ func (s *pluginService) enableKnownModels(client hostClient, storage copilotStor
 	}
 	close(jobs)
 	wait.Wait()
+	s.logEvent(client.callbackID, "debug", "models.policy_enable.completed", map[string]any{
+		"attempted_count": len(knownCopilotModels),
+		"enabled_count":   enabled.Load(),
+		"failed_count":    int64(len(knownCopilotModels)) - enabled.Load(),
+	})
 }
 
 func hasImageMediaType(values []string) bool {

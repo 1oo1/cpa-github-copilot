@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -47,7 +51,23 @@ plugins:
 	}
 	host := pluginhost.New()
 	t.Cleanup(host.ShutdownAll)
+	var logOutput bytes.Buffer
+	logger := log.StandardLogger()
+	originalOutput := logger.Out
+	originalFormatter := logger.Formatter
+	originalLevel := logger.Level
+	log.SetOutput(&logOutput)
+	log.SetFormatter(&log.TextFormatter{DisableColors: true, DisableTimestamp: true})
+	log.SetLevel(log.DebugLevel)
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFormatter(originalFormatter)
+		log.SetLevel(originalLevel)
+	})
 	host.ApplyConfig(context.Background(), cfg)
+	if !strings.Contains(logOutput.String(), "github-copilot: plugin.configured") {
+		t.Fatalf("real host did not receive plugin diagnostic log: %s", logOutput.String())
+	}
 	if !host.PluginLoaded("github-copilot-go") || !host.PluginRegistered("github-copilot-go") {
 		t.Fatalf("plugin load state: loaded=%v registered=%v", host.PluginLoaded("github-copilot-go"), host.PluginRegistered("github-copilot-go"))
 	}

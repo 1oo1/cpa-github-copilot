@@ -34,6 +34,7 @@ func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, er
 	defer f.mu.Unlock()
 	var result any = map[string]any{}
 	switch method {
+	case pluginabi.MethodHostLog:
 	case pluginabi.MethodHostHTTPDoStream:
 		result = rpcHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-1"}
 	case pluginabi.MethodHostHTTPStreamRead:
@@ -103,6 +104,52 @@ func TestExecuteStreamPassThroughAndClosesBothStreams(t *testing.T) {
 	}
 	if got := string(bytesJoin(bridge.emitted)); got != "data: first\n\ndata: [DONE]\n\n" {
 		t.Fatalf("emitted = %q", got)
+	}
+}
+
+func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(105_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.6-sol","input":"hi","stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.6-sol", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.6-sol", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-split-sse", HostCallbackID: "callback-stream",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := append([][]byte(nil), bridge.emitted...)
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("plugin stream error = %q", pluginError)
+	}
+	want := []string{
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n",
+	}
+	if len(emitted) != len(want) {
+		t.Fatalf("emitted chunks = %q, want %q", emitted, want)
+	}
+	for index := range want {
+		if string(emitted[index]) != want[index] {
+			t.Fatalf("emitted[%d] = %q, want %q", index, emitted[index], want[index])
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(emitted[index])), "data:"))
+		if !json.Valid([]byte(data)) {
+			t.Fatalf("emitted[%d] has invalid SSE JSON: %q", index, data)
+		}
 	}
 }
 

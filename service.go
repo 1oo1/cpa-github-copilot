@@ -60,6 +60,14 @@ func (s *pluginService) configure(raw []byte) error {
 	for _, session := range staleSessions {
 		clearLoginSessionSecrets(session)
 	}
+	s.logEvent("", "info", "plugin.configured", map[string]any{
+		"github_host":                   cfg.GitHubHost,
+		"enable_models":                 cfg.EnableModels,
+		"model_cache_ttl_seconds":       cfg.ModelCacheTTL,
+		"max_stream_buffer_bytes":       cfg.MaxStreamBytes,
+		"credential_identity_changed":   changedIdentity,
+		"discarded_login_session_count": len(staleSessions),
+	})
 	return nil
 }
 
@@ -96,7 +104,37 @@ func (s *pluginService) registration() registration {
 	}
 }
 
-func (s *pluginService) dispatch(method string, request []byte) ([]byte, error) {
+func (s *pluginService) dispatch(method string, request []byte) (response []byte, err error) {
+	callbackID := callbackIDFromRequest(request)
+	started := s.now().UTC()
+	s.logEvent(callbackID, "debug", "rpc.started", map[string]any{
+		"method":        method,
+		"request_bytes": len(request),
+	})
+	defer func() {
+		fields := map[string]any{
+			"method":         method,
+			"request_bytes":  len(request),
+			"response_bytes": len(response),
+			"duration_ms":    s.now().UTC().Sub(started).Milliseconds(),
+		}
+		if recovered := recover(); recovered != nil {
+			fields["failure_code"] = "panic"
+			s.logEvent(callbackID, "error", "rpc.panicked", fields)
+			panic(recovered)
+		}
+		if err == nil {
+			s.logEvent(callbackID, "debug", "rpc.completed", fields)
+			return
+		}
+		if failure, ok := err.(*pluginFailure); ok && failure != nil {
+			fields["failure_code"] = failure.code
+			fields["http_status"] = failure.httpStatus
+			fields["retryable"] = failure.retryable
+		}
+		s.logEvent(callbackID, "warn", "rpc.failed", fields)
+	}()
+
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		if errConfigure := s.configure(request); errConfigure != nil {
@@ -131,6 +169,7 @@ func (s *pluginService) dispatch(method string, request []byte) ([]byte, error) 
 }
 
 func (s *pluginService) shutdown() {
+	s.logEvent("", "info", "plugin.shutdown", nil)
 	s.mu.Lock()
 	sessions := s.sessions
 	s.sessions = make(map[string]*loginSession)

@@ -168,6 +168,7 @@ func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	if pluginErr.httpStatus != http.StatusForbidden {
 		t.Fatalf("HTTP status = %d", pluginErr.httpStatus)
 	}
+	assertLogsExclude(t, bridge.snapshotLogs(), sentinel, storage.CopilotSessionToken)
 }
 
 func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {

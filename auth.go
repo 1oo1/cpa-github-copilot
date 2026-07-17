@@ -22,6 +22,7 @@ const (
 	defaultPollInterval = 5 * time.Second
 	minPollInterval     = time.Second
 	refreshSafetyMargin = 5 * time.Minute
+	hostRefreshInterval = 15 * time.Minute
 )
 
 type copilotStorage struct {
@@ -92,24 +93,43 @@ type loginSession struct {
 func (s *pluginService) parseAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthParseRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		s.logEvent("", "debug", "auth.parse.ignored", map[string]any{"reason": "invalid_envelope"})
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 	var marker struct {
 		Type string `json:"type"`
 	}
-	if errUnmarshal := json.Unmarshal(req.RawJSON, &marker); errUnmarshal != nil || strings.ToLower(strings.TrimSpace(marker.Type)) != pluginIdentifier {
+	if errUnmarshal := json.Unmarshal(req.RawJSON, &marker); errUnmarshal != nil {
+		s.logEvent("", "debug", "auth.parse.ignored", map[string]any{
+			"file_name": safeLogFileName(req.FileName),
+			"reason":    "invalid_json",
+		})
+		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
+	}
+	if strings.ToLower(strings.TrimSpace(marker.Type)) != pluginIdentifier {
+		s.logEvent("", "debug", "auth.parse.ignored", map[string]any{
+			"file_name": safeLogFileName(req.FileName),
+			"reason":    "provider_mismatch",
+		})
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 	storage, errStorage := decodeCopilotStorage(req.RawJSON)
+	disabledReasons := make([]string, 0, 3)
 	if errStorage != nil {
+		disabledReasons = append(disabledReasons, "invalid_storage")
 		storage = copilotStorage{Type: pluginIdentifier, GitHubHost: s.loadedConfig().GitHubHost}
 	}
-	disabled := errStorage != nil || strings.TrimSpace(storage.GitHubAccessToken) == ""
+	disabled := errStorage != nil
+	if strings.TrimSpace(storage.GitHubAccessToken) == "" {
+		disabled = true
+		disabledReasons = append(disabledReasons, "missing_long_term_auth")
+	}
 	if storage.GitHubHost == "" {
 		storage.GitHubHost = s.loadedConfig().GitHubHost
 	}
 	if normalized, errHost := normalizeGitHubHost(storage.GitHubHost); errHost != nil || normalized != s.loadedConfig().GitHubHost {
 		disabled = true
+		disabledReasons = append(disabledReasons, "github_host_mismatch")
 	}
 	auth := authDataFromStorage(storage, authDataDefaults{
 		ID:         req.FileName,
@@ -121,6 +141,16 @@ func (s *pluginService) parseAuth(raw []byte) ([]byte, error) {
 	if len(auth.StorageJSON) == 0 {
 		auth.StorageJSON = append([]byte(nil), req.RawJSON...)
 	}
+	fields := authLogFields(storage, s.now().UTC())
+	fields["file_name"] = safeLogFileName(req.FileName)
+	fields["storage_valid"] = errStorage == nil
+	fields["disabled"] = disabled
+	fields["disabled_reasons"] = disabledReasons
+	level := "info"
+	if disabled {
+		level = "warn"
+	}
+	s.logEvent("", level, "auth.parsed", fields)
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: auth})
 }
 
@@ -196,6 +226,13 @@ func authDataFromStorage(storage copilotStorage, defaults authDataDefaults) plug
 	}
 	metadata := safeAuthMetadata(defaults.Metadata)
 	metadata["type"] = pluginIdentifier
+	metadata["auth_kind"] = "oauth"
+	metadata["refresh_interval_seconds"] = int64(hostRefreshInterval / time.Second)
+	if storage.ExpiresAt > 0 {
+		metadata["expires_at"] = storage.ExpiresAt
+	} else {
+		delete(metadata, "expires_at")
+	}
 	if storage.Account != "" {
 		metadata["account"] = storage.Account
 	}
@@ -339,6 +376,11 @@ func (s *pluginService) startLogin(raw []byte) ([]byte, error) {
 	s.mu.Lock()
 	s.sessions[state] = session
 	s.mu.Unlock()
+	s.logEvent(req.HostCallbackID, "info", "auth.login.started", map[string]any{
+		"github_host":           endpoints.GitHubHost,
+		"poll_interval_seconds": int(interval / time.Second),
+		"expires_at":            expiresAt,
+	})
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  pluginIdentifier,
 		URL:       verificationURLWithCode(verificationURL, strings.TrimSpace(device.UserCode)),
@@ -384,6 +426,7 @@ func (s *pluginService) pollLogin(raw []byte) ([]byte, error) {
 	session := s.sessions[state]
 	s.mu.RUnlock()
 	if session == nil {
+		s.logEvent(req.HostCallbackID, "warn", "auth.login.failed", map[string]any{"reason": "unknown_session"})
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "Device authorization session is unknown or expired"})
 	}
 	now := s.now().UTC()
@@ -391,10 +434,17 @@ func (s *pluginService) pollLogin(raw []byte) ([]byte, error) {
 	if !now.Before(session.expiresAt) {
 		session.mu.Unlock()
 		s.deleteSession(state)
+		s.logEvent(req.HostCallbackID, "warn", "auth.login.failed", map[string]any{"reason": "expired"})
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "GitHub device authorization expired"})
 	}
 	if session.polling || now.Before(session.nextPoll) {
+		nextPoll := session.nextPoll
+		polling := session.polling
 		session.mu.Unlock()
+		s.logEvent(req.HostCallbackID, "debug", "auth.login.pending", map[string]any{
+			"poll_in_progress": polling,
+			"next_poll_at":     nextPoll,
+		})
 		return pendingLoginResponse()
 	}
 	session.polling = true
@@ -411,12 +461,15 @@ func (s *pluginService) pollLogin(raw []byte) ([]byte, error) {
 		if errPoll != nil {
 			if errPoll.retryable {
 				s.reschedule(session, 0)
+				s.logFailure(req.HostCallbackID, "auth.login.retry_scheduled", errPoll, nil)
 				return pendingLoginResponse()
 			}
 			s.deleteSession(state)
+			s.logFailure(req.HostCallbackID, "auth.login.failed", errPoll, nil)
 			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: errPoll.message})
 		}
 		if !outcome {
+			s.logEvent(req.HostCallbackID, "debug", "auth.login.pending", map[string]any{"reason": "awaiting_authorization"})
 			return pendingLoginResponse()
 		}
 	}
@@ -424,12 +477,15 @@ func (s *pluginService) pollLogin(raw []byte) ([]byte, error) {
 	if failure != nil {
 		if failure.retryable {
 			s.reschedule(session, 0)
+			s.logFailure(req.HostCallbackID, "auth.login.retry_scheduled", failure, nil)
 			return pendingLoginResponse()
 		}
 		s.deleteSession(state)
+		s.logFailure(req.HostCallbackID, "auth.login.failed", failure, nil)
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: failure.message})
 	}
 	s.deleteSession(state)
+	s.logEvent(req.HostCallbackID, "info", "auth.login.completed", authLogFields(storage, now))
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "GitHub Copilot authentication completed",
@@ -615,7 +671,7 @@ func (s *pluginService) exchangeSession(client hostClient, githubToken, githubHo
 		}
 	}
 	token := strings.TrimSpace(tokenResp.Token)
-	return copilotStorage{
+	storage := copilotStorage{
 		Type:                pluginIdentifier,
 		GitHubAccessToken:   githubToken,
 		CopilotSessionToken: token,
@@ -623,7 +679,9 @@ func (s *pluginService) exchangeSession(client hostClient, githubToken, githubHo
 		ExpiresAt:           expiresAt.UnixMilli(),
 		GitHubHost:          endpoints.GitHubHost,
 		APIBaseURL:          apiBaseFromSessionToken(token, endpoints.GitHubHost),
-	}, nil
+	}
+	s.logEvent(client.callbackID, "info", "auth.session.exchanged", authLogFields(storage, now))
+	return storage, nil
 }
 
 func (s *pluginService) fetchGitHubAccount(client hostClient, githubToken, githubHost string) string {
@@ -667,15 +725,23 @@ func (s *pluginService) refreshAuth(raw []byte) ([]byte, error) {
 	}
 	previous, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil {
+		s.logFailure(req.HostCallbackID, "auth.refresh.failed", &pluginFailure{code: "invalid_auth", httpStatus: http.StatusUnauthorized}, map[string]any{
+			"auth_id": req.AuthID,
+		})
 		return nil, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
 	}
+	startFields := authLogFields(previous, s.now().UTC())
+	startFields["auth_id"] = req.AuthID
+	s.logEvent(req.HostCallbackID, "info", "auth.refresh.started", startFields)
 	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
 	next, failure := s.exchangeSession(client, previous.GitHubAccessToken, previous.GitHubHost)
 	if failure != nil {
+		s.logFailure(req.HostCallbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "session_exchange"})
 		return nil, failure
 	}
 	models, failure := s.discoverModels(client, next)
 	if failure != nil {
+		s.logFailure(req.HostCallbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
 		return nil, failure
 	}
 	next.Models = models
@@ -687,6 +753,9 @@ func (s *pluginService) refreshAuth(raw []byte) ([]byte, error) {
 		Metadata:   req.Metadata,
 		Attributes: req.Attributes,
 	})
+	completedFields := authLogFields(next, s.now().UTC())
+	completedFields["auth_id"] = req.AuthID
+	s.logEvent(req.HostCallbackID, "info", "auth.refresh.completed", completedFields)
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter})
 }
 

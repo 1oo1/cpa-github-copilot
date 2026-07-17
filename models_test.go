@@ -122,6 +122,11 @@ func TestModelsForAuthFallsBackToStaleNonEmptyCache(t *testing.T) {
 	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" {
 		t.Fatalf("fallback response = %#v", result)
 	}
+	logEntry := findLogEvent(t, bridge.snapshotLogs(), "models.discovery.fallback")
+	if logEntry.Fields["failure_code"] != "model_discovery_http_error" || logEntry.Fields["cached_model_count"] != 1 {
+		t.Fatalf("fallback log fields = %#v", logEntry.Fields)
+	}
+	assertLogsExclude(t, bridge.snapshotLogs(), storage.GitHubAccessToken, storage.CopilotSessionToken)
 }
 
 func TestDiscoverModelsAcceptsValidEmptyCatalog(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 
 const (
 	pluginIdentifier = "github-copilot"
-	pluginVersion    = "0.1.0"
+	pluginVersion    = "0.1.1"
 
 	defaultClientID   = "Iv1.b507a08c87ecfe98"
 	defaultGitHubHost = "github.com"
