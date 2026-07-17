@@ -30,7 +30,7 @@ func TestBuiltPluginLoadsInCLIProxyHost(t *testing.T) {
 	if errWrite := os.WriteFile(target, binary, 0o700); errWrite != nil {
 		t.Fatalf("stage plugin binary: %v", errWrite)
 	}
-	rawConfig := []byte(fmt.Sprintf(`
+	rawConfig := fmt.Appendf(nil, `
 auth-dir: %q
 plugins:
   enabled: true
@@ -40,7 +40,7 @@ plugins:
       enabled: true
       priority: 10
       enable_models: false
-`, filepath.Join(pluginsDir, "auth"), pluginsDir))
+`, filepath.Join(pluginsDir, "auth"), pluginsDir)
 	cfg, errConfig := config.ParseConfigBytes(rawConfig)
 	if errConfig != nil {
 		t.Fatalf("parse host config: %v", errConfig)

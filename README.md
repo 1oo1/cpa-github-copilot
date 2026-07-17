@@ -43,6 +43,8 @@ JSON，应保护 CLIProxyAPI 的 auth 目录和备份。
 
 - Go 1.26 或更高版本
 - 可用的 C 编译器（Go `-buildmode=c-shared` 需要 CGO）
+- 构建全部 Linux 产物时，使用 x86-64 和 ARM64 Linux C 编译器（默认分别为
+  `x86_64-linux-gnu-gcc` 和 `aarch64-linux-gnu-gcc`），或使用 Docker
 - 与该项目相邻的当前 CLIProxyAPI v7 源码：
 
 ```text
@@ -63,14 +65,19 @@ make build
 make integration
 ```
 
-构建产物位于：
+`make build` 会先清空 `bin/`，然后构建全部支持的 Linux 平台架构，产物位于：
 
-- macOS: `bin/github-copilot-go.dylib`
-- Linux: `bin/github-copilot-go.so`
-- Windows: `bin/github-copilot-go.dll`
+- Linux x86-64: `bin/linux/amd64/github-copilot-go.so`
+- Linux ARM64: `bin/linux/arm64/github-copilot-go.so`
+
+也可以用 `make build-linux-amd64` 或 `make build-linux-arm64` 只构建一个架构。
+交叉编译器路径可通过 `LINUX_AMD64_CC` 和 `LINUX_ARM64_CC` 覆盖。每个
+`build*` 目标都会先清空 `bin/`。找不到对应交叉编译器时，构建会自动使用
+Docker 中的 `golang:1.26-bookworm`；镜像可通过 `DOCKER_GO_IMAGE` 覆盖。
 
 `make integration` 会使用 CLIProxyAPI 的真实动态库 loader 装载产物，并验证
-注册、`auth.parse` 的 `Handled` 行为和按凭据模型提供方能力。
+注册、`auth.parse` 的 `Handled` 行为和按凭据模型提供方能力。该目标会自动构建
+当前主机平台的测试产物。
 
 ## 安装与配置
 
