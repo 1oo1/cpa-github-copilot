@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: cpa-github-copilot
+
+      - name: Checkout CLIProxyAPI (replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          path: CLIProxyAPI
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cpa-github-copilot/go.mod
+
+      - name: Install cross compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-x86-64-linux-gnu gcc-aarch64-linux-gnu
+
+      - name: Build plugins
+        working-directory: cpa-github-copilot
+        run: make build
+
+      - name: Stage artifacts
+        working-directory: cpa-github-copilot
+        run: |
+          mkdir -p dist
+          cp bin/linux/amd64/github-copilot-go.so dist/github-copilot-go-linux-amd64.so
+          cp bin/linux/arm64/github-copilot-go.so dist/github-copilot-go-linux-arm64.so
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cpa-github-copilot/dist/*.so
+          generate_release_notes: true
