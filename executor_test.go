@@ -154,9 +154,13 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 
 	prepare := func(t *testing.T, model, payload string) preparedInference {
 		t.Helper()
+		stored := storedModel{ID: model, Format: formatClaude}
+		if model == "claude-opus-4.8" {
+			stored.AdaptiveThinking = true
+		}
 		prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
 			AuthID: "auth", Model: model, Format: formatClaude, SourceFormat: formatClaude,
-			Payload: []byte(payload), StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: model, Format: formatClaude})),
+			Payload: []byte(payload), StorageJSON: mustJSON(t, executorStorage(now, stored)),
 		}, true)
 		if failure != nil {
 			t.Fatal(failure)
@@ -207,6 +211,49 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 			t.Fatalf("newer model messages were rewritten: %#v", payload["messages"])
 		}
 		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
+			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+	})
+
+	t.Run("converts Claude Code enabled thinking for adaptive models", func(t *testing.T) {
+		prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
+			Payload: []byte(`{
+				"model":"claude-opus-4.8",
+				"max_tokens":32000,
+				"messages":[{"role":"user","content":"Hello"}],
+				"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+				"thinking":{"type":"enabled","budget_tokens":31999,"display":"omitted"},
+				"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}
+			}`),
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+				ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			})),
+			Headers: http.Header{"Anthropic-Beta": []string{
+				"claude-code-20250219,context-1m-2025-08-07,context-management-2025-06-27," + advisorToolBeta,
+			}},
+		}, true)
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		payload := decode(t, prepared)
+		thinking, ok := payload["thinking"].(map[string]any)
+		if !ok || thinking["type"] != "adaptive" || thinking["display"] != "omitted" {
+			t.Fatalf("thinking = %#v", payload["thinking"])
+		}
+		if _, exists := thinking["budget_tokens"]; exists {
+			t.Fatalf("legacy thinking budget was retained: %#v", thinking)
+		}
+		outputConfig, ok := payload["output_config"].(map[string]any)
+		if !ok || outputConfig["effort"] != "max" {
+			t.Fatalf("output_config = %#v", payload["output_config"])
+		}
+		contextManagement, ok := payload["context_management"].(map[string]any)
+		edits, editsOK := contextManagement["edits"].([]any)
+		if !ok || !editsOK || len(edits) != 1 {
+			t.Fatalf("context_management = %#v", payload["context_management"])
+		}
+		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "claude-code-20250219,context-1m-2025-08-07,context-management-2025-06-27" {
 			t.Fatalf("Anthropic-Beta = %q", beta)
 		}
 	})
@@ -335,7 +382,7 @@ func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
 				"thinking":      map[string]any{"type": "adaptive"},
 				"output_config": map[string]any{"effort": test.effort},
 			}
-			if !normalizeAnthropicPayload(payload, "claude-haiku-4.5") {
+			if !normalizeAnthropicPayload(payload, "claude-haiku-4.5", false) {
 				t.Fatal("payload was not normalized")
 			}
 			thinking := payload["thinking"].(map[string]any)
@@ -343,6 +390,38 @@ func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
 				t.Fatalf("thinking = %#v", thinking)
 			}
 		})
+	}
+}
+
+func TestAnthropicAdaptiveThinkingMapsLegacyBudgetsToEffort(t *testing.T) {
+	for _, test := range []struct {
+		budget int
+		want   string
+	}{
+		{budget: 0, want: "high"},
+		{budget: 2048, want: "low"},
+		{budget: 8192, want: "medium"},
+		{budget: 16384, want: "high"},
+		{budget: 31999, want: "max"},
+	} {
+		payload := map[string]any{
+			"max_tokens": 32000,
+			"thinking": map[string]any{
+				"type":          "enabled",
+				"budget_tokens": test.budget,
+				"display":       "omitted",
+			},
+		}
+		if !normalizeAnthropicPayload(payload, "claude-opus-4.8", true) {
+			t.Fatalf("budget %d was not normalized", test.budget)
+		}
+		thinking := payload["thinking"].(map[string]any)
+		if thinking["type"] != "adaptive" || thinking["display"] != "omitted" {
+			t.Fatalf("budget %d thinking = %#v", test.budget, thinking)
+		}
+		if got := payload["output_config"].(map[string]any)["effort"]; got != test.want {
+			t.Fatalf("budget %d effort = %q, want %q", test.budget, got, test.want)
+		}
 	}
 }
 
@@ -464,7 +543,7 @@ func TestExecuteHTTPRequestLeavesNewAnthropicPayloadUnchanged(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(97_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude})
+	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true})
 	body := []byte(`{
 		"model":"claude-opus-4.8",
 		"messages":[{"role":"user","content":"Use the tool"}],

@@ -150,7 +150,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 			stream,
 		)
 	}
-	payload, errPrepare := normalizeInferencePayload(payload, model, route.Format, stream)
+	payload, errPrepare := normalizeInferencePayload(payload, model, route.Format, stream, route.AdaptiveThinking)
 	if errPrepare != nil {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: errPrepare.Error(), httpStatus: http.StatusBadRequest}
 	}
@@ -216,7 +216,7 @@ func preparedInferenceLogFields(prepared preparedInference, stream bool) map[str
 	}
 }
 
-func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([]byte, error) {
+func normalizeInferencePayload(raw []byte, model, format string, stream, supportsAdaptiveThinking bool) ([]byte, error) {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil || payload == nil {
 		return nil, fmt.Errorf("GitHub Copilot request payload must be a JSON object")
@@ -228,7 +228,7 @@ func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([
 			payload["max_tokens"] = 4096
 		}
 		delete(payload, "stream_options")
-		normalizeAnthropicPayload(payload, model)
+		normalizeAnthropicPayload(payload, model, supportsAdaptiveThinking)
 	}
 	if format == formatOpenAIResponse {
 		if _, exists := payload["store"]; !exists {
@@ -242,7 +242,10 @@ func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([
 	return out, nil
 }
 
-func normalizeAnthropicPayload(payload map[string]any, model string) bool {
+func normalizeAnthropicPayload(payload map[string]any, model string, supportsAdaptiveThinking bool) bool {
+	if supportsAdaptiveThinking {
+		return normalizeAnthropicAdaptiveThinking(payload)
+	}
 	if !usesAnthropicLegacyCompatibility(model) {
 		return false
 	}
@@ -310,6 +313,49 @@ func anthropicThinkingBudget(payload, thinking map[string]any) int {
 		budget = maxTokens - 1024
 	}
 	return budget
+}
+
+func normalizeAnthropicAdaptiveThinking(payload map[string]any) bool {
+	thinking, ok := payload["thinking"].(map[string]any)
+	if !ok || !strings.EqualFold(stringValue(thinking["type"]), "enabled") {
+		return false
+	}
+
+	normalized := map[string]any{"type": "adaptive"}
+	if display := stringValue(thinking["display"]); display != "" {
+		normalized["display"] = display
+	}
+	payload["thinking"] = normalized
+
+	outputConfig, ok := payload["output_config"].(map[string]any)
+	if !ok {
+		outputConfig = make(map[string]any)
+	}
+	if stringValue(outputConfig["effort"]) == "" {
+		outputConfig["effort"] = anthropicAdaptiveEffort(payload, thinking)
+	}
+	payload["output_config"] = outputConfig
+	return true
+}
+
+func anthropicAdaptiveEffort(payload, thinking map[string]any) string {
+	budget := intFromJSONNumber(thinking["budget_tokens"])
+	maxTokens := intFromJSONNumber(payload["max_tokens"])
+	if maxTokens > 0 && budget > 0 && budget >= maxTokens-1024 {
+		return "max"
+	}
+	switch {
+	case budget <= 0:
+		return "high"
+	case budget <= 2048:
+		return "low"
+	case budget <= 8192:
+		return "medium"
+	case budget <= 16384:
+		return "high"
+	default:
+		return "max"
+	}
 }
 
 func intFromJSONNumber(value any) int {
@@ -434,12 +480,14 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) 
 	return changed
 }
 
-func normalizeAnthropicPayloadBytes(raw []byte, model string) []byte {
+func normalizeAnthropicPayloadBytes(raw []byte, model string, supportsAdaptiveThinking bool) []byte {
 	if !usesAnthropicLegacyCompatibility(model) {
-		return raw
+		if !supportsAdaptiveThinking {
+			return raw
+		}
 	}
 	var payload map[string]any
-	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayload(payload, model) {
+	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayload(payload, model, supportsAdaptiveThinking) {
 		return raw
 	}
 	out, errMarshal := json.Marshal(payload)
@@ -589,7 +637,8 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 	format := inferModelFormat(model)
 	body := append([]byte(nil), req.Body...)
 	if format == formatClaude {
-		body = normalizeAnthropicPayloadBytes(body, model)
+		route := s.resolveModelRoute("", model, storage)
+		body = normalizeAnthropicPayloadBytes(body, model, route.AdaptiveThinking)
 	}
 	headers := inferenceHeaders(storage.CopilotSessionToken, format, body, req.Headers)
 	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(pluginapi.HTTPRequest{

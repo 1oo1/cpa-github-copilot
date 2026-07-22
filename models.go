@@ -30,8 +30,9 @@ type storedModel struct {
 }
 
 type modelRoute struct {
-	Format string
-	Path   string
+	Format           string
+	Path             string
+	AdaptiveThinking bool
 }
 
 type remoteModelsResponse struct {
@@ -346,7 +347,11 @@ func (s *pluginService) setModelRoutes(authID string, models []storedModel) {
 	}
 	for _, model := range models {
 		if model.ID != "" && endpointPath(model.Format) != "" {
-			s.routes[routeKey{AuthID: authID, ModelID: model.ID}] = modelRoute{Format: model.Format, Path: endpointPath(model.Format)}
+			s.routes[routeKey{AuthID: authID, ModelID: model.ID}] = modelRoute{
+				Format:           model.Format,
+				Path:             endpointPath(model.Format),
+				AdaptiveThinking: model.AdaptiveThinking,
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -355,7 +360,11 @@ func (s *pluginService) setModelRoutes(authID string, models []storedModel) {
 func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilotStorage) modelRoute {
 	for _, model := range storage.Models {
 		if model.ID == modelID && endpointPath(model.Format) != "" {
-			return modelRoute{Format: model.Format, Path: endpointPath(model.Format)}
+			return modelRoute{
+				Format:           model.Format,
+				Path:             endpointPath(model.Format),
+				AdaptiveThinking: model.AdaptiveThinking,
+			}
 		}
 	}
 	if len(storage.Models) > 0 || storage.ModelsFetchedAt > 0 {

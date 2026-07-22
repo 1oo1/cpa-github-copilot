@@ -16,6 +16,7 @@ const (
 	defaultAnthropicVersion = "2023-06-01"
 	fineGrainedToolBeta     = "fine-grained-tool-streaming-2025-05-14"
 	interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+	advisorToolBeta         = "advisor-tool-2026-03-01"
 )
 
 func brokerHeaders(githubToken string) http.Header {
@@ -62,7 +63,7 @@ func inferenceHeaders(sessionToken, format string, payload []byte, caller http.H
 			if beta = strings.TrimSpace(beta); beta != "" {
 				headers.Set("Anthropic-Beta", beta)
 			}
-		} else if beta := strings.TrimSpace(caller.Get("Anthropic-Beta")); beta != "" {
+		} else if beta := supportedAnthropicBetas(model, caller.Get("Anthropic-Beta")); beta != "" {
 			headers.Set("Anthropic-Beta", beta)
 		}
 	}
@@ -101,6 +102,21 @@ func appendAnthropicBeta(raw, required string) string {
 			continue
 		}
 		seen[key] = struct{}{}
+		values = append(values, value)
+	}
+	return strings.Join(values, ",")
+}
+
+func supportedAnthropicBetas(model, raw string) string {
+	if !strings.EqualFold(normalizeModelID(model), "claude-opus-4.8") {
+		return strings.TrimSpace(raw)
+	}
+	values := make([]string, 0, len(strings.Split(raw, ",")))
+	for _, value := range strings.Split(raw, ",") {
+		value = strings.TrimSpace(value)
+		if value == "" || strings.EqualFold(value, advisorToolBeta) {
+			continue
+		}
 		values = append(values, value)
 	}
 	return strings.Join(values, ",")

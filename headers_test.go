@@ -64,3 +64,15 @@ func TestInferenceHeadersKeepNewAnthropicModelsOnOriginalPath(t *testing.T) {
 		t.Fatalf("Anthropic-Beta = %q", beta)
 	}
 }
+
+func TestInferenceHeadersRemoveUnsupportedOpus48AdvisorBeta(t *testing.T) {
+	headers := inferenceHeaders("real-session", formatClaude, []byte(`{
+		"model":"claude-opus-4.8",
+		"messages":[{"role":"user","content":"hi"}]
+	}`), http.Header{
+		"Anthropic-Beta": []string{"claude-code-20250219," + advisorToolBeta + ",context-management-2025-06-27"},
+	})
+	if beta := headers.Get("Anthropic-Beta"); beta != "claude-code-20250219,context-management-2025-06-27" {
+		t.Fatalf("Anthropic-Beta = %q", beta)
+	}
+}
