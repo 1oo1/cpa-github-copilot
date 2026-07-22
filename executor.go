@@ -243,6 +243,9 @@ func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([
 }
 
 func normalizeAnthropicPayload(payload map[string]any, model string) bool {
+	if !usesAnthropicLegacyCompatibility(model) {
+		return false
+	}
 	changed := normalizeAnthropicToolInputStreaming(payload, model)
 	if !usesAnthropicBudgetThinking(model) {
 		return changed
@@ -432,6 +435,9 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) 
 }
 
 func normalizeAnthropicPayloadBytes(raw []byte, model string) []byte {
+	if !usesAnthropicLegacyCompatibility(model) {
+		return raw
+	}
 	var payload map[string]any
 	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayload(payload, model) {
 		return raw
@@ -459,6 +465,10 @@ func usesAnthropicBudgetThinking(model string) bool {
 	default:
 		return false
 	}
+}
+
+func usesAnthropicLegacyCompatibility(model string) bool {
+	return usesAnthropicBudgetThinking(model) || !supportsAnthropicEagerToolInputStreaming(model)
 }
 
 func normalizeFormat(raw string) string {

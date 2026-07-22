@@ -51,3 +51,16 @@ func TestInferenceHeadersProtectAuthorization(t *testing.T) {
 		t.Fatalf("Copilot headers = %#v", headers)
 	}
 }
+
+func TestInferenceHeadersKeepNewAnthropicModelsOnOriginalPath(t *testing.T) {
+	headers := inferenceHeaders("real-session", formatClaude, []byte(`{
+		"model":"claude-opus-4.8",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+	}`), http.Header{
+		"Anthropic-Beta": []string{"feature-one", "feature-two"},
+	})
+	if beta := headers.Get("Anthropic-Beta"); beta != "feature-one" {
+		t.Fatalf("Anthropic-Beta = %q", beta)
+	}
+}

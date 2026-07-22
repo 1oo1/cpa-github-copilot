@@ -48,17 +48,21 @@ func inferenceHeaders(sessionToken, format string, payload []byte, caller http.H
 	if format == formatClaude {
 		headers.Set("Anthropic-Version", defaultAnthropicVersion)
 		model := modelFromPayload(payload)
-		beta := strings.Join(caller.Values("Anthropic-Beta"), ",")
-		if usesAnthropicBudgetThinking(model) {
-			beta = ""
-		}
-		if !supportsAnthropicEagerToolInputStreaming(model) && hasAnthropicTools(payload) {
-			beta = appendAnthropicBeta(beta, fineGrainedToolBeta)
-		}
-		if usesAnthropicBudgetThinking(model) && hasEnabledAnthropicThinking(payload) {
-			beta = appendAnthropicBeta(beta, interleavedThinkingBeta)
-		}
-		if beta = strings.TrimSpace(beta); beta != "" {
+		if usesAnthropicLegacyCompatibility(model) {
+			beta := strings.Join(caller.Values("Anthropic-Beta"), ",")
+			if usesAnthropicBudgetThinking(model) {
+				beta = ""
+			}
+			if !supportsAnthropicEagerToolInputStreaming(model) && hasAnthropicTools(payload) {
+				beta = appendAnthropicBeta(beta, fineGrainedToolBeta)
+			}
+			if usesAnthropicBudgetThinking(model) && hasEnabledAnthropicThinking(payload) {
+				beta = appendAnthropicBeta(beta, interleavedThinkingBeta)
+			}
+			if beta = strings.TrimSpace(beta); beta != "" {
+				headers.Set("Anthropic-Beta", beta)
+			}
+		} else if beta := strings.TrimSpace(caller.Get("Anthropic-Beta")); beta != "" {
 			headers.Set("Anthropic-Beta", beta)
 		}
 	}

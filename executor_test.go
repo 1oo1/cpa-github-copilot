@@ -172,11 +172,17 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		return payload
 	}
 
-	t.Run("sends per-tool eager_input_streaming by default", func(t *testing.T) {
+	t.Run("keeps newer models on the original payload path", func(t *testing.T) {
 		prepared := prepare(t, "claude-opus-4.8", `{
 			"model":"claude-opus-4.8",
-			"messages":[{"role":"user","content":"Use the tool"}],
-			"tools":[{"name":"lookup","description":"Look up a value","input_schema":{"type":"object"}}]
+			"messages":[
+				{"role":"user","content":"Use the tool"},
+				{"role":"system","content":"keep this message in place"}
+			],
+			"tools":[{"name":"lookup","description":"Look up a value","input_schema":{"type":"object"}}],
+			"thinking":{"type":"adaptive","display":"omitted"},
+			"output_config":{"effort":"xhigh"},
+			"context_management":{"edits":[]}
 		}`)
 		payload := decode(t, prepared)
 		tools, ok := payload["tools"].([]any)
@@ -184,8 +190,21 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 			t.Fatalf("tools = %#v", payload["tools"])
 		}
 		tool, ok := tools[0].(map[string]any)
-		if !ok || tool["eager_input_streaming"] != true {
+		if !ok {
 			t.Fatalf("first tool = %#v", tools[0])
+		}
+		if _, exists := tool["eager_input_streaming"]; exists {
+			t.Fatalf("newer model tool was rewritten: %#v", tool)
+		}
+		if _, exists := payload["output_config"]; !exists {
+			t.Fatal("newer model output_config was removed")
+		}
+		if _, exists := payload["context_management"]; !exists {
+			t.Fatal("newer model context_management was removed")
+		}
+		messages, ok := payload["messages"].([]any)
+		if !ok || len(messages) != 2 || messages[1].(map[string]any)["role"] != "system" {
+			t.Fatalf("newer model messages were rewritten: %#v", payload["messages"])
 		}
 		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
 			t.Fatalf("Anthropic-Beta = %q", beta)
@@ -327,6 +346,30 @@ func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
 	}
 }
 
+func TestAnthropicLegacyCompatibilityModelBoundary(t *testing.T) {
+	for _, test := range []struct {
+		model string
+		want  bool
+	}{
+		{model: "claude-haiku-4.5", want: true},
+		{model: "claude-opus-4.5", want: true},
+		{model: "claude-sonnet-4", want: true},
+		{model: "claude-sonnet-4.5", want: true},
+		{model: "claude-opus-4.6", want: false},
+		{model: "claude-opus-4.7", want: false},
+		{model: "claude-opus-4.8", want: false},
+		{model: "claude-sonnet-4.6", want: false},
+		{model: "claude-sonnet-5", want: false},
+		{model: "claude-future", want: false},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			if got := usesAnthropicLegacyCompatibility(test.model); got != test.want {
+				t.Fatalf("usesAnthropicLegacyCompatibility(%q) = %t, want %t", test.model, got, test.want)
+			}
+		})
+	}
+}
+
 func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	const sentinel = "SENTINEL_PRIVATE_UPSTREAM_BODY"
 	service := newPluginService(nil)
@@ -409,6 +452,45 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	_, failure := service.executeHTTPRequest(mustJSON(t, rpcExecutorHTTPRequest{ExecutorHTTPRequest: pluginapi.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/v1/messages",
 		Method:      http.MethodPost,
+		Body:        body,
+		StorageJSON: mustJSON(t, storage),
+	}}))
+	if failure != nil {
+		t.Fatal(failure)
+	}
+}
+
+func TestExecuteHTTPRequestLeavesNewAnthropicPayloadUnchanged(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(97_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude})
+	body := []byte(`{
+		"model":"claude-opus-4.8",
+		"messages":[{"role":"user","content":"Use the tool"}],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+		"thinking":{"type":"adaptive","display":"omitted"},
+		"output_config":{"effort":"xhigh"},
+		"context_management":{"edits":[]}
+	}`)
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %s", method)
+		}
+		req := payload.(rpcHostHTTPRequest)
+		if string(req.Body) != string(body) {
+			t.Fatalf("newer model body was rewritten:\n got: %s\nwant: %s", req.Body, body)
+		}
+		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != "feature-one" {
+			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
+	}}
+	service.bridge = bridge
+	_, failure := service.executeHTTPRequest(mustJSON(t, rpcExecutorHTTPRequest{ExecutorHTTPRequest: pluginapi.ExecutorHTTPRequest{
+		URL:         "https://api.individual.githubcopilot.com/v1/messages",
+		Method:      http.MethodPost,
+		Headers:     http.Header{"Anthropic-Beta": []string{"feature-one", "feature-two"}},
 		Body:        body,
 		StorageJSON: mustJSON(t, storage),
 	}}))
