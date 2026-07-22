@@ -14,6 +14,8 @@ const (
 	copilotAPIVersion       = "2026-06-01"
 	copilotOpenAIIntent     = "conversation-edits"
 	defaultAnthropicVersion = "2023-06-01"
+	fineGrainedToolBeta     = "fine-grained-tool-streaming-2025-05-14"
+	interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 )
 
 func brokerHeaders(githubToken string) http.Header {
@@ -45,7 +47,18 @@ func inferenceHeaders(sessionToken, format string, payload []byte, caller http.H
 	}
 	if format == formatClaude {
 		headers.Set("Anthropic-Version", defaultAnthropicVersion)
-		if beta := strings.TrimSpace(caller.Get("Anthropic-Beta")); beta != "" {
+		model := modelFromPayload(payload)
+		beta := strings.Join(caller.Values("Anthropic-Beta"), ",")
+		if usesAnthropicBudgetThinking(model) {
+			beta = ""
+		}
+		if !supportsAnthropicEagerToolInputStreaming(model) && hasAnthropicTools(payload) {
+			beta = appendAnthropicBeta(beta, fineGrainedToolBeta)
+		}
+		if usesAnthropicBudgetThinking(model) && hasEnabledAnthropicThinking(payload) {
+			beta = appendAnthropicBeta(beta, interleavedThinkingBeta)
+		}
+		if beta = strings.TrimSpace(beta); beta != "" {
 			headers.Set("Anthropic-Beta", beta)
 		}
 	}
@@ -53,6 +66,40 @@ func inferenceHeaders(sessionToken, format string, payload []byte, caller http.H
 		headers.Set("X-Interaction-Type", interaction)
 	}
 	return headers
+}
+
+func hasAnthropicTools(payload []byte) bool {
+	var root struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	return json.Unmarshal(payload, &root) == nil && len(root.Tools) > 0
+}
+
+func hasEnabledAnthropicThinking(payload []byte) bool {
+	var root struct {
+		Thinking struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+	}
+	return json.Unmarshal(payload, &root) == nil && strings.EqualFold(strings.TrimSpace(root.Thinking.Type), "enabled")
+}
+
+func appendAnthropicBeta(raw, required string) string {
+	values := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	for _, value := range append(strings.Split(raw, ","), required) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		values = append(values, value)
+	}
+	return strings.Join(values, ",")
 }
 
 func inferInitiator(payload []byte) string {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -146,6 +147,186 @@ func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
 	}
 }
 
+func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(75_000, 0).UTC()
+	service.now = func() time.Time { return now }
+
+	prepare := func(t *testing.T, model, payload string) preparedInference {
+		t.Helper()
+		prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: model, Format: formatClaude, SourceFormat: formatClaude,
+			Payload: []byte(payload), StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: model, Format: formatClaude})),
+		}, true)
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		return prepared
+	}
+	decode := func(t *testing.T, prepared preparedInference) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		if errDecode := json.Unmarshal(prepared.upstreamPayload, &payload); errDecode != nil {
+			t.Fatalf("decode upstream payload: %v", errDecode)
+		}
+		return payload
+	}
+
+	t.Run("sends per-tool eager_input_streaming by default", func(t *testing.T) {
+		prepared := prepare(t, "claude-opus-4.8", `{
+			"model":"claude-opus-4.8",
+			"messages":[{"role":"user","content":"Use the tool"}],
+			"tools":[{"name":"lookup","description":"Look up a value","input_schema":{"type":"object"}}]
+		}`)
+		payload := decode(t, prepared)
+		tools, ok := payload["tools"].([]any)
+		if !ok || len(tools) != 1 {
+			t.Fatalf("tools = %#v", payload["tools"])
+		}
+		tool, ok := tools[0].(map[string]any)
+		if !ok || tool["eager_input_streaming"] != true {
+			t.Fatalf("first tool = %#v", tools[0])
+		}
+		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
+			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+	})
+
+	t.Run("uses the legacy fine-grained beta when eager input streaming is disabled", func(t *testing.T) {
+		for _, model := range []string{"claude-haiku-4.5", "claude-sonnet-4", "claude-sonnet-4.5"} {
+			t.Run(model, func(t *testing.T) {
+				prepared := prepare(t, model, `{
+					"model":"`+model+`",
+					"messages":[{"role":"user","content":"Use the tool"}],
+					"tools":[{"name":"lookup","eager_input_streaming":true,"input_schema":{"type":"object"}}]
+				}`)
+				payload := decode(t, prepared)
+				tools, ok := payload["tools"].([]any)
+				if !ok || len(tools) != 1 {
+					t.Fatalf("tools = %#v", payload["tools"])
+				}
+				tool, ok := tools[0].(map[string]any)
+				if !ok {
+					t.Fatalf("first tool = %#v", tools[0])
+				}
+				if _, exists := tool["eager_input_streaming"]; exists {
+					t.Fatalf("eager_input_streaming reached %s: %#v", model, tool)
+				}
+				if beta := prepared.headers.Get("Anthropic-Beta"); beta != fineGrainedToolBeta {
+					t.Fatalf("Anthropic-Beta = %q", beta)
+				}
+			})
+		}
+	})
+
+	t.Run("omits tools and legacy beta when there are no tools", func(t *testing.T) {
+		prepared := prepare(t, "claude-haiku-4.5", `{
+			"model":"claude-haiku-4.5",
+			"messages":[{"role":"user","content":"Hello"}],
+			"tools":[]
+		}`)
+		payload := decode(t, prepared)
+		if _, exists := payload["tools"]; exists {
+			t.Fatalf("empty tools were retained: %#v", payload["tools"])
+		}
+		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
+			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+	})
+}
+
+func TestHaikuNormalizesClaudeCodeRequestLikePi(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(77_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	const model = "claude-haiku-4.5"
+	payload := []byte(`{
+		"model":"claude-haiku-4.5",
+		"max_tokens":32000,
+		"system":[{"type":"text","text":"top-level system"}],
+		"messages":[
+			{"role":"user","content":"Hello"},
+			{"role":"system","content":[{"type":"text","text":"mid-system","cache_control":{"type":"ephemeral"}}]}
+		],
+		"tools":[],
+		"thinking":{"type":"adaptive","display":"omitted"},
+		"output_config":{"effort":"high"},
+		"context_management":{"edits":[]}
+	}`)
+	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+		AuthID: "auth", Model: model, Format: formatClaude, SourceFormat: formatClaude,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: model, Format: formatClaude})),
+		Headers: http.Header{"Anthropic-Beta": []string{
+			"interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,effort-2025-11-24",
+		}},
+	}, true)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	var body map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &body); errDecode != nil {
+		t.Fatalf("decode upstream payload: %v", errDecode)
+	}
+	if _, exists := body["tools"]; exists {
+		t.Fatalf("empty tools were retained: %#v", body["tools"])
+	}
+	if _, exists := body["output_config"]; exists {
+		t.Fatalf("adaptive output_config was retained: %#v", body["output_config"])
+	}
+	if _, exists := body["context_management"]; exists {
+		t.Fatalf("context_management was retained: %#v", body["context_management"])
+	}
+	thinking, ok := body["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(16384) || thinking["display"] != "summarized" {
+		t.Fatalf("thinking = %#v", body["thinking"])
+	}
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 1 || messages[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("messages = %#v", body["messages"])
+	}
+	system, ok := body["system"].([]any)
+	if !ok || len(system) != 2 {
+		t.Fatalf("system = %#v", body["system"])
+	}
+	moved := system[1].(map[string]any)
+	if moved["text"] != "mid-system" || moved["cache_control"] == nil {
+		t.Fatalf("moved system block = %#v", moved)
+	}
+	if beta := prepared.headers.Get("Anthropic-Beta"); beta != interleavedThinkingBeta {
+		t.Fatalf("Anthropic-Beta = %q", beta)
+	}
+}
+
+func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
+	for _, test := range []struct {
+		effort    string
+		maxTokens int
+		want      int
+	}{
+		{effort: "minimal", maxTokens: 32000, want: 1024},
+		{effort: "low", maxTokens: 32000, want: 2048},
+		{effort: "medium", maxTokens: 32000, want: 8192},
+		{effort: "high", maxTokens: 32000, want: 16384},
+		{effort: "xhigh", maxTokens: 32000, want: 16384},
+		{effort: "high", maxTokens: 4096, want: 3072},
+	} {
+		t.Run(fmt.Sprintf("%s-%d", test.effort, test.maxTokens), func(t *testing.T) {
+			payload := map[string]any{
+				"max_tokens":    test.maxTokens,
+				"thinking":      map[string]any{"type": "adaptive"},
+				"output_config": map[string]any{"effort": test.effort},
+			}
+			if !normalizeAnthropicPayload(payload, "claude-haiku-4.5") {
+				t.Fatal("payload was not normalized")
+			}
+			thinking := payload["thinking"].(map[string]any)
+			if thinking["budget_tokens"] != test.want {
+				t.Fatalf("thinking = %#v", thinking)
+			}
+		})
+	}
+}
+
 func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	const sentinel = "SENTINEL_PRIVATE_UPSTREAM_BODY"
 	service := newPluginService(nil)
@@ -189,6 +370,50 @@ func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {
 	}
 	if len(bridge.snapshot()) != 0 {
 		t.Fatal("blocked cross-origin request reached host bridge")
+	}
+}
+
+func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(95_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %s", method)
+		}
+		req := payload.(rpcHostHTTPRequest)
+		var body map[string]any
+		if errDecode := json.Unmarshal(req.Body, &body); errDecode != nil {
+			t.Fatalf("decode upstream body: %v", errDecode)
+		}
+		tools, ok := body["tools"].([]any)
+		if !ok || len(tools) != 1 {
+			t.Fatalf("tools = %#v", body["tools"])
+		}
+		tool := tools[0].(map[string]any)
+		if _, exists := tool["eager_input_streaming"]; exists {
+			t.Fatalf("eager_input_streaming reached HTTP bridge: %#v", tool)
+		}
+		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != fineGrainedToolBeta {
+			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
+	}}
+	service.bridge = bridge
+	body := []byte(`{
+		"model":"claude-haiku-4.5",
+		"messages":[{"role":"user","content":"Use the tool"}],
+		"tools":[{"name":"lookup","eager_input_streaming":true,"input_schema":{"type":"object"}}]
+	}`)
+	_, failure := service.executeHTTPRequest(mustJSON(t, rpcExecutorHTTPRequest{ExecutorHTTPRequest: pluginapi.ExecutorHTTPRequest{
+		URL:         "https://api.individual.githubcopilot.com/v1/messages",
+		Method:      http.MethodPost,
+		Body:        body,
+		StorageJSON: mustJSON(t, storage),
+	}}))
+	if failure != nil {
+		t.Fatal(failure)
 	}
 }
 

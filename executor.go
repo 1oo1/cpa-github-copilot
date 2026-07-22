@@ -228,6 +228,7 @@ func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([
 			payload["max_tokens"] = 4096
 		}
 		delete(payload, "stream_options")
+		normalizeAnthropicPayload(payload, model)
 	}
 	if format == formatOpenAIResponse {
 		if _, exists := payload["store"]; !exists {
@@ -239,6 +240,225 @@ func normalizeInferencePayload(raw []byte, model, format string, stream bool) ([
 		return nil, fmt.Errorf("encode GitHub Copilot request payload")
 	}
 	return out, nil
+}
+
+func normalizeAnthropicPayload(payload map[string]any, model string) bool {
+	changed := normalizeAnthropicToolInputStreaming(payload, model)
+	if !usesAnthropicBudgetThinking(model) {
+		return changed
+	}
+	thinking, hasThinking := payload["thinking"].(map[string]any)
+	adaptiveThinking := hasThinking && strings.EqualFold(stringValue(thinking["type"]), "adaptive")
+	budget := 0
+	if adaptiveThinking {
+		budget = anthropicThinkingBudget(payload, thinking)
+	}
+	if normalizeAnthropicSystemMessages(payload) {
+		changed = true
+	}
+	if _, exists := payload["context_management"]; exists {
+		delete(payload, "context_management")
+		changed = true
+	}
+	if outputConfig, ok := payload["output_config"].(map[string]any); ok {
+		if _, exists := outputConfig["effort"]; exists {
+			delete(outputConfig, "effort")
+			changed = true
+		}
+		if len(outputConfig) == 0 {
+			delete(payload, "output_config")
+		}
+	}
+	if !adaptiveThinking {
+		return changed
+	}
+
+	if budget < 1024 {
+		delete(payload, "thinking")
+		return true
+	}
+	payload["thinking"] = map[string]any{
+		"type":          "enabled",
+		"budget_tokens": budget,
+		"display":       "summarized",
+	}
+	return true
+}
+
+func anthropicThinkingBudget(payload, thinking map[string]any) int {
+	effort := ""
+	if outputConfig, ok := payload["output_config"].(map[string]any); ok {
+		effort = stringValue(outputConfig["effort"])
+	}
+	if effort == "" {
+		effort = stringValue(thinking["effort"])
+	}
+	budget := 16384
+	switch strings.ToLower(effort) {
+	case "minimal":
+		budget = 1024
+	case "low":
+		budget = 2048
+	case "medium":
+		budget = 8192
+	}
+	maxTokens := intFromJSONNumber(payload["max_tokens"])
+	if maxTokens > 0 && budget > maxTokens-1024 {
+		budget = maxTokens - 1024
+	}
+	return budget
+}
+
+func intFromJSONNumber(value any) int {
+	switch number := value.(type) {
+	case float64:
+		return int(number)
+	case int:
+		return number
+	case int64:
+		return int(number)
+	default:
+		return 0
+	}
+}
+
+func normalizeAnthropicSystemMessages(payload map[string]any) bool {
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return false
+	}
+	system, ok := anthropicSystemBlocks(payload["system"])
+	if !ok {
+		return false
+	}
+	kept := make([]any, 0, len(messages))
+	moved := false
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok || !strings.EqualFold(stringValue(message["role"]), "system") {
+			kept = append(kept, rawMessage)
+			continue
+		}
+		blocks, convertible := anthropicSystemBlocks(message["content"])
+		if !convertible {
+			kept = append(kept, rawMessage)
+			continue
+		}
+		system = append(system, blocks...)
+		moved = true
+	}
+	if !moved {
+		return false
+	}
+	payload["messages"] = kept
+	if len(system) == 0 {
+		delete(payload, "system")
+	} else {
+		payload["system"] = system
+	}
+	return true
+}
+
+func anthropicSystemBlocks(content any) ([]any, bool) {
+	switch typed := content.(type) {
+	case nil:
+		return nil, true
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil, true
+		}
+		return []any{map[string]any{"type": "text", "text": typed}}, true
+	case []any:
+		blocks := make([]any, 0, len(typed))
+		for _, rawBlock := range typed {
+			switch block := rawBlock.(type) {
+			case string:
+				if strings.TrimSpace(block) != "" {
+					blocks = append(blocks, map[string]any{"type": "text", "text": block})
+				}
+			case map[string]any:
+				if !strings.EqualFold(stringValue(block["type"]), "text") {
+					return nil, false
+				}
+				if text, ok := block["text"].(string); !ok {
+					return nil, false
+				} else if strings.TrimSpace(text) != "" {
+					blocks = append(blocks, block)
+				}
+			default:
+				return nil, false
+			}
+		}
+		return blocks, true
+	default:
+		return nil, false
+	}
+}
+
+func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) bool {
+	rawTools, exists := payload["tools"]
+	if !exists {
+		return false
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return false
+	}
+	if len(tools) == 0 {
+		delete(payload, "tools")
+		return true
+	}
+
+	changed := false
+	supportsEager := supportsAnthropicEagerToolInputStreaming(model)
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if supportsEager {
+			if eager, exists := tool["eager_input_streaming"]; !exists || eager != true {
+				tool["eager_input_streaming"] = true
+				changed = true
+			}
+			continue
+		}
+		if _, exists := tool["eager_input_streaming"]; exists {
+			delete(tool, "eager_input_streaming")
+			changed = true
+		}
+	}
+	return changed
+}
+
+func normalizeAnthropicPayloadBytes(raw []byte, model string) []byte {
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayload(payload, model) {
+		return raw
+	}
+	out, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return raw
+	}
+	return out
+}
+
+func supportsAnthropicEagerToolInputStreaming(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-haiku-4.5", "claude-sonnet-4", "claude-sonnet-4.5":
+		return false
+	default:
+		return true
+	}
+}
+
+func usesAnthropicBudgetThinking(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-haiku-4.5", "claude-opus-4.5", "claude-sonnet-4", "claude-sonnet-4.5":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeFormat(raw string) string {
@@ -357,12 +577,16 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 	}
 	model := modelFromPayload(req.Body)
 	format := inferModelFormat(model)
-	headers := inferenceHeaders(storage.CopilotSessionToken, format, req.Body, req.Headers)
+	body := append([]byte(nil), req.Body...)
+	if format == formatClaude {
+		body = normalizeAnthropicPayloadBytes(body, model)
+	}
+	headers := inferenceHeaders(storage.CopilotSessionToken, format, body, req.Headers)
 	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(pluginapi.HTTPRequest{
 		Method:  valueOr(strings.TrimSpace(req.Method), http.MethodPost),
 		URL:     req.URL,
 		Headers: headers,
-		Body:    append([]byte(nil), req.Body...),
+		Body:    body,
 	})
 	if errHTTP != nil {
 		failure := &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot HTTP request failed", retryable: true, httpStatus: http.StatusBadGateway}
