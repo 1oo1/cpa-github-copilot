@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type streamBridgeFake struct {
 	pluginClosed   bool
 	pluginError    string
 	emitError      bool
+	logs           []rpcHostLogRequest
 	done           chan struct{}
 	doneOnce       sync.Once
 }
@@ -35,6 +37,9 @@ func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, er
 	var result any = map[string]any{}
 	switch method {
 	case pluginabi.MethodHostLog:
+		if request, ok := payload.(rpcHostLogRequest); ok {
+			f.logs = append(f.logs, request)
+		}
 	case pluginabi.MethodHostHTTPDoStream:
 		result = rpcHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-1"}
 	case pluginabi.MethodHostHTTPStreamRead:
@@ -70,6 +75,12 @@ func (f *streamBridgeFake) wait(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for plugin stream close")
 	}
+}
+
+func (f *streamBridgeFake) snapshotLogs() []rpcHostLogRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]rpcHostLogRequest(nil), f.logs...)
 }
 
 func TestExecuteStreamPassThroughAndClosesBothStreams(t *testing.T) {
@@ -280,4 +291,144 @@ func bytesJoin(chunks [][]byte) []byte {
 		out = append(out, chunk...)
 	}
 	return out
+}
+
+func hasLogEvent(logs []rpcHostLogRequest, event string) bool {
+	for _, entry := range logs {
+		if entry.Fields["event"] == event {
+			return true
+		}
+	}
+	return false
+}
+
+func executeOpenAIStream(t *testing.T, bridge *streamBridgeFake, streamID string, at time.Time) {
+	t.Helper()
+	service := newPluginService(bridge)
+	service.now = func() time.Time { return at }
+	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+			Payload: payload, StorageJSON: mustJSON(t, executorStorage(at, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		},
+		StreamID: streamID, HostCallbackID: "callback-stream",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+}
+
+func TestForwardStreamSuccessLogsCompletedDebug(t *testing.T) {
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: first\n\n")},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n"), Done: true},
+	)
+	executeOpenAIStream(t, bridge, "plugin-success-log", time.Unix(135_000, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.forward_failed") {
+		t.Fatal("successful stream must not log inference.stream.forward_failed")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.completed")
+	if entry.Level != "debug" {
+		t.Fatalf("completed level = %q, want debug", entry.Level)
+	}
+	if entry.Fields["success"] != true {
+		t.Fatalf("success = %v, want true", entry.Fields["success"])
+	}
+	if _, hasReason := entry.Fields["reason"]; hasReason {
+		t.Fatalf("completed log should not include a reason field")
+	}
+}
+
+func TestForwardStreamBenignDownstreamCloseLogsDebug(t *testing.T) {
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
+	bridge.emitError = true
+	executeOpenAIStream(t, bridge, "plugin-benign-emit", time.Unix(130_000, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.forward_failed") {
+		t.Fatal("benign downstream close must not log inference.stream.forward_failed")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.client_disconnected")
+	if entry.Level != "debug" {
+		t.Fatalf("client_disconnected level = %q, want debug", entry.Level)
+	}
+	if entry.Fields["reason"] != streamReasonDownstreamClosed {
+		t.Fatalf("reason = %v, want %q", entry.Fields["reason"], streamReasonDownstreamClosed)
+	}
+	if entry.Fields["success"] != false {
+		t.Fatalf("success = %v, want false", entry.Fields["success"])
+	}
+}
+
+func TestForwardStreamReadFailureLogsWarn(t *testing.T) {
+	bridge := newStreamBridgeFake() // no chunks: the host stream read call fails
+	executeOpenAIStream(t, bridge, "plugin-read-failure", time.Unix(131_000, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.client_disconnected") {
+		t.Fatal("a host read failure must not be logged as a benign client disconnect")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.forward_failed")
+	if entry.Level != "warn" {
+		t.Fatalf("forward_failed level = %q, want warn", entry.Level)
+	}
+	if entry.Fields["reason"] != streamReasonReadFailed {
+		t.Fatalf("reason = %v, want %q", entry.Fields["reason"], streamReasonReadFailed)
+	}
+}
+
+func TestForwardStreamUpstreamErrorLogsWarn(t *testing.T) {
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
+	executeOpenAIStream(t, bridge, "plugin-upstream-warn", time.Unix(132_000, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.client_disconnected") {
+		t.Fatal("upstream error must not be logged as client_disconnected")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.forward_failed")
+	if entry.Level != "warn" {
+		t.Fatalf("forward_failed level = %q, want warn", entry.Level)
+	}
+	if entry.Fields["reason"] != streamReasonUpstreamError {
+		t.Fatalf("reason = %v, want %q", entry.Fields["reason"], streamReasonUpstreamError)
+	}
+	errMessage, _ := entry.Fields["error"].(string)
+	if strings.Contains(errMessage, "private upstream detail") {
+		t.Fatalf("log leaked upstream detail: %q", errMessage)
+	}
+	if errMessage != "GitHub Copilot upstream stream failed" {
+		t.Fatalf("error message = %q", errMessage)
+	}
+}
+
+func TestClassifyStreamForwardError(t *testing.T) {
+	if reason, message, benign := classifyStreamForwardError(nil); reason != "" || message != "" || benign {
+		t.Fatalf("nil error classified as (%q, %q, %v)", reason, message, benign)
+	}
+	benignErr := newStreamForwardError(streamReasonDownstreamClosed, "closed", true)
+	if reason, message, benign := classifyStreamForwardError(benignErr); reason != streamReasonDownstreamClosed || message != "closed" || !benign {
+		t.Fatalf("benign error classified as (%q, %q, %v)", reason, message, benign)
+	}
+	fatalErr := newStreamForwardError(streamReasonUpstreamError, "boom", false)
+	if reason, _, benign := classifyStreamForwardError(fatalErr); reason != streamReasonUpstreamError || benign {
+		t.Fatalf("fatal error classified as (%q, benign=%v)", reason, benign)
+	}
+	if reason, message, benign := classifyStreamForwardError(errors.New("raw")); reason != "unknown" || message != "raw" || benign {
+		t.Fatalf("raw error classified as (%q, %q, %v)", reason, message, benign)
+	}
+}
+
+func TestSSEFramerBufferExceededReturnsTypedError(t *testing.T) {
+	framer := newSSEFramer(16)
+	_, errPush := framer.Push([]byte("data: 12345678901234567890"))
+	if errPush == nil {
+		t.Fatal("oversized partial event was accepted")
+	}
+	var forwardErr *streamForwardError
+	if !errors.As(errPush, &forwardErr) {
+		t.Fatalf("framer error type = %T, want *streamForwardError", errPush)
+	}
+	if forwardErr.reason != streamReasonBufferExceeded || forwardErr.benign {
+		t.Fatalf("framer error = (reason=%q, benign=%v)", forwardErr.reason, forwardErr.benign)
+	}
 }

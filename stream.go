@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -55,18 +55,26 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 }
 
 func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
-	errorMessage := ""
+	var forwardErr error
 	defer func() {
 		panicked := recover() != nil
 		if panicked {
-			errorMessage = "GitHub Copilot stream forwarding failed"
+			forwardErr = newStreamForwardError(streamReasonPanic, "GitHub Copilot stream forwarding failed", false)
 		}
+		reason, errorMessage, benign := classifyStreamForwardError(forwardErr)
 		fields := preparedInferenceLogFields(prepared, true)
-		fields["success"] = errorMessage == ""
+		fields["success"] = forwardErr == nil
 		fields["panicked"] = panicked
-		if errorMessage == "" {
+		switch {
+		case forwardErr == nil:
 			s.logEvent(client.callbackID, "debug", "inference.stream.completed", fields)
-		} else {
+		case benign:
+			fields["reason"] = reason
+			fields["error"] = errorMessage
+			s.logEvent(client.callbackID, "debug", "inference.stream.client_disconnected", fields)
+		default:
+			fields["reason"] = reason
+			fields["error"] = errorMessage
 			s.logEvent(client.callbackID, "warn", "inference.stream.forward_failed", fields)
 		}
 		client.closeStream(upstreamStreamID)
@@ -74,14 +82,62 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 	}()
 	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		if errForward := forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer); errForward != nil {
-			errorMessage = errForward.Error()
-		}
+		forwardErr = forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer)
 		return
 	}
-	if errForward := forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer); errForward != nil {
-		errorMessage = errForward.Error()
+	forwardErr = forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer)
+}
+
+// streamForwardError classifies why stream forwarding stopped so the deferred
+// logger in forwardCopilotStream can choose an appropriate level. Only a benign
+// downstream close is expected during normal operation and must not be logged as
+// a warning: when the client goes away the host rejects the next emit. Host read
+// failures are deliberately NOT treated as benign. The host dispatches plugin
+// stream reads on a background context, so a client disconnect surfaces either as
+// a normal end-of-stream (the upstream channel closes) or as a rejected emit,
+// never as a read error. A read error therefore signals a real host/ABI failure
+// (teardown, a closed-stream race, or an undecodable response) and must warn.
+type streamForwardError struct {
+	reason  string
+	message string
+	benign  bool
+}
+
+const (
+	streamReasonDownstreamClosed = "downstream_closed"
+	streamReasonReadFailed       = "read_failed"
+	streamReasonUpstreamError    = "upstream_error"
+	streamReasonBufferExceeded   = "buffer_exceeded"
+	streamReasonPanic            = "panic"
+)
+
+func newStreamForwardError(reason, message string, benign bool) *streamForwardError {
+	return &streamForwardError{reason: reason, message: message, benign: benign}
+}
+
+func (e *streamForwardError) Error() string {
+	if e == nil {
+		return ""
 	}
+	return e.message
+}
+
+// classifyStreamForwardError extracts the log reason, downstream error message,
+// and benign flag from a forwarding error. Errors that are not *streamForwardError
+// are treated as non-benign failures with an "unknown" reason.
+func classifyStreamForwardError(err error) (reason, message string, benign bool) {
+	if err == nil {
+		return "", "", false
+	}
+	var forwardErr *streamForwardError
+	if errors.As(err, &forwardErr) {
+		reason = forwardErr.reason
+		if reason == "" {
+			reason = "unknown"
+		}
+		return reason, forwardErr.Error(), forwardErr.benign
+	}
+	return "unknown", err.Error(), false
 }
 
 func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string, maxBuffer int) error {
@@ -94,17 +150,17 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 		payload = append(payload, frame...)
 		payload = append(payload, '\n', '\n')
 		if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
-			return fmt.Errorf("GitHub Copilot downstream stream closed")
+			return newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 		}
 		return nil
 	}
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
 		if errRead != nil {
-			return fmt.Errorf("GitHub Copilot upstream stream read failed")
+			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
 		if chunk.Error != "" {
-			return fmt.Errorf("GitHub Copilot upstream stream failed")
+			return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
 		}
 		frames, errFrame := framer.Push(chunk.Payload)
 		if errFrame != nil {
@@ -153,7 +209,7 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 				continue
 			}
 			if errEmit := client.emit(pluginStreamID, output); errEmit != nil {
-				return fmt.Errorf("GitHub Copilot downstream stream closed")
+				return newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 			}
 		}
 		return nil
@@ -161,10 +217,10 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
 		if errRead != nil {
-			return fmt.Errorf("GitHub Copilot upstream stream read failed")
+			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
 		if chunk.Error != "" {
-			return fmt.Errorf("GitHub Copilot upstream stream failed")
+			return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
 		}
 		frames, errFrame := framer.Push(chunk.Payload)
 		if errFrame != nil {
@@ -215,7 +271,7 @@ func (f *sseFramer) Push(chunk []byte) ([][]byte, error) {
 		f.buffer = append(f.buffer[:0], f.buffer[index+separatorLength:]...)
 	}
 	if len(f.buffer) > f.max {
-		return nil, fmt.Errorf("GitHub Copilot stream event exceeded the configured buffer")
+		return nil, newStreamForwardError(streamReasonBufferExceeded, "GitHub Copilot stream event exceeded the configured buffer", false)
 	}
 	return frames, nil
 }
