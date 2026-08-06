@@ -77,7 +77,7 @@ var knownCopilotModels = []string{
 	"claude-sonnet-4.6", "claude-sonnet-5", "gemini-2.5-pro", "gemini-3-flash-preview",
 	"gemini-3.1-pro-preview", "gemini-3.5-flash", "gpt-4.1", "gpt-5-mini", "gpt-5.2",
 	"gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "kimi-k2.7-code",
+	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "kimi-k2.7-code",
 	"mai-code-1-flash-picker",
 }
 
@@ -175,7 +175,7 @@ func (s *pluginService) discoverModels(client hostClient, storage copilotStorage
 		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "upstream_http"})
 		return nil, failure
 	}
-	models, errParse := parseDiscoveredModels(resp.Body)
+	models, errParse := parseDiscoveredModels(resp.Body, baseURL == individualCopilotAPIURL)
 	if errParse != nil {
 		failure := &pluginFailure{code: "model_discovery_invalid", message: errParse.Error(), httpStatus: http.StatusBadGateway}
 		s.logFailure(client.callbackID, "models.discovery.failed", failure, map[string]any{"stage": "response_validation"})
@@ -188,23 +188,37 @@ func (s *pluginService) discoverModels(client hostClient, storage copilotStorage
 	return models, nil
 }
 
-func parseDiscoveredModels(raw []byte) ([]storedModel, error) {
+func parseDiscoveredModels(raw []byte, allowPolicyFallback bool) ([]storedModel, error) {
 	var response remoteModelsResponse
 	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil || response.Data == nil {
 		return nil, fmt.Errorf("GitHub Copilot returned an invalid model catalog")
 	}
-	models := make([]storedModel, 0, len(response.Data))
-	seen := make(map[string]struct{})
+	pickerModels := make([]remoteModel, 0, len(response.Data))
+	policyModels := make([]remoteModel, 0, len(response.Data))
 	for _, rawModel := range response.Data {
 		var model remoteModel
 		if json.Unmarshal(rawModel, &model) != nil {
 			continue
 		}
 		model.ID = strings.TrimSpace(model.ID)
-		if model.ID == "" || !model.ModelPickerEnabled || strings.EqualFold(strings.TrimSpace(model.Policy.State), "disabled") ||
-			(model.Capabilities.Supports.ToolCalls != nil && !*model.Capabilities.Supports.ToolCalls) {
+		if model.ID == "" || (model.Capabilities.Supports.ToolCalls != nil && !*model.Capabilities.Supports.ToolCalls) {
 			continue
 		}
+		policyState := strings.TrimSpace(model.Policy.State)
+		if model.ModelPickerEnabled && !strings.EqualFold(policyState, "disabled") {
+			pickerModels = append(pickerModels, model)
+		}
+		if strings.EqualFold(policyState, "enabled") {
+			policyModels = append(policyModels, model)
+		}
+	}
+	selectedModels := pickerModels
+	if len(selectedModels) == 0 && allowPolicyFallback {
+		selectedModels = policyModels
+	}
+	models := make([]storedModel, 0, len(selectedModels))
+	seen := make(map[string]struct{})
+	for _, model := range selectedModels {
 		if _, exists := seen[model.ID]; exists {
 			continue
 		}
@@ -277,7 +291,7 @@ func inferModelFormat(modelID string) string {
 	if strings.HasPrefix(id, "claude-") && id != "claude-fable-5" {
 		return formatClaude
 	}
-	if strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
+	if id == "grok-4.5" || strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
 		return formatOpenAIResponse
 	}
 	return formatOpenAI

@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const individualCopilotAPIURL = "https://api.individual.githubcopilot.com"
+
 var hostnameLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 type providerEndpoints struct {
@@ -69,7 +71,7 @@ func endpointsForHost(host string) (providerEndpoints, error) {
 	}
 	if normalized == defaultGitHubHost {
 		endpoints.CopilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
-		endpoints.FallbackAPIURL = "https://api.individual.githubcopilot.com"
+		endpoints.FallbackAPIURL = individualCopilotAPIURL
 		endpoints.GitHubUserURL = "https://api.github.com/user"
 	} else {
 		endpoints.CopilotTokenURL = "https://api." + normalized + "/copilot_internal/v2/token"

@@ -25,7 +25,7 @@ SSE 流，因此 Chat Completions 客户端也可以调用只支持 Responses �
 GitHub Device Flow
   -> GitHub access token（长期，持久化）
   -> Copilot token broker（宿主 HTTP 桥）
-  -> Copilot session token（短期，提前 5 分钟刷新）
+  -> Copilot session token（短期，提前 10 分钟刷新）
   -> /models（账号模型发现）
   -> /chat/completions | /responses | /v1/messages
 ```
@@ -153,8 +153,10 @@ GET /v0/management/get-auth-status?state=<state>
 
 ## API 使用
 
-模型列表来自当前账号的 Copilot `/models`，并过滤掉 picker 未启用、policy 禁用或
-明确不支持 tool calls 的项目：
+模型列表来自当前账号的 Copilot `/models`，默认过滤掉 picker 未启用、policy 禁用
+或明确不支持 tool calls 的项目。若 Individual endpoint 的 picker 结果为空，则回退
+到 `policy.state == "enabled"` 且支持 tool calls 的项目；Business 和 Enterprise
+仍使用严格 picker 语义：
 
 ```http
 GET /v1/models
@@ -170,7 +172,8 @@ OpenAI Chat Completions 示例：
 }
 ```
 
-同一个模型也可从 Responses 入口调用；Claude 模型可从 Messages 入口原生调用。
+同一个模型也可从 Responses 入口调用；`grok-4.5`、GPT-5、OSWE 和 MAI 模型走
+Responses 上游，Claude 模型可从 Messages 入口原生调用。
 插件会保护上游 Authorization，前端请求头不能覆盖 Copilot session token。
 
 ## 凭据兼容

@@ -21,7 +21,7 @@ func TestParseDiscoveredModelsFiltersAndMapsCapabilities(t *testing.T) {
 		remoteModelFixture("hidden", false, "", true, []string{"/chat/completions"}),
 		remoteModelFixture("no-tools", true, "", false, []string{"/chat/completions"}),
 	}})
-	models, errParse := parseDiscoveredModels(raw)
+	models, errParse := parseDiscoveredModels(raw, false)
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
@@ -41,6 +41,7 @@ func TestSelectModelFormatUsesSupportedEndpointAndInference(t *testing.T) {
 		want      string
 	}{
 		{id: "gpt-5.4", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
+		{id: "grok-4.5", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
 		{id: "claude-sonnet-4.6", endpoints: []string{"/v1/messages"}, want: formatClaude},
 		{id: "gpt-4.1", endpoints: []string{"/responses"}, want: formatOpenAIResponse},
 		{id: "gpt-4.1", endpoints: nil, want: formatOpenAI},
@@ -139,6 +140,60 @@ func TestDiscoverModelsAcceptsValidEmptyCatalog(t *testing.T) {
 		GitHubHost:          "github.com",
 	})
 	if failure != nil || models == nil || len(models) != 0 {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsFallsBackToEnabledPoliciesForIndividualAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("disabled", false, "disabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("no-tools", false, "enabled", false, []string{"/chat/completions"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newPluginService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 1 || models[0].ID != "gpt-4.1" {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsPrefersNonEmptyPickerCatalogForIndividualAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"}),
+		remoteModelFixture("gpt-5.4", false, "enabled", true, []string{"/responses"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newPluginService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 1 || models[0].ID != "gpt-4.1" {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsKeepsStrictPickerSemanticsForBusinessAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newPluginService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.business.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 0 {
 		t.Fatalf("models = %#v, failure = %#v", models, failure)
 	}
 }

@@ -93,8 +93,9 @@ that would erase the `Handled` decision at the host adapter boundary.
    fetch a non-secret GitHub login for labeling, and return the complete auth.
 
 The long-lived GitHub token is never sent to a model endpoint. The short-lived
-Copilot session token is scheduled for refresh five minutes before the broker's
-`expires_at`, with a floor for unusually short sessions.
+Copilot session token is scheduled for refresh ten minutes before the broker's
+`expires_at`, leaving enough time for the host's five-minute retry backoff when
+model discovery makes a refresh attempt fail.
 
 ### 3.4 Refresh
 
@@ -125,6 +126,10 @@ response, and exposes only models satisfying all of:
 - `policy.state != "disabled"`;
 - `capabilities.supports.tool_calls != false`;
 - at least one supported or safely inferred inference endpoint.
+
+If this strict picker result is empty on the exact Individual API endpoint,
+discovery falls back to models with `policy.state == "enabled"` and tool calls.
+Business and Enterprise endpoints retain strict picker semantics.
 
 Model metadata will include context/output limits, input modalities, reasoning
 levels/budgets, and the account-supported endpoint. The selected route is
