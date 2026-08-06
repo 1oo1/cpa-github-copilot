@@ -397,7 +397,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	}
 }
 
-func TestRefreshAuthReturnsNoPartialCredentialWhenDiscoveryFails(t *testing.T) {
+func TestRefreshAuthKeepsNewSessionAndCachedModelsWhenDiscoveryFails(t *testing.T) {
 	now := time.Unix(24_000, 0).UTC()
 	bridge := &fakeBridge{handler: func(_ string, payload any) (any, error) {
 		req := payload.(rpcHostHTTPRequest)
@@ -414,17 +414,23 @@ func TestRefreshAuthReturnsNoPartialCredentialWhenDiscoveryFails(t *testing.T) {
 	service.now = func() time.Time { return now }
 	previous := copilotStorage{
 		Type: pluginIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "tid=OLD",
-		GitHubHost: "github.com", Models: []storedModel{{ID: "gpt-4.1", Format: formatOpenAI}},
+		GitHubHost: "github.com", ModelsFetchedAt: now.Add(-time.Hour).UnixMilli(),
+		Models: []storedModel{{ID: "gpt-4.1", Format: formatOpenAI}},
 	}
 	response, failure := service.refreshAuth(mustJSON(t, rpcAuthRefreshRequest{
 		AuthRefreshRequest: pluginapi.AuthRefreshRequest{AuthID: "auth", StorageJSON: mustJSON(t, previous)},
 		HostCallbackID:     "refresh",
 	}))
-	if failure == nil || response != nil || !strings.Contains(failure.Error(), "invalid model catalog") {
+	if failure != nil {
 		t.Fatalf("response=%s failure=%v", response, failure)
 	}
-	if previous.CopilotSessionToken != "tid=OLD" || len(previous.Models) != 1 {
-		t.Fatalf("previous credential was mutated: %#v", previous)
+	result := decodePluginResult[pluginapi.AuthRefreshResponse](t, response)
+	next, errStorage := decodeCopilotStorage(result.Auth.StorageJSON)
+	if errStorage != nil || !strings.HasPrefix(next.CopilotSessionToken, "tid=NEW;") || next.ExpiresAt != time.Unix(25000, 0).UnixMilli() {
+		t.Fatalf("refreshed session = %#v, %v", next, errStorage)
+	}
+	if len(next.Models) != 1 || next.Models[0].ID != "gpt-4.1" || next.ModelsFetchedAt != previous.ModelsFetchedAt {
+		t.Fatalf("cached models were not preserved: %#v", next)
 	}
 }
 
@@ -448,7 +454,7 @@ func TestExchangeSessionExpiryMarginAndMissingFields(t *testing.T) {
 	if failure != nil {
 		t.Fatal(failure)
 	}
-	wantRefresh := time.Unix(26000, 0).Add(-refreshSafetyMargin).UnixMilli()
+	wantRefresh := time.Unix(26000, 0).Add(-10 * time.Minute).UnixMilli()
 	if storage.RefreshAfter != wantRefresh {
 		t.Fatalf("refresh_after = %d, want %d", storage.RefreshAfter, wantRefresh)
 	}

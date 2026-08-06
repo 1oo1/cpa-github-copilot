@@ -21,7 +21,9 @@ import (
 const (
 	defaultPollInterval = 5 * time.Second
 	minPollInterval     = time.Second
-	refreshSafetyMargin = 5 * time.Minute
+	// CPA 刷新失败后的退避时间是 5 分钟，刷新过程还强制请求 /models；模型接口偶发失败时，即使已经拿到新 session token，插件也会丢弃整个刷新结果。
+	// 如果刷新时间也是 5 分钟，可能会出现下一次重试时 token 已到期，因此插件返回 401：GitHub Copilot session requires refresh。
+	refreshSafetyMargin = 10 * time.Minute
 	hostRefreshInterval = 15 * time.Minute
 )
 
@@ -741,11 +743,17 @@ func (s *pluginService) refreshAuth(raw []byte) ([]byte, error) {
 	}
 	models, failure := s.discoverModels(client, next)
 	if failure != nil {
-		s.logFailure(req.HostCallbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
-		return nil, failure
+		next.Models = append([]storedModel(nil), previous.Models...)
+		next.ModelsFetchedAt = previous.ModelsFetchedAt
+		s.logFailure(req.HostCallbackID, "auth.refresh.models_fallback", failure, map[string]any{
+			"auth_id":            req.AuthID,
+			"cached_model_count": len(next.Models),
+			"cached_model_ids":   storedModelIDs(next.Models),
+		})
+	} else {
+		next.Models = models
+		next.ModelsFetchedAt = s.now().UTC().UnixMilli()
 	}
-	next.Models = models
-	next.ModelsFetchedAt = s.now().UTC().UnixMilli()
 	next.Account = previous.Account
 	auth := authDataFromStorage(next, authDataDefaults{
 		ID:         req.AuthID,
