@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "github-copilot-go",
+      "name": "GitHub Copilot",
+      "description": "Adds GitHub Copilot subscription provider support to CLIProxyAPI.",
+      "author": "1oo1",
+      "repository": "https://github.com/1oo1/cpa-github-copilot",
+      "homepage": "https://github.com/1oo1/cpa-github-copilot",
+      "tags": [
+        "Provider",
+        "GitHub Copilot"
+      ]
+    }
+  ]
+}

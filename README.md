@@ -74,12 +74,68 @@ make integration
 交叉编译器路径可通过 `LINUX_AMD64_CC` 和 `LINUX_ARM64_CC` 覆盖。每个
 `build*` 目标都会先清空 `bin/`。找不到对应交叉编译器时，构建会自动使用
 Docker 中的 `golang:1.26-bookworm`；镜像可通过 `DOCKER_GO_IMAGE` 覆盖。
+构建版本默认取当前 checkout 的精确 Git tag；普通开发构建使用 `0.0.0-dev`，
+也可以显式指定，例如 `make build VERSION=0.1.3`。
 
 `make integration` 会使用 CLIProxyAPI 的真实动态库 loader 装载产物，并验证
 注册、`auth.parse` 的 `Handled` 行为和按凭据模型提供方能力。该目标会自动构建
 当前主机平台的测试产物。
 
-## 安装与配置
+## 通过 Plugin Store 安装与更新
+
+本仓库自带 [registry.json](registry.json)，无需登记到官方 Plugin Store。在
+CLIProxyAPI 配置中把它的 GitHub Raw URL 追加为 Store source：
+
+```yaml
+plugins:
+  enabled: true
+  dir: "/path/to/plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/registry.json"
+  configs:
+    github-copilot-go:
+      enabled: true
+      priority: 100
+```
+
+重载配置后，从 Management Center 的 Plugin Store 找到 `GitHub Copilot` 并安装。
+首次 Store 安装会把动态库写入 `plugins.dir/<goos>/<goarch>/`，并在插件配置中记录
+该自定义 source 和已安装版本；之后发布新的 GitHub Release，CPA 就能检测并
+安装更新，不需要手工复制动态库。
+
+也可以通过 Management API 安装或更新到最新版本：
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer <MANAGEMENT_KEY>" \
+  "http://127.0.0.1:<PORT>/v0/management/plugin-store/github-copilot-go/install"
+```
+
+指定版本时使用不带 `v` 的版本号：
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer <MANAGEMENT_KEY>" \
+  "http://127.0.0.1:<PORT>/v0/management/plugin-store/github-copilot-go/install?version=0.1.3"
+```
+
+如果当前是手工安装，也应在配置 source 后从 Plugin Store 执行一次安装，让 CPA
+写入 store manifest 并接管该插件。确认版本化文件正常加载后，可以删除原先无
+版本的 `github-copilot-go.so`。
+
+发布 tag 必须使用 `v<数字版本>`，例如 `v0.1.3`。Release workflow 会注入
+`0.1.3` 作为插件上报版本，并生成 CPA 安装器要求的资产：
+
+```text
+github-copilot-go_0.1.3_linux_amd64.zip
+github-copilot-go_0.1.3_linux_arm64.zip
+checksums.txt
+```
+
+每个 ZIP 根目录只包含 `github-copilot-go.so`。发布新版本后无需修改本仓库的
+registry，CPA 会从 GitHub Latest Release 获取版本和资产。
+
+## 手工安装与配置
 
 把动态库放入 `plugins.dir` 或其当前平台子目录。动态库文件名决定插件配置 ID，
 默认产物对应 `github-copilot-go`：

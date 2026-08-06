@@ -84,7 +84,7 @@ func (s *pluginService) registration() registration {
 			Name:             "GitHub Copilot",
 			Version:          pluginVersion,
 			Author:           "cpa-github-copilot",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+			GitHubRepository: "https://github.com/1oo1/cpa-github-copilot",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "client_id", Type: pluginapi.ConfigFieldTypeString, Description: "GitHub OAuth public client ID used for device authorization."},
 				{Name: "github_host", Type: pluginapi.ConfigFieldTypeString, Description: "GitHub.com or a trusted GitHub Enterprise hostname."},

@@ -54,6 +54,9 @@ func TestDispatchLogsLifecycleSuccessAndFailure(t *testing.T) {
 	if registered.Metadata.Version != pluginVersion {
 		t.Fatalf("registered version = %q", registered.Metadata.Version)
 	}
+	if registered.Metadata.GitHubRepository != "https://github.com/1oo1/cpa-github-copilot" {
+		t.Fatalf("registered repository = %q", registered.Metadata.GitHubRepository)
+	}
 	_, errUnsupported := service.dispatch("unsupported.method", mustJSON(t, map[string]any{"host_callback_id": "callback-failure"}))
 	if errUnsupported == nil || errUnsupported.(*pluginFailure).code != "unknown_method" {
 		t.Fatalf("unsupported dispatch error = %#v", errUnsupported)

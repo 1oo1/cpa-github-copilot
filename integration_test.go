@@ -75,6 +75,9 @@ plugins:
 	if len(registered) != 1 || !registered[0].SupportsOAuth || registered[0].OAuthProvider != pluginIdentifier {
 		t.Fatalf("registered plugins = %#v", registered)
 	}
+	if expectedVersion := os.Getenv("CPA_PLUGIN_INTEGRATION_VERSION"); expectedVersion != "" && registered[0].Metadata.Version != expectedVersion {
+		t.Fatalf("registered version = %q, want %q", registered[0].Metadata.Version, expectedVersion)
+	}
 	if !host.HasAuthProvider(pluginIdentifier) {
 		t.Fatal("real host did not register the auth provider")
 	}

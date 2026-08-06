@@ -35,17 +35,34 @@ jobs:
 
       - name: Build plugins
         working-directory: cpa-github-copilot
-        run: make build
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "release tag must use v<dotted-numeric-version>, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          make build VERSION="${GITHUB_REF_NAME#v}"
 
       - name: Stage artifacts
         working-directory: cpa-github-copilot
+        shell: bash
         run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
-          cp bin/linux/amd64/github-copilot-go.so dist/github-copilot-go-linux-amd64.so
-          cp bin/linux/arm64/github-copilot-go.so dist/github-copilot-go-linux-arm64.so
+          zip -j "dist/github-copilot-go_${version}_linux_amd64.zip" \
+            bin/linux/amd64/github-copilot-go.so
+          zip -j "dist/github-copilot-go_${version}_linux_arm64.zip" \
+            bin/linux/arm64/github-copilot-go.so
+          (
+            cd dist
+            sha256sum *.zip > checksums.txt
+          )
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: cpa-github-copilot/dist/*.so
+          files: |
+            cpa-github-copilot/dist/*.zip
+            cpa-github-copilot/dist/checksums.txt
           generate_release_notes: true

@@ -13,7 +13,6 @@ import (
 
 const (
 	pluginIdentifier = "github-copilot"
-	pluginVersion    = "0.1.2"
 
 	defaultClientID   = "Iv1.b507a08c87ecfe98"
 	defaultGitHubHost = "github.com"
@@ -22,6 +21,8 @@ const (
 	formatOpenAIResponse = "openai-response"
 	formatClaude         = "claude"
 )
+
+var pluginVersion = "0.0.0-dev"
 
 type envelope struct {
 	OK     bool            `json:"ok"`

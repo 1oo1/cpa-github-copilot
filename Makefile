@@ -1,6 +1,11 @@
 GO ?= go
 DOCKER ?= docker
 DOCKER_GO_IMAGE ?= golang:1.26-bookworm
+VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+ifeq ($(strip $(VERSION)),)
+VERSION := 0.0.0-dev
+endif
+GO_LDFLAGS := -X main.pluginVersion=$(VERSION)
 
 BIN_DIR := $(CURDIR)/bin
 PLUGIN_NAME := github-copilot-go
@@ -49,14 +54,14 @@ build-native: clean
 _build-linux-amd64:
 	mkdir -p $(LINUX_AMD64_DIR)
 	@if command -v $(firstword $(LINUX_AMD64_CC)) >/dev/null 2>&1; then \
-		CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC="$(LINUX_AMD64_CC)" $(GO) build -buildmode=c-shared -o $(LINUX_AMD64_PLUGIN) .; \
+		CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC="$(LINUX_AMD64_CC)" $(GO) build -ldflags "$(GO_LDFLAGS)" -buildmode=c-shared -o $(LINUX_AMD64_PLUGIN) .; \
 	elif command -v $(DOCKER) >/dev/null 2>&1; then \
 		$(DOCKER) run --rm --platform linux/amd64 \
 			-e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=amd64 \
 			-v "$(CURDIR):/workspace/cpa-github-copilot" \
 			-v "$(CLI_PROXY_API_DIR):/workspace/CLIProxyAPI" \
 			-w /workspace/cpa-github-copilot \
-			$(DOCKER_GO_IMAGE) go build -buildmode=c-shared -o bin/linux/amd64/$(PLUGIN_NAME).so .; \
+			$(DOCKER_GO_IMAGE) go build -ldflags "$(GO_LDFLAGS)" -buildmode=c-shared -o bin/linux/amd64/$(PLUGIN_NAME).so .; \
 	else \
 		echo "error: $(LINUX_AMD64_CC) or $(DOCKER) is required to build linux/amd64" >&2; \
 		exit 1; \
@@ -66,14 +71,14 @@ _build-linux-amd64:
 _build-linux-arm64:
 	mkdir -p $(LINUX_ARM64_DIR)
 	@if command -v $(firstword $(LINUX_ARM64_CC)) >/dev/null 2>&1; then \
-		CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="$(LINUX_ARM64_CC)" $(GO) build -buildmode=c-shared -o $(LINUX_ARM64_PLUGIN) .; \
+		CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC="$(LINUX_ARM64_CC)" $(GO) build -ldflags "$(GO_LDFLAGS)" -buildmode=c-shared -o $(LINUX_ARM64_PLUGIN) .; \
 	elif command -v $(DOCKER) >/dev/null 2>&1; then \
 		$(DOCKER) run --rm --platform linux/arm64 \
 			-e CGO_ENABLED=1 -e GOOS=linux -e GOARCH=arm64 \
 			-v "$(CURDIR):/workspace/cpa-github-copilot" \
 			-v "$(CLI_PROXY_API_DIR):/workspace/CLIProxyAPI" \
 			-w /workspace/cpa-github-copilot \
-			$(DOCKER_GO_IMAGE) go build -buildmode=c-shared -o bin/linux/arm64/$(PLUGIN_NAME).so .; \
+			$(DOCKER_GO_IMAGE) go build -ldflags "$(GO_LDFLAGS)" -buildmode=c-shared -o bin/linux/arm64/$(PLUGIN_NAME).so .; \
 	else \
 		echo "error: $(LINUX_ARM64_CC) or $(DOCKER) is required to build linux/arm64" >&2; \
 		exit 1; \
@@ -82,7 +87,7 @@ _build-linux-arm64:
 
 _build-native:
 	mkdir -p $(NATIVE_DIR)
-	CGO_ENABLED=1 GOOS=$(NATIVE_GOOS) GOARCH=$(NATIVE_GOARCH) $(GO) build -buildmode=c-shared -o $(NATIVE_PLUGIN) .
+	CGO_ENABLED=1 GOOS=$(NATIVE_GOOS) GOARCH=$(NATIVE_GOARCH) $(GO) build -ldflags "$(GO_LDFLAGS)" -buildmode=c-shared -o $(NATIVE_PLUGIN) .
 	rm -f $(NATIVE_DIR)/$(PLUGIN_NAME).h
 
 test:
@@ -93,7 +98,7 @@ vet:
 
 integration: clean
 	$(MAKE) _build-native
-	CPA_PLUGIN_INTEGRATION_BINARY=$(NATIVE_PLUGIN) $(GO) test -run '^TestBuiltPluginLoadsInCLIProxyHost$$' .
+	CPA_PLUGIN_INTEGRATION_BINARY=$(NATIVE_PLUGIN) CPA_PLUGIN_INTEGRATION_VERSION=$(VERSION) $(GO) test -run '^TestBuiltPluginLoadsInCLIProxyHost$$' .
 
 clean:
 	rm -rf $(BIN_DIR)
