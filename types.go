@@ -56,11 +56,13 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	ClientID       string `yaml:"client_id"`
-	GitHubHost     string `yaml:"github_host"`
-	EnableModels   bool   `yaml:"enable_models"`
-	ModelCacheTTL  int    `yaml:"model_cache_ttl_seconds"`
-	MaxStreamBytes int    `yaml:"max_stream_buffer_bytes"`
+	ClientID                    string `yaml:"client_id"`
+	GitHubHost                  string `yaml:"github_host"`
+	EnableModels                bool   `yaml:"enable_models"`
+	ModelCacheTTL               int    `yaml:"model_cache_ttl_seconds"`
+	EnableRemoteCompatibility   bool   `yaml:"enable_remote_compatibility"`
+	RemoteCompatibilityCacheTTL int    `yaml:"remote_compatibility_cache_ttl_seconds"`
+	MaxStreamBytes              int    `yaml:"max_stream_buffer_bytes"`
 }
 
 type registration struct {

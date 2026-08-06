@@ -16,6 +16,11 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 	service := newPluginService(nil)
 	service.now = func() time.Time { return time.Unix(50_000, 0).UTC() }
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+	storage.CompatibilityManifest = []byte(`{
+		"schema_version":1,
+		"generated_at":"2026-08-06T00:00:00Z",
+		"models":{"gpt-4.1":{"headers":{"User-Agent":"GitHubCopilotChat/remote","Editor-Version":"vscode/remote"}}}
+	}`)
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
 		if method != pluginabi.MethodHostHTTPDo {
@@ -30,6 +35,9 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 		}
 		if got := http.Header(req.Headers).Get("X-Initiator"); got != "user" {
 			t.Fatalf("X-Initiator = %q", got)
+		}
+		if headers := http.Header(req.Headers); headers.Get("User-Agent") != "GitHubCopilotChat/remote" || headers.Get("Editor-Version") != "vscode/remote" {
+			t.Fatalf("compatibility headers = %#v", headers)
 		}
 		var body map[string]any
 		if json.Unmarshal(req.Body, &body) != nil || body["model"] != "gpt-4.1" || body["stream"] != false {
@@ -147,6 +155,78 @@ func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
 	}
 }
 
+func TestPrepareInferencePreservesNativeAnthropicXHighEffort(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(72_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{
+		"model":"claude-opus-4.8",
+		"max_tokens":64000,
+		"reasoning_effort":"xhigh",
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+		AuthID: "auth", Model: "claude-opus-4.8", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		OriginalRequest: payload, Payload: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ReasoningLevels: []string{"minimal", "low", "medium", "high", "xhigh", "max"},
+		})),
+	}, false)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	var upstream map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &upstream); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	thinking, _ := upstream["thinking"].(map[string]any)
+	outputConfig, _ := upstream["output_config"].(map[string]any)
+	if thinking["type"] != "adaptive" || outputConfig["effort"] != "xhigh" {
+		t.Fatalf("upstream payload = %s", prepared.upstreamPayload)
+	}
+}
+
+func TestGitHubCopilotResponsesCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		reasoning     string
+		wantReasoning bool
+		wantEffort    string
+	}{
+		{name: "disabled reasoning is omitted", reasoning: "none", wantReasoning: false},
+		{name: "minimal reasoning maps to low", reasoning: "minimal", wantReasoning: true, wantEffort: "low"},
+		{name: "enabled reasoning is preserved", reasoning: "high", wantReasoning: true, wantEffort: "high"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := []byte(`{
+				"model":"gpt-5.4",
+				"store":true,
+				"reasoning":{"effort":"` + test.reasoning + `"},
+				"input":[{"role":"user","content":"hi"}]
+			}`)
+			normalized, errNormalize := normalizeInferencePayload(raw, "gpt-5.4", formatOpenAIResponse, false, false)
+			if errNormalize != nil {
+				t.Fatal(errNormalize)
+			}
+			var payload map[string]any
+			if errDecode := json.Unmarshal(normalized, &payload); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if payload["store"] != false {
+				t.Fatalf("store = %#v", payload["store"])
+			}
+			_, hasReasoning := payload["reasoning"]
+			if hasReasoning != test.wantReasoning {
+				t.Fatalf("payload = %#v", payload)
+			}
+			if hasReasoning && payload["reasoning"].(map[string]any)["effort"] != test.wantEffort {
+				t.Fatalf("payload = %#v", payload)
+			}
+		})
+	}
+}
+
 func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(75_000, 0).UTC()
@@ -176,7 +256,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		return payload
 	}
 
-	t.Run("keeps newer models on the original payload path", func(t *testing.T) {
+	t.Run("enables eager input streaming for newer models", func(t *testing.T) {
 		prepared := prepare(t, "claude-opus-4.8", `{
 			"model":"claude-opus-4.8",
 			"messages":[
@@ -197,8 +277,8 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		if !ok {
 			t.Fatalf("first tool = %#v", tools[0])
 		}
-		if _, exists := tool["eager_input_streaming"]; exists {
-			t.Fatalf("newer model tool was rewritten: %#v", tool)
+		if eager, exists := tool["eager_input_streaming"]; !exists || eager != true {
+			t.Fatalf("eager_input_streaming was not enabled: %#v", tool)
 		}
 		if _, exists := payload["output_config"]; !exists {
 			t.Fatal("newer model output_config was removed")
@@ -212,6 +292,36 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		}
 		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
 			t.Fatalf("Anthropic-Beta = %q", beta)
+		}
+	})
+
+	t.Run("removes unsupported strict tool metadata", func(t *testing.T) {
+		prepared := prepare(t, "claude-opus-4.8", `{
+			"model":"claude-opus-4.8",
+			"messages":[{"role":"user","content":"Use the tool"}],
+			"tools":[{
+				"name":"lookup",
+				"strict":true,
+				"input_schema":{
+					"type":"object",
+					"properties":{"query":{"type":"string"}},
+					"required":["query"],
+					"additionalProperties":false,
+					"title":"StrictLookupInput"
+				}
+			}]
+		}`)
+		payload := decode(t, prepared)
+		tool := payload["tools"].([]any)[0].(map[string]any)
+		if _, exists := tool["strict"]; exists {
+			t.Fatalf("strict reached Copilot: %#v", tool)
+		}
+		schema := tool["input_schema"].(map[string]any)
+		if _, exists := schema["additionalProperties"]; exists || schema["title"] != nil {
+			t.Fatalf("strict schema reached Copilot: %#v", schema)
+		}
+		if schema["type"] != "object" || schema["properties"] == nil || schema["required"] == nil {
+			t.Fatalf("legacy schema = %#v", schema)
 		}
 	})
 
@@ -245,7 +355,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 			t.Fatalf("legacy thinking budget was retained: %#v", thinking)
 		}
 		outputConfig, ok := payload["output_config"].(map[string]any)
-		if !ok || outputConfig["effort"] != "max" {
+		if !ok || outputConfig["effort"] != "xhigh" {
 			t.Fatalf("output_config = %#v", payload["output_config"])
 		}
 		contextManagement, ok := payload["context_management"].(map[string]any)
@@ -395,24 +505,31 @@ func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
 
 func TestAnthropicAdaptiveThinkingMapsLegacyBudgetsToEffort(t *testing.T) {
 	for _, test := range []struct {
-		budget int
-		want   string
+		model     string
+		maxTokens int
+		budget    int
+		want      string
 	}{
-		{budget: 0, want: "high"},
-		{budget: 2048, want: "low"},
-		{budget: 8192, want: "medium"},
-		{budget: 16384, want: "high"},
-		{budget: 31999, want: "max"},
+		{model: "claude-opus-4.8", maxTokens: 32000, budget: 0, want: "high"},
+		{model: "claude-opus-4.8", maxTokens: 1536, budget: 1024, want: "low"},
+		{model: "claude-opus-4.8", maxTokens: 32000, budget: 2048, want: "low"},
+		{model: "claude-opus-4.8", maxTokens: 32000, budget: 8192, want: "medium"},
+		{model: "claude-opus-4.8", maxTokens: 32000, budget: 16384, want: "high"},
+		{model: "claude-opus-4.8", maxTokens: 128000, budget: 24576, want: "high"},
+		{model: "claude-opus-4.8", maxTokens: 128000, budget: 32768, want: "xhigh"},
+		{model: "claude-opus-4.6", maxTokens: 128000, budget: 32768, want: "max"},
+		{model: "claude-opus-4.8", maxTokens: 32000, budget: 31999, want: "xhigh"},
+		{model: "claude-opus-4.8", maxTokens: 128000, budget: 32769, want: "max"},
 	} {
 		payload := map[string]any{
-			"max_tokens": 32000,
+			"max_tokens": test.maxTokens,
 			"thinking": map[string]any{
 				"type":          "enabled",
 				"budget_tokens": test.budget,
 				"display":       "omitted",
 			},
 		}
-		if !normalizeAnthropicPayload(payload, "claude-opus-4.8", true) {
+		if !normalizeAnthropicPayload(payload, test.model, true) {
 			t.Fatalf("budget %d was not normalized", test.budget)
 		}
 		thinking := payload["thinking"].(map[string]any)
@@ -422,6 +539,221 @@ func TestAnthropicAdaptiveThinkingMapsLegacyBudgetsToEffort(t *testing.T) {
 		if got := payload["output_config"].(map[string]any)["effort"]; got != test.want {
 			t.Fatalf("budget %d effort = %q, want %q", test.budget, got, test.want)
 		}
+	}
+}
+
+func TestAnthropicForcedAdaptiveThinkingDoesNotDependOnDiscoveredCapability(t *testing.T) {
+	payload := map[string]any{
+		"max_tokens": 32000,
+		"thinking": map[string]any{
+			"type":          "enabled",
+			"budget_tokens": 16384,
+		},
+	}
+	if !normalizeAnthropicPayload(payload, "claude-sonnet-4.6", false) {
+		t.Fatal("payload was not normalized")
+	}
+	thinking := payload["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" {
+		t.Fatalf("thinking = %#v", thinking)
+	}
+	if effort := payload["output_config"].(map[string]any)["effort"]; effort != "high" {
+		t.Fatalf("effort = %q, want high", effort)
+	}
+}
+
+func TestAnthropicTemperatureCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		model    string
+		thinking map[string]any
+		wantTemp bool
+	}{
+		{name: "unsupported model", model: "claude-opus-4.7", wantTemp: false},
+		{name: "unsupported model with thinking", model: "claude-opus-4.8", thinking: map[string]any{"type": "adaptive"}, wantTemp: false},
+		{name: "thinking enabled", model: "claude-opus-4.6", thinking: map[string]any{"type": "adaptive"}, wantTemp: false},
+		{name: "supported without thinking", model: "claude-opus-4.6", wantTemp: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := map[string]any{"temperature": 0.7}
+			if test.thinking != nil {
+				payload["thinking"] = test.thinking
+			}
+			normalizeAnthropicPayload(payload, test.model, false)
+			_, hasTemperature := payload["temperature"]
+			if hasTemperature != test.wantTemp {
+				t.Fatalf("temperature present = %t, want %t: %#v", hasTemperature, test.wantTemp, payload)
+			}
+		})
+	}
+}
+
+func TestAnthropicCompatibilityMatchesPiCatalog(t *testing.T) {
+	for _, test := range []struct {
+		model         string
+		forceAdaptive bool
+		eagerTools    bool
+		temperature   bool
+		xhigh         bool
+	}{
+		{model: "claude-fable-5", forceAdaptive: true, eagerTools: true, temperature: true, xhigh: true},
+		{model: "claude-haiku-4.5", eagerTools: false, temperature: true},
+		{model: "claude-opus-4.5", eagerTools: true, temperature: true},
+		{model: "claude-opus-4.6", forceAdaptive: true, eagerTools: true, temperature: true},
+		{model: "claude-opus-4.7", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
+		{model: "claude-opus-4.8", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
+		{model: "claude-opus-5", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
+		{model: "claude-sonnet-4", eagerTools: false, temperature: true},
+		{model: "claude-sonnet-4.5", eagerTools: false, temperature: true},
+		{model: "claude-sonnet-4.6", forceAdaptive: true, eagerTools: true, temperature: true},
+		{model: "claude-sonnet-5", forceAdaptive: true, eagerTools: true, temperature: true, xhigh: true},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			if got := forcesAnthropicAdaptiveThinking(test.model); got != test.forceAdaptive {
+				t.Fatalf("forces adaptive = %t, want %t", got, test.forceAdaptive)
+			}
+			if got := supportsAnthropicEagerToolInputStreaming(test.model); got != test.eagerTools {
+				t.Fatalf("supports eager tools = %t, want %t", got, test.eagerTools)
+			}
+			if got := supportsAnthropicTemperature(test.model); got != test.temperature {
+				t.Fatalf("supports temperature = %t, want %t", got, test.temperature)
+			}
+			if got := supportsAnthropicXHighEffort(test.model); got != test.xhigh {
+				t.Fatalf("supports xhigh = %t, want %t", got, test.xhigh)
+			}
+		})
+	}
+}
+
+func TestRemoteCompatibilityControlsAnthropicPayload(t *testing.T) {
+	forceAdaptive := true
+	supportsTemperature := false
+	supportsEager := false
+	supportsXHigh := true
+	now := time.Now().UTC()
+	storage := executorStorage(now, storedModel{
+		ID:                              "claude-sonnet-4.6",
+		Format:                          formatClaude,
+		ForceAdaptiveThinking:           &forceAdaptive,
+		SupportsTemperature:             &supportsTemperature,
+		SupportsEagerToolInputStreaming: &supportsEager,
+		SupportsXHighEffort:             &supportsXHigh,
+	})
+	payload := []byte(`{
+		"model":"claude-sonnet-4.6",
+		"max_tokens":128000,
+		"temperature":0.7,
+		"thinking":{"type":"enabled","budget_tokens":32768},
+		"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{},"required":[]}}]
+	}`)
+	prepared, failure := newPluginService(nil).prepareInference(pluginapi.ExecutorRequest{
+		Model:       "claude-sonnet-4.6",
+		Format:      formatClaude,
+		Payload:     payload,
+		StorageJSON: mustJSON(t, storage),
+	}, false)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	var normalized map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &normalized); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if _, exists := normalized["temperature"]; exists {
+		t.Fatalf("temperature was retained: %#v", normalized)
+	}
+	if effort := normalized["output_config"].(map[string]any)["effort"]; effort != "xhigh" {
+		t.Fatalf("effort = %q, want xhigh", effort)
+	}
+	tool := normalized["tools"].([]any)[0].(map[string]any)
+	if _, exists := tool["eager_input_streaming"]; exists {
+		t.Fatalf("eager input streaming was retained: %#v", tool)
+	}
+}
+
+func TestRemoteCompatibilityCanDisableForcedAdaptiveThinking(t *testing.T) {
+	forceAdaptive := false
+	now := time.Now().UTC()
+	storage := executorStorage(now, storedModel{
+		ID:                    "claude-sonnet-4.6",
+		Format:                formatClaude,
+		ForceAdaptiveThinking: &forceAdaptive,
+	})
+	payload := []byte(`{
+		"model":"claude-sonnet-4.6",
+		"max_tokens":32000,
+		"thinking":{"type":"enabled","budget_tokens":16384}
+	}`)
+	prepared, failure := newPluginService(nil).prepareInference(pluginapi.ExecutorRequest{
+		Model:       "claude-sonnet-4.6",
+		Format:      formatClaude,
+		Payload:     payload,
+		StorageJSON: mustJSON(t, storage),
+	}, false)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	var normalized map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &normalized); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if thinking := normalized["thinking"].(map[string]any); thinking["type"] != "enabled" {
+		t.Fatalf("thinking = %#v", thinking)
+	}
+}
+
+func TestDisabledRemoteCompatibilityIgnoresCachedExecutorOverlay(t *testing.T) {
+	storage := executorStorage(time.Now().UTC(), storedModel{
+		ID: "gpt-4.1", Format: formatOpenAI,
+	})
+	storage.CompatibilityManifest = []byte(`{
+		"schema_version":1,
+		"generated_at":"2026-08-07T00:00:00Z",
+		"models":{"gpt-4.1":{"format":"openai-response"}}
+	}`)
+	service := newPluginService(nil)
+	config := service.loadedConfig()
+	config.EnableRemoteCompatibility = false
+	service.config = config
+	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+		Model:       "gpt-4.1",
+		Format:      formatOpenAI,
+		Payload:     []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`),
+		StorageJSON: mustJSON(t, storage),
+	}, false)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	if prepared.upstreamFormat != formatOpenAI || prepared.upstreamPath != "/chat/completions" {
+		t.Fatalf("prepared route = %#v", prepared)
+	}
+}
+
+func TestGitHubCopilotOpenAICompatibility(t *testing.T) {
+	for _, model := range []string{"gemini-3.6-flash", "gpt-4.1", "kimi-k2.7-code"} {
+		t.Run(model, func(t *testing.T) {
+			raw := []byte(`{
+				"model":"` + model + `",
+				"store":true,
+				"reasoning_effort":"high",
+				"messages":[{"role":"developer","content":"system prompt"},{"role":"user","content":"hello"}]
+			}`)
+			normalized, errNormalize := normalizeInferencePayload(raw, model, formatOpenAI, false, false)
+			if errNormalize != nil {
+				t.Fatal(errNormalize)
+			}
+			var payload map[string]any
+			if errDecode := json.Unmarshal(normalized, &payload); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			_, hasStore := payload["store"]
+			_, hasReasoning := payload["reasoning_effort"]
+			messages := payload["messages"].([]any)
+			role := messages[0].(map[string]any)["role"]
+			if hasStore || hasReasoning || role != "system" {
+				t.Fatalf("payload = %#v", payload)
+			}
+		})
 	}
 }
 
@@ -539,7 +871,58 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	}
 }
 
-func TestExecuteHTTPRequestLeavesNewAnthropicPayloadUnchanged(t *testing.T) {
+func TestExecuteHTTPRequestAppliesForcedAdaptiveCompatibilityToOldCredentials(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(96_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude})
+	storage.CompatibilityManifest = []byte(`{
+		"schema_version":1,
+		"generated_at":"2026-08-06T00:00:00Z",
+		"models":{"claude-opus-4.8":{"headers":{"Copilot-Integration-Id":"remote-chat"}}}
+	}`)
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("method = %s", method)
+		}
+		req := payload.(rpcHostHTTPRequest)
+		if headers := http.Header(req.Headers); headers.Get("Copilot-Integration-Id") != "remote-chat" ||
+			headers.Get("Authorization") != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
+			t.Fatalf("upstream headers = %#v", headers)
+		}
+		var body map[string]any
+		if errDecode := json.Unmarshal(req.Body, &body); errDecode != nil {
+			t.Fatalf("decode upstream body: %v", errDecode)
+		}
+		thinking := body["thinking"].(map[string]any)
+		if thinking["type"] != "adaptive" {
+			t.Fatalf("thinking = %#v", thinking)
+		}
+		if _, exists := body["temperature"]; exists {
+			t.Fatalf("temperature reached HTTP bridge: %#v", body)
+		}
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
+	}}
+	service.bridge = bridge
+	body := []byte(`{
+		"model":"claude-opus-4.8",
+		"max_tokens":32000,
+		"messages":[{"role":"user","content":"Hello"}],
+		"temperature":0.7,
+		"thinking":{"type":"enabled","budget_tokens":16384}
+	}`)
+	_, failure := service.executeHTTPRequest(mustJSON(t, rpcExecutorHTTPRequest{ExecutorHTTPRequest: pluginapi.ExecutorHTTPRequest{
+		URL:         "https://api.individual.githubcopilot.com/v1/messages",
+		Method:      http.MethodPost,
+		Body:        body,
+		StorageJSON: mustJSON(t, storage),
+	}}))
+	if failure != nil {
+		t.Fatal(failure)
+	}
+}
+
+func TestExecuteHTTPRequestPreservesNewAnthropicFieldsAndEnablesEagerTools(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(97_000, 0).UTC()
 	service.now = func() time.Time { return now }
@@ -557,8 +940,18 @@ func TestExecuteHTTPRequestLeavesNewAnthropicPayloadUnchanged(t *testing.T) {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(rpcHostHTTPRequest)
-		if string(req.Body) != string(body) {
-			t.Fatalf("newer model body was rewritten:\n got: %s\nwant: %s", req.Body, body)
+		var upstream map[string]any
+		if errDecode := json.Unmarshal(req.Body, &upstream); errDecode != nil {
+			t.Fatalf("decode upstream body: %v", errDecode)
+		}
+		thinking := upstream["thinking"].(map[string]any)
+		outputConfig := upstream["output_config"].(map[string]any)
+		contextManagement := upstream["context_management"].(map[string]any)
+		tools := upstream["tools"].([]any)
+		tool := tools[0].(map[string]any)
+		if thinking["type"] != "adaptive" || thinking["display"] != "omitted" || outputConfig["effort"] != "xhigh" ||
+			contextManagement["edits"] == nil || tool["eager_input_streaming"] != true {
+			t.Fatalf("newer model body = %#v", upstream)
 		}
 		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != "feature-one" {
 			t.Fatalf("Anthropic-Beta = %q", beta)

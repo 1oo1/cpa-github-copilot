@@ -30,7 +30,8 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 		t.Fatal(errConfigure)
 	}
 	config := service.loadedConfig()
-	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels {
+	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels ||
+		!config.EnableRemoteCompatibility || config.RemoteCompatibilityCacheTTL != 4*60*60 {
 		t.Fatalf("default config = %#v", config)
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {
@@ -38,6 +39,11 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 		if errConfigure == nil {
 			t.Fatalf("unsafe host %q was accepted", host)
 		}
+	}
+	if errConfigure := service.configure(mustJSON(t, lifecycleRequest{
+		ConfigYAML: []byte("remote_compatibility_cache_ttl_seconds: -1\n"),
+	})); errConfigure == nil {
+		t.Fatal("negative remote compatibility cache TTL was accepted")
 	}
 }
 

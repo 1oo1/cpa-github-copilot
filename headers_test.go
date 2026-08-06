@@ -52,6 +52,28 @@ func TestInferenceHeadersProtectAuthorization(t *testing.T) {
 	}
 }
 
+func TestInferenceHeadersApplyCompatibilityIdentityHeaders(t *testing.T) {
+	route := modelRoute{
+		Format: formatOpenAI,
+		Headers: map[string]string{
+			"User-Agent":             "GitHubCopilotChat/remote",
+			"Editor-Version":         "vscode/remote",
+			"Editor-Plugin-Version":  "copilot-chat/remote",
+			"Copilot-Integration-Id": "remote-chat",
+		},
+	}
+	headers := inferenceHeadersForRoute("real-session", route, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), http.Header{
+		"Authorization": []string{"Bearer attacker"},
+	})
+	if headers.Get("User-Agent") != "GitHubCopilotChat/remote" || headers.Get("Editor-Version") != "vscode/remote" ||
+		headers.Get("Editor-Plugin-Version") != "copilot-chat/remote" || headers.Get("Copilot-Integration-Id") != "remote-chat" {
+		t.Fatalf("compatibility identity headers = %#v", headers)
+	}
+	if headers.Get("Authorization") != "Bearer real-session" || headers.Get("Openai-Intent") != copilotOpenAIIntent {
+		t.Fatalf("protected headers = %#v", headers)
+	}
+}
+
 func TestInferenceHeadersKeepNewAnthropicModelsOnOriginalPath(t *testing.T) {
 	headers := inferenceHeaders("real-session", formatClaude, []byte(`{
 		"model":"claude-opus-4.8",

@@ -150,7 +150,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 			stream,
 		)
 	}
-	payload, errPrepare := normalizeInferencePayload(payload, model, route.Format, stream, route.AdaptiveThinking)
+	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream)
 	if errPrepare != nil {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: errPrepare.Error(), httpStatus: http.StatusBadRequest}
 	}
@@ -174,7 +174,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 		upstreamURL:      baseURL + route.Path,
 		upstreamPath:     route.Path,
 		upstreamPayload:  payload,
-		headers:          inferenceHeaders(storage.CopilotSessionToken, route.Format, payload, req.Headers),
+		headers:          inferenceHeadersForRoute(storage.CopilotSessionToken, route, payload, req.Headers),
 	}, nil
 }
 
@@ -217,23 +217,28 @@ func preparedInferenceLogFields(prepared preparedInference, stream bool) map[str
 }
 
 func normalizeInferencePayload(raw []byte, model, format string, stream, supportsAdaptiveThinking bool) ([]byte, error) {
+	return normalizeInferencePayloadForRoute(raw, model, modelRoute{Format: format, AdaptiveThinking: supportsAdaptiveThinking}, stream)
+}
+
+func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRoute, stream bool) ([]byte, error) {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil || payload == nil {
 		return nil, fmt.Errorf("GitHub Copilot request payload must be a JSON object")
 	}
 	payload["model"] = model
 	payload["stream"] = stream
-	if format == formatClaude {
+	if route.Format == formatOpenAI {
+		normalizeOpenAICompatibility(payload)
+	}
+	if route.Format == formatClaude {
 		if _, exists := payload["max_tokens"]; !exists {
 			payload["max_tokens"] = 4096
 		}
 		delete(payload, "stream_options")
-		normalizeAnthropicPayload(payload, model, supportsAdaptiveThinking)
+		normalizeAnthropicPayloadForRoute(payload, model, route)
 	}
-	if format == formatOpenAIResponse {
-		if _, exists := payload["store"]; !exists {
-			payload["store"] = false
-		}
+	if route.Format == formatOpenAIResponse {
+		normalizeOpenAIResponsesCompatibility(payload, model)
 	}
 	out, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
@@ -242,14 +247,58 @@ func normalizeInferencePayload(raw []byte, model, format string, stream, support
 	return out, nil
 }
 
+func normalizeOpenAICompatibility(payload map[string]any) bool {
+	changed := false
+	for _, field := range []string{"store", "reasoning_effort"} {
+		if _, exists := payload[field]; exists {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if messages, ok := payload["messages"].([]any); ok {
+		for _, rawMessage := range messages {
+			message, ok := rawMessage.(map[string]any)
+			if ok && strings.EqualFold(stringValue(message["role"]), "developer") {
+				message["role"] = "system"
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string) bool {
+	changed := payload["store"] != false
+	payload["store"] = false
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+		effort := strings.ToLower(stringValue(reasoning["effort"]))
+		if len(reasoning) == 0 || effort == "none" || effort == "off" {
+			delete(payload, "reasoning")
+			changed = true
+		} else if strings.HasPrefix(strings.ToLower(normalizeModelID(model)), "gpt-5") && effort == "minimal" {
+			reasoning["effort"] = "low"
+			changed = true
+		}
+	}
+	return changed
+}
+
 func normalizeAnthropicPayload(payload map[string]any, model string, supportsAdaptiveThinking bool) bool {
-	if supportsAdaptiveThinking {
-		return normalizeAnthropicAdaptiveThinking(payload)
+	return normalizeAnthropicPayloadForRoute(payload, model, modelRoute{AdaptiveThinking: supportsAdaptiveThinking})
+}
+
+func normalizeAnthropicPayloadForRoute(payload map[string]any, model string, route modelRoute) bool {
+	compatibility := anthropicCompatibilityForRoute(model, route)
+	changed := normalizeAnthropicTemperature(payload, compatibility.supportsTemperature)
+	if normalizeAnthropicToolInputStreaming(payload, compatibility.supportsEagerToolInputStreaming) {
+		changed = true
 	}
-	if !usesAnthropicLegacyCompatibility(model) {
-		return false
+	if compatibility.adaptiveThinking {
+		return normalizeAnthropicAdaptiveThinking(payload, compatibility.supportsXHighEffort) || changed
 	}
-	changed := normalizeAnthropicToolInputStreaming(payload, model)
+	if !usesAnthropicBudgetThinking(model) && compatibility.supportsEagerToolInputStreaming {
+		return changed
+	}
 	if !usesAnthropicBudgetThinking(model) {
 		return changed
 	}
@@ -315,7 +364,7 @@ func anthropicThinkingBudget(payload, thinking map[string]any) int {
 	return budget
 }
 
-func normalizeAnthropicAdaptiveThinking(payload map[string]any) bool {
+func normalizeAnthropicAdaptiveThinking(payload map[string]any, supportsXHighEffort bool) bool {
 	thinking, ok := payload["thinking"].(map[string]any)
 	if !ok || !strings.EqualFold(stringValue(thinking["type"]), "enabled") {
 		return false
@@ -332,18 +381,14 @@ func normalizeAnthropicAdaptiveThinking(payload map[string]any) bool {
 		outputConfig = make(map[string]any)
 	}
 	if stringValue(outputConfig["effort"]) == "" {
-		outputConfig["effort"] = anthropicAdaptiveEffort(payload, thinking)
+		outputConfig["effort"] = anthropicAdaptiveEffort(thinking, supportsXHighEffort)
 	}
 	payload["output_config"] = outputConfig
 	return true
 }
 
-func anthropicAdaptiveEffort(payload, thinking map[string]any) string {
+func anthropicAdaptiveEffort(thinking map[string]any, supportsXHighEffort bool) string {
 	budget := intFromJSONNumber(thinking["budget_tokens"])
-	maxTokens := intFromJSONNumber(payload["max_tokens"])
-	if maxTokens > 0 && budget > 0 && budget >= maxTokens-1024 {
-		return "max"
-	}
 	switch {
 	case budget <= 0:
 		return "high"
@@ -351,8 +396,10 @@ func anthropicAdaptiveEffort(payload, thinking map[string]any) string {
 		return "low"
 	case budget <= 8192:
 		return "medium"
-	case budget <= 16384:
+	case budget <= 24576:
 		return "high"
+	case budget <= 32768 && supportsXHighEffort:
+		return "xhigh"
 	default:
 		return "max"
 	}
@@ -444,7 +491,7 @@ func anthropicSystemBlocks(content any) ([]any, bool) {
 	}
 }
 
-func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) bool {
+func normalizeAnthropicToolInputStreaming(payload map[string]any, supportsEager bool) bool {
 	rawTools, exists := payload["tools"]
 	if !exists {
 		return false
@@ -459,11 +506,32 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) 
 	}
 
 	changed := false
-	supportsEager := supportsAnthropicEagerToolInputStreaming(model)
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
 		if !ok {
 			continue
+		}
+		if _, exists := tool["strict"]; exists {
+			delete(tool, "strict")
+			changed = true
+		}
+		if schema, ok := tool["input_schema"].(map[string]any); ok {
+			properties, hasProperties := schema["properties"]
+			if !hasProperties {
+				properties = map[string]any{}
+			}
+			required, hasRequired := schema["required"]
+			if !hasRequired {
+				required = []any{}
+			}
+			if len(schema) != 3 || schema["type"] != "object" || !hasProperties || !hasRequired {
+				changed = true
+			}
+			tool["input_schema"] = map[string]any{
+				"type":       "object",
+				"properties": properties,
+				"required":   required,
+			}
 		}
 		if supportsEager {
 			if eager, exists := tool["eager_input_streaming"]; !exists || eager != true {
@@ -481,13 +549,12 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, model string) 
 }
 
 func normalizeAnthropicPayloadBytes(raw []byte, model string, supportsAdaptiveThinking bool) []byte {
-	if !usesAnthropicLegacyCompatibility(model) {
-		if !supportsAdaptiveThinking {
-			return raw
-		}
-	}
+	return normalizeAnthropicPayloadBytesForRoute(raw, model, modelRoute{AdaptiveThinking: supportsAdaptiveThinking})
+}
+
+func normalizeAnthropicPayloadBytesForRoute(raw []byte, model string, route modelRoute) []byte {
 	var payload map[string]any
-	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayload(payload, model, supportsAdaptiveThinking) {
+	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayloadForRoute(payload, model, route) {
 		return raw
 	}
 	out, errMarshal := json.Marshal(payload)
@@ -506,6 +573,47 @@ func supportsAnthropicEagerToolInputStreaming(model string) bool {
 	}
 }
 
+func forcesAnthropicAdaptiveThinking(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-fable-5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5",
+		"claude-sonnet-4.6", "claude-sonnet-5":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportsAnthropicTemperature(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5":
+		return false
+	default:
+		return true
+	}
+}
+
+func supportsAnthropicXHighEffort(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-fable-5", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "claude-sonnet-5":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAnthropicTemperature(payload map[string]any, supportsTemperature bool) bool {
+	if _, exists := payload["temperature"]; !exists {
+		return false
+	}
+	thinking, hasThinking := payload["thinking"].(map[string]any)
+	thinkingType := strings.ToLower(stringValue(thinking["type"]))
+	if supportsTemperature && (!hasThinking || (thinkingType != "enabled" && thinkingType != "adaptive")) {
+		return false
+	}
+	delete(payload, "temperature")
+	return true
+}
+
 func usesAnthropicBudgetThinking(model string) bool {
 	switch strings.ToLower(normalizeModelID(model)) {
 	case "claude-haiku-4.5", "claude-opus-4.5", "claude-sonnet-4", "claude-sonnet-4.5":
@@ -517,6 +625,26 @@ func usesAnthropicBudgetThinking(model string) bool {
 
 func usesAnthropicLegacyCompatibility(model string) bool {
 	return usesAnthropicBudgetThinking(model) || !supportsAnthropicEagerToolInputStreaming(model)
+}
+
+type anthropicCompatibility struct {
+	adaptiveThinking                bool
+	supportsTemperature             bool
+	supportsEagerToolInputStreaming bool
+	supportsXHighEffort             bool
+}
+
+func anthropicCompatibilityForRoute(model string, route modelRoute) anthropicCompatibility {
+	adaptiveThinking := route.AdaptiveThinking
+	if route.ForceAdaptiveThinking == nil {
+		adaptiveThinking = adaptiveThinking || forcesAnthropicAdaptiveThinking(model)
+	}
+	return anthropicCompatibility{
+		adaptiveThinking:                adaptiveThinking,
+		supportsTemperature:             compatibilityBool(route.SupportsTemperature, supportsAnthropicTemperature(model)),
+		supportsEagerToolInputStreaming: compatibilityBool(route.SupportsEagerToolInputStreaming, supportsAnthropicEagerToolInputStreaming(model)),
+		supportsXHighEffort:             compatibilityBool(route.SupportsXHighEffort, supportsAnthropicXHighEffort(model)),
+	}
 }
 
 func normalizeFormat(raw string) string {
@@ -634,13 +762,17 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 		return nil, failure
 	}
 	model := modelFromPayload(req.Body)
-	format := inferModelFormat(model)
+	route := s.resolveModelRoute("", model, storage)
+	format := route.Format
+	if format == "" {
+		format = inferModelFormat(model)
+		route.Format = format
+	}
 	body := append([]byte(nil), req.Body...)
 	if format == formatClaude {
-		route := s.resolveModelRoute("", model, storage)
-		body = normalizeAnthropicPayloadBytes(body, model, route.AdaptiveThinking)
+		body = normalizeAnthropicPayloadBytesForRoute(body, model, route)
 	}
-	headers := inferenceHeaders(storage.CopilotSessionToken, format, body, req.Headers)
+	headers := inferenceHeadersForRoute(storage.CopilotSessionToken, route, body, req.Headers)
 	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(pluginapi.HTTPRequest{
 		Method:  valueOr(strings.TrimSpace(req.Method), http.MethodPost),
 		URL:     req.URL,

@@ -29,6 +29,8 @@ model requires a different upstream protocol.
   `proxy-ep` parsing.
 - `models.go`: `/models` decoding, filtering, endpoint selection, model
   metadata conversion, and per-auth route caching.
+- `compatibility.go` and `compatibility.json`: strict, opt-in compatibility
+  manifest parsing, fixed-origin refresh, ETag cache, and safe model overlays.
 - `executor.go`: payload protocol conversion, Copilot headers, endpoint
   selection, non-streaming execution, and guarded raw HTTP execution.
 - `stream.go`: upstream stream bridge, SSE framing, stateful response
@@ -147,15 +149,20 @@ OAuth executor satisfies the host's provider-native registration path.
 
 1. Resolve the model route from credential storage, then the per-auth cache,
    then conservative model-name inference.
+  A newer validated compatibility manifest may adjust only a fixed enum route,
+  approved metadata, and allowlisted client identity headers for an ID already
+  present in the account catalog; it cannot supply an origin, URL, credential,
+  authorization header, or request body.
 2. Normalize the request format aliases to `openai`, `openai-response`, or
    `claude`.
 3. If the client format differs from the model endpoint, require a registered
    CLIProxyAPI request transformer and convert the structured payload.
 4. Set the resolved model and stream flag using JSON APIs.
-5. Build centralized Copilot headers: static client identity, Bearer session
-   token, API version, `Openai-Intent`, last-message `X-Initiator`, and
-   conditional `Copilot-Vision-Request`. Caller headers cannot replace
-   `Authorization` or the upstream origin.
+5. Build centralized Copilot headers: static or manifest-overridden allowlisted
+  client identity, Bearer session token, API version, `Openai-Intent`,
+  last-message `X-Initiator`, and conditional `Copilot-Vision-Request`.
+  Manifest and caller headers cannot replace `Authorization` or the upstream
+  origin.
 6. Send only through `host.http.do` or `host.http.do_stream`.
 7. Translate responses back to the client-requested format. Preserve upstream
    HTTP status through ABI error `http_status` without embedding response bodies

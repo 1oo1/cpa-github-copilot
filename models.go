@@ -14,25 +14,37 @@ import (
 )
 
 type storedModel struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name,omitempty"`
-	Version          string   `json:"version,omitempty"`
-	Family           string   `json:"family,omitempty"`
-	Format           string   `json:"format"`
-	ContextWindow    int64    `json:"context_window,omitempty"`
-	MaxPromptTokens  int64    `json:"max_prompt_tokens,omitempty"`
-	MaxOutputTokens  int64    `json:"max_output_tokens,omitempty"`
-	InputModalities  []string `json:"input_modalities,omitempty"`
-	ReasoningLevels  []string `json:"reasoning_levels,omitempty"`
-	MinThinking      int      `json:"min_thinking,omitempty"`
-	MaxThinking      int      `json:"max_thinking,omitempty"`
-	AdaptiveThinking bool     `json:"adaptive_thinking,omitempty"`
+	ID                              string            `json:"id"`
+	Name                            string            `json:"name,omitempty"`
+	Version                         string            `json:"version,omitempty"`
+	Family                          string            `json:"family,omitempty"`
+	Format                          string            `json:"format"`
+	ContextWindow                   int64             `json:"context_window,omitempty"`
+	MaxPromptTokens                 int64             `json:"max_prompt_tokens,omitempty"`
+	MaxOutputTokens                 int64             `json:"max_output_tokens,omitempty"`
+	InputModalities                 []string          `json:"input_modalities,omitempty"`
+	ReasoningLevels                 []string          `json:"reasoning_levels,omitempty"`
+	MinThinking                     int               `json:"min_thinking,omitempty"`
+	MaxThinking                     int               `json:"max_thinking,omitempty"`
+	AdaptiveThinking                bool              `json:"adaptive_thinking,omitempty"`
+	ForceAdaptiveThinking           *bool             `json:"force_adaptive_thinking,omitempty"`
+	SupportsTemperature             *bool             `json:"supports_temperature,omitempty"`
+	SupportsEagerToolInputStreaming *bool             `json:"supports_eager_tool_input_streaming,omitempty"`
+	SupportsXHighEffort             *bool             `json:"supports_xhigh_effort,omitempty"`
+	CompatibilityHeaders            map[string]string `json:"-"`
+	ContextWindowOverridden         bool              `json:"-"`
+	ReasoningLevelsOverridden       bool              `json:"-"`
 }
 
 type modelRoute struct {
-	Format           string
-	Path             string
-	AdaptiveThinking bool
+	Format                          string
+	Path                            string
+	Headers                         map[string]string
+	AdaptiveThinking                bool
+	ForceAdaptiveThinking           *bool
+	SupportsTemperature             *bool
+	SupportsEagerToolInputStreaming *bool
+	SupportsXHighEffort             *bool
 }
 
 type remoteModelsResponse struct {
@@ -73,9 +85,9 @@ type remoteModel struct {
 
 var knownCopilotModels = []string{
 	"claude-fable-5", "claude-haiku-4.5", "claude-opus-4.5", "claude-opus-4.6",
-	"claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4", "claude-sonnet-4.5",
-	"claude-sonnet-4.6", "claude-sonnet-5", "gemini-2.5-pro", "gemini-3-flash-preview",
-	"gemini-3.1-pro-preview", "gemini-3.5-flash", "gpt-4.1", "gpt-5-mini", "gpt-5.2",
+	"claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "claude-sonnet-4", "claude-sonnet-4.5",
+	"claude-sonnet-4.6", "claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
+	"gemini-3.6-flash", "gpt-4.1", "gpt-5-mini", "gpt-5.2",
 	"gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
 	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "kimi-k2.7-code",
 	"mai-code-1-flash-picker",
@@ -97,18 +109,20 @@ func (s *pluginService) modelsForAuth(raw []byte) ([]byte, error) {
 		s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "github_host_validation"})
 		return nil, failure
 	}
-	models := append([]storedModel(nil), storage.Models...)
-	fetched := false
+	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	manifest, manifestChanged := s.loadCompatibilityManifest(client, &storage)
+	models := applyCompatibilityManifest(storage.Models, manifest)
+	storageChanged := manifestChanged
 	cacheFresh := s.modelCacheFresh(storage)
 	source := "cache"
 	if !cacheFresh {
 		source = "discovery"
-		discovered, failure := s.discoverModels(hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}, storage)
+		discovered, failure := s.discoverModels(client, storage)
 		if failure == nil {
-			models = discovered
+			models = applyCompatibilityManifest(discovered, manifest)
 			storage.Models = discovered
 			storage.ModelsFetchedAt = s.now().UTC().UnixMilli()
-			fetched = true
+			storageChanged = true
 		} else if len(models) == 0 {
 			s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
 			return nil, failure
@@ -130,7 +144,7 @@ func (s *pluginService) modelsForAuth(raw []byte) ([]byte, error) {
 		"model_ids":      storedModelIDs(models),
 	})
 	response := pluginapi.ModelResponse{Provider: pluginIdentifier, Models: modelInfos(models)}
-	if fetched {
+	if storageChanged {
 		response.AuthUpdate = authDataFromStorage(storage, authDataDefaults{
 			ID:         req.AuthID,
 			FileName:   fileNameFromAttributes(req.Attributes, req.AuthID),
@@ -230,21 +244,21 @@ func parseDiscoveredModels(raw []byte, allowPolicyFallback bool) ([]storedModel,
 		if model.Capabilities.Supports.Vision || hasImageMediaType(model.Capabilities.Limits.Vision.SupportedMediaTypes) {
 			modalities = append(modalities, "image")
 		}
-		levels := cleanLevels(model.Capabilities.Supports.ReasoningEffort)
+		levels := copilotReasoningLevels(model.ID, model.Capabilities.Supports.ReasoningEffort)
 		models = append(models, storedModel{
 			ID:               model.ID,
 			Name:             valueOr(strings.TrimSpace(model.Name), model.ID),
 			Version:          strings.TrimSpace(model.Version),
 			Family:           strings.TrimSpace(model.Capabilities.Family),
 			Format:           format,
-			ContextWindow:    positiveInt64(model.Capabilities.Limits.MaxContextWindowTokens, model.Capabilities.Limits.MaxPromptTokens),
+			ContextWindow:    copilotContextWindow(model.ID, positiveInt64(model.Capabilities.Limits.MaxContextWindowTokens, model.Capabilities.Limits.MaxPromptTokens)),
 			MaxPromptTokens:  maxInt64(model.Capabilities.Limits.MaxPromptTokens, 0),
 			MaxOutputTokens:  maxInt64(model.Capabilities.Limits.MaxOutputTokens, 0),
 			InputModalities:  modalities,
 			ReasoningLevels:  levels,
 			MinThinking:      max(model.Capabilities.Supports.MinThinkingBudget, 0),
 			MaxThinking:      max(model.Capabilities.Supports.MaxThinkingBudget, 0),
-			AdaptiveThinking: model.Capabilities.Supports.AdaptiveThinking,
+			AdaptiveThinking: model.Capabilities.Supports.AdaptiveThinking || forcesAnthropicAdaptiveThinking(model.ID),
 		})
 		seen[model.ID] = struct{}{}
 	}
@@ -288,13 +302,33 @@ func selectModelFormat(modelID string, endpoints []string) string {
 
 func inferModelFormat(modelID string) string {
 	id := strings.ToLower(strings.TrimSpace(modelID))
-	if strings.HasPrefix(id, "claude-") && id != "claude-fable-5" {
+	if isCopilotClaude(id) {
 		return formatClaude
 	}
 	if id == "grok-4.5" || strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
 		return formatOpenAIResponse
 	}
 	return formatOpenAI
+}
+
+func isCopilotClaude(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	for _, family := range []string{"haiku", "sonnet", "opus", "fable"} {
+		version, found := strings.CutPrefix(id, "claude-"+family+"-")
+		if !found || version == "" {
+			continue
+		}
+		majorMatches := version[0] == '4' || version[0] == '5'
+		return majorMatches && (len(version) == 1 || version[1] == '.' || version[1] == '-')
+	}
+	return false
+}
+
+func effectiveModelFormat(modelID, storedFormat string) string {
+	if strings.EqualFold(strings.TrimSpace(modelID), "claude-fable-5") {
+		return formatClaude
+	}
+	return storedFormat
 }
 
 func endpointPath(format string) string {
@@ -316,15 +350,30 @@ func modelInfos(models []storedModel) []pluginapi.ModelInfo {
 		if strings.TrimSpace(model.ID) == "" {
 			continue
 		}
-		parameters := []string{"max_tokens", "temperature", "top_p", "tools", "tool_choice", "stream"}
+		format := effectiveModelFormat(model.ID, model.Format)
+		adaptiveThinking := model.AdaptiveThinking || compatibilityBool(model.ForceAdaptiveThinking, forcesAnthropicAdaptiveThinking(model.ID))
+		reasoningLevels := copilotReasoningLevels(model.ID, model.ReasoningLevels)
+		if model.ReasoningLevelsOverridden {
+			reasoningLevels = cleanLevels(model.ReasoningLevels)
+		}
+		contextWindow := copilotContextWindow(model.ID, model.ContextWindow)
+		if model.ContextWindowOverridden {
+			contextWindow = model.ContextWindow
+		}
+		configurableThinking := format != formatOpenAI
+		parameters := []string{"max_tokens"}
+		if format != formatClaude || compatibilityBool(model.SupportsTemperature, supportsAnthropicTemperature(model.ID)) {
+			parameters = append(parameters, "temperature")
+		}
+		parameters = append(parameters, "top_p", "tools", "tool_choice", "stream")
 		var thinking *pluginapi.ThinkingSupport
-		if len(model.ReasoningLevels) > 0 || model.MaxThinking > 0 || model.AdaptiveThinking {
+		if configurableThinking && (len(reasoningLevels) > 0 || model.MaxThinking > 0 || adaptiveThinking) {
 			thinking = &pluginapi.ThinkingSupport{
 				Min:            model.MinThinking,
 				Max:            model.MaxThinking,
-				ZeroAllowed:    true,
-				DynamicAllowed: model.AdaptiveThinking,
-				Levels:         append([]string(nil), model.ReasoningLevels...),
+				ZeroAllowed:    supportsReasoningOff(model.ID, format),
+				DynamicAllowed: adaptiveThinking,
+				Levels:         reasoningLevels,
 			}
 			parameters = append(parameters, "reasoning_effort")
 		}
@@ -340,7 +389,7 @@ func modelInfos(models []storedModel) []pluginapi.ModelInfo {
 			InputTokenLimit:            model.MaxPromptTokens,
 			OutputTokenLimit:           model.MaxOutputTokens,
 			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              model.ContextWindow,
+			ContextLength:              contextWindow,
 			MaxCompletionTokens:        model.MaxOutputTokens,
 			SupportedParameters:        parameters,
 			SupportedInputModalities:   append([]string(nil), model.InputModalities...),
@@ -360,12 +409,9 @@ func (s *pluginService) setModelRoutes(authID string, models []storedModel) {
 		}
 	}
 	for _, model := range models {
-		if model.ID != "" && endpointPath(model.Format) != "" {
-			s.routes[routeKey{AuthID: authID, ModelID: model.ID}] = modelRoute{
-				Format:           model.Format,
-				Path:             endpointPath(model.Format),
-				AdaptiveThinking: model.AdaptiveThinking,
-			}
+		route := routeForStoredModel(model)
+		if model.ID != "" && route.Path != "" {
+			s.routes[routeKey{AuthID: authID, ModelID: model.ID}] = route
 		}
 	}
 	s.mu.Unlock()
@@ -373,12 +419,13 @@ func (s *pluginService) setModelRoutes(authID string, models []storedModel) {
 
 func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilotStorage) modelRoute {
 	for _, model := range storage.Models {
-		if model.ID == modelID && endpointPath(model.Format) != "" {
-			return modelRoute{
-				Format:           model.Format,
-				Path:             endpointPath(model.Format),
-				AdaptiveThinking: model.AdaptiveThinking,
+		if model.ID == modelID {
+			if s.loadedConfig().EnableRemoteCompatibility {
+				if manifest, ok := cachedCompatibilityManifest(&storage); ok {
+					model = applyCompatibilityManifest([]storedModel{model}, manifest)[0]
+				}
 			}
+			return routeForStoredModel(model)
 		}
 	}
 	if len(storage.Models) > 0 || storage.ModelsFetchedAt > 0 {
@@ -391,7 +438,28 @@ func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilo
 		return route
 	}
 	format := inferModelFormat(modelID)
-	return modelRoute{Format: format, Path: endpointPath(format)}
+	return modelRoute{Format: format, Path: endpointPath(format), AdaptiveThinking: forcesAnthropicAdaptiveThinking(modelID)}
+}
+
+func routeForStoredModel(model storedModel) modelRoute {
+	format := effectiveModelFormat(model.ID, model.Format)
+	return modelRoute{
+		Format:                          format,
+		Path:                            endpointPath(format),
+		Headers:                         cloneStringMap(model.CompatibilityHeaders),
+		AdaptiveThinking:                model.AdaptiveThinking || compatibilityBool(model.ForceAdaptiveThinking, forcesAnthropicAdaptiveThinking(model.ID)),
+		ForceAdaptiveThinking:           cloneBool(model.ForceAdaptiveThinking),
+		SupportsTemperature:             cloneBool(model.SupportsTemperature),
+		SupportsEagerToolInputStreaming: cloneBool(model.SupportsEagerToolInputStreaming),
+		SupportsXHighEffort:             cloneBool(model.SupportsXHighEffort),
+	}
+}
+
+func compatibilityBool(override *bool, fallback bool) bool {
+	if override != nil {
+		return *override
+	}
+	return fallback
 }
 
 func (s *pluginService) enableKnownModels(client hostClient, storage copilotStorage) {
@@ -460,6 +528,73 @@ func cleanLevels(levels []string) []string {
 		}
 	}
 	return out
+}
+
+func copilotReasoningLevels(model string, discovered []string) []string {
+	levels := cleanLevels(discovered)
+	id := strings.ToLower(normalizeModelID(model))
+	var required []string
+	switch {
+	case forcesAnthropicAdaptiveThinking(id):
+		required = []string{"minimal", "low", "medium", "high"}
+		if supportsAnthropicXHighEffort(id) {
+			required = append(required, "xhigh")
+		}
+		required = append(required, "max")
+	case strings.HasPrefix(id, "gpt-5"):
+		required = []string{"minimal", "low", "medium", "high"}
+		if supportsCopilotGPTXHigh(id) {
+			required = append(required, "xhigh")
+		}
+		if supportsCopilotGPTMax(id) {
+			required = append(required, "max")
+		}
+	default:
+		return levels
+	}
+	seen := make(map[string]struct{}, len(required)+len(levels))
+	out := make([]string, 0, len(required)+len(levels))
+	for _, level := range append(required, levels...) {
+		if _, exists := seen[level]; exists {
+			continue
+		}
+		seen[level] = struct{}{}
+		out = append(out, level)
+	}
+	return out
+}
+
+func supportsCopilotGPTXHigh(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+		"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportsCopilotGPTMax(model string) bool {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportsReasoningOff(model, format string) bool {
+	return format != formatOpenAIResponse || !strings.HasPrefix(strings.ToLower(normalizeModelID(model)), "gpt-5")
+}
+
+func copilotContextWindow(model string, discovered int64) int64 {
+	switch strings.ToLower(normalizeModelID(model)) {
+	case "claude-fable-5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5",
+		"claude-sonnet-4.6", "claude-sonnet-5", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5":
+		return maxInt64(discovered, 1_000_000)
+	default:
+		return discovered
+	}
 }
 
 func positiveInt64(values ...int64) int64 {

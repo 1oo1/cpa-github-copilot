@@ -152,6 +152,8 @@ plugins:
       github_host: "github.com"
       enable_models: true
       model_cache_ttl_seconds: 300
+      enable_remote_compatibility: true
+      remote_compatibility_cache_ttl_seconds: 14400
       max_stream_buffer_bytes: 4194304
 ```
 
@@ -163,11 +165,41 @@ plugins:
 | `github_host` | `github.com` | GitHub.com 或管理员信任的 GitHub Enterprise 主机名 |
 | `enable_models` | `true` | 登录后 best-effort 启用已知模型 policy |
 | `model_cache_ttl_seconds` | `300` | 非空账号模型目录的复用时间；`0` 表示每次发现都刷新 |
+| `enable_remote_compatibility` | `true` | 从项目固定 manifest 应用较新的受限兼容覆盖 |
+| `remote_compatibility_cache_ttl_seconds` | `14400` | manifest 成功检查后的缓存时间；`0` 表示每次检查 |
 | `max_stream_buffer_bytes` | `4194304` | 跨协议转换时单个未完成 SSE 事件的最大缓存 |
 
 Enterprise 主机只能通过插件配置指定，必须是 HTTPS DNS 主机名，不能包含用户
 信息、端口、路径、查询参数或 IP 地址。Enterprise 部署还需要配置可用于该实例
 的 OAuth public client ID。
+
+### 远端兼容清单
+
+启用 `enable_remote_compatibility` 后，模型列表刷新会通过宿主 HTTP 桥检查固定地址：
+
+```text
+https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/compatibility.json
+```
+
+请求不携带 GitHub 或 Copilot 凭据，只包含 JSON `Accept`、插件 `User-Agent` 和可选
+ETag。成功响应缓存在 provider-owned `StorageJSON`；网络或解析失败时继续使用最后一次
+有效缓存或内置规则。远端 `generated_at` 早于当前二进制内置 manifest 时不会生效。
+
+清单只能覆盖 GitHub `/models` 已返回的同 ID 模型。完整目录使用严格 schema 解析，其中
+协议格式枚举、context window、最大输出 token、reasoning levels，以及 adaptive thinking、
+temperature、eager tool input 和 xhigh 等已实现能力会应用到本地路由。请求 headers 仅允许
+`User-Agent`、`Editor-Version`、`Editor-Plugin-Version` 和 `Copilot-Integration-Id` 四个客户端
+身份字段；未知 header、换行值或 `Authorization`、`Host` 会使整份清单被拒绝。`baseUrl`、
+provider、cost 等目录元数据不会控制请求；协议格式只能映射到本地固定的
+`/chat/completions`、`/responses` 或 `/v1/messages`，不能提供 URL、凭据、OAuth 配置或原始
+request body。
+GitHub `/models` 明确报告的 capability 仍是事实来源；例如远端
+`force_adaptive_thinking: false` 只取消本地强制规则，不会否定 GitHub 已报告的
+`adaptive_thinking: true`。
+
+该清单目前与项目源码和发布流程共享 GitHub 仓库信任边界，尚未使用独立数字签名。默认
+启用远端检查；对 main 分支远端更新策略不满意的部署可显式关闭，仅使用随二进制发布的
+内置规则。
 
 ## 诊断日志
 

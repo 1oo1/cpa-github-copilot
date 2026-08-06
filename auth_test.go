@@ -374,8 +374,20 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 		}
 	}
 	service := newPluginService(bridge)
+	config := service.loadedConfig()
+	config.EnableRemoteCompatibility = true
+	service.config = config
 	service.now = func() time.Time { return now }
-	previous := copilotStorage{Type: pluginIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "old", GitHubHost: "github.com", Account: "octocat"}
+	previous := copilotStorage{
+		Type: pluginIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "old", GitHubHost: "github.com", Account: "octocat",
+		CompatibilityManifest: []byte(`{
+			"schema_version":1,
+			"generated_at":"2026-08-07T00:00:00Z",
+			"models":{"claude-sonnet-4.6":{"supports_temperature":false}}
+		}`),
+		CompatibilityCheckedAt: now.UnixMilli(),
+		CompatibilityETag:      `"compat-1"`,
+	}
 	raw, errRefresh := service.refreshAuth(mustJSON(t, rpcAuthRefreshRequest{
 		AuthRefreshRequest: pluginapi.AuthRefreshRequest{
 			AuthID:      "copilot.json",
@@ -391,6 +403,13 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	next, errStorage := decodeCopilotStorage(result.Auth.StorageJSON)
 	if errStorage != nil || !strings.Contains(next.CopilotSessionToken, "NEW_SESSION") || next.Account != "octocat" || len(next.Models) != 1 {
 		t.Fatalf("refreshed storage = %#v, %v", next, errStorage)
+	}
+	if len(next.CompatibilityManifest) == 0 || next.CompatibilityETag != `"compat-1"` || next.Models[0].SupportsTemperature != nil {
+		t.Fatalf("compatibility cache was not reapplied: %#v", next)
+	}
+	route := service.resolveModelRoute("copilot.json", "claude-sonnet-4.6", next)
+	if route.SupportsTemperature == nil || *route.SupportsTemperature {
+		t.Fatalf("compatibility route = %#v", route)
 	}
 	if _, leaked := result.Auth.Metadata["access_token"]; leaked || result.Auth.Metadata["note"] != "keep" {
 		t.Fatalf("refreshed metadata = %#v", result.Auth.Metadata)

@@ -36,7 +36,14 @@ func copilotIdentityHeaders() http.Header {
 }
 
 func inferenceHeaders(sessionToken, format string, payload []byte, caller http.Header) http.Header {
+	return inferenceHeadersForRoute(sessionToken, modelRoute{Format: format}, payload, caller)
+}
+
+func inferenceHeadersForRoute(sessionToken string, route modelRoute, payload []byte, caller http.Header) http.Header {
 	headers := copilotIdentityHeaders()
+	for name, value := range route.Headers {
+		headers.Set(name, value)
+	}
 	headers.Set("Accept", "application/json")
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Authorization", "Bearer "+sessionToken)
@@ -46,7 +53,7 @@ func inferenceHeaders(sessionToken, format string, payload []byte, caller http.H
 	if containsVisionContent(payload) {
 		headers.Set("Copilot-Vision-Request", "true")
 	}
-	if format == formatClaude {
+	if route.Format == formatClaude {
 		headers.Set("Anthropic-Version", defaultAnthropicVersion)
 		model := modelFromPayload(payload)
 		if usesAnthropicLegacyCompatibility(model) {

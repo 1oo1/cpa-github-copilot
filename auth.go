@@ -28,21 +28,24 @@ const (
 )
 
 type copilotStorage struct {
-	Type                 string        `json:"type"`
-	GitHubAccessToken    string        `json:"github_access_token"`
-	CopilotSessionToken  string        `json:"copilot_session_token,omitempty"`
-	RefreshAfter         int64         `json:"refresh_after,omitempty"`
-	ExpiresAt            int64         `json:"expires_at,omitempty"`
-	GitHubHost           string        `json:"github_host,omitempty"`
-	APIBaseURL           string        `json:"api_base_url,omitempty"`
-	Account              string        `json:"account,omitempty"`
-	Models               []storedModel `json:"models,omitempty"`
-	ModelsFetchedAt      int64         `json:"models_fetched_at,omitempty"`
-	LegacyRefresh        string        `json:"refresh,omitempty"`
-	LegacyAccess         string        `json:"access,omitempty"`
-	LegacyExpires        int64         `json:"expires,omitempty"`
-	LegacyEnterpriseURL  string        `json:"enterpriseUrl,omitempty"`
-	LegacyAvailableModel []string      `json:"availableModelIds,omitempty"`
+	Type                   string          `json:"type"`
+	GitHubAccessToken      string          `json:"github_access_token"`
+	CopilotSessionToken    string          `json:"copilot_session_token,omitempty"`
+	RefreshAfter           int64           `json:"refresh_after,omitempty"`
+	ExpiresAt              int64           `json:"expires_at,omitempty"`
+	GitHubHost             string          `json:"github_host,omitempty"`
+	APIBaseURL             string          `json:"api_base_url,omitempty"`
+	Account                string          `json:"account,omitempty"`
+	Models                 []storedModel   `json:"models,omitempty"`
+	ModelsFetchedAt        int64           `json:"models_fetched_at,omitempty"`
+	CompatibilityManifest  json.RawMessage `json:"compatibility_manifest,omitempty"`
+	CompatibilityCheckedAt int64           `json:"compatibility_checked_at,omitempty"`
+	CompatibilityETag      string          `json:"compatibility_etag,omitempty"`
+	LegacyRefresh          string          `json:"refresh,omitempty"`
+	LegacyAccess           string          `json:"access,omitempty"`
+	LegacyExpires          int64           `json:"expires,omitempty"`
+	LegacyEnterpriseURL    string          `json:"enterpriseUrl,omitempty"`
+	LegacyAvailableModel   []string        `json:"availableModelIds,omitempty"`
 }
 
 type deviceCodeResponse struct {
@@ -195,6 +198,7 @@ func decodeCopilotStorage(raw []byte) (copilotStorage, error) {
 	storage.LegacyExpires = 0
 	storage.LegacyEnterpriseURL = ""
 	storage.LegacyAvailableModel = nil
+	storage.CompatibilityETag = safeCompatibilityETag(storage.CompatibilityETag)
 	return storage, nil
 }
 
@@ -741,6 +745,9 @@ func (s *pluginService) refreshAuth(raw []byte) ([]byte, error) {
 		s.logFailure(req.HostCallbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "session_exchange"})
 		return nil, failure
 	}
+	next.CompatibilityManifest = append(json.RawMessage(nil), previous.CompatibilityManifest...)
+	next.CompatibilityCheckedAt = previous.CompatibilityCheckedAt
+	next.CompatibilityETag = previous.CompatibilityETag
 	models, failure := s.discoverModels(client, next)
 	if failure != nil {
 		next.Models = append([]storedModel(nil), previous.Models...)
