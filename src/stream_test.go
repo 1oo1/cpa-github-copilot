@@ -392,12 +392,110 @@ func TestForwardStreamUpstreamErrorLogsWarn(t *testing.T) {
 	if entry.Fields["reason"] != streamReasonUpstreamError {
 		t.Fatalf("reason = %v, want %q", entry.Fields["reason"], streamReasonUpstreamError)
 	}
+	if entry.Fields["upstream_cause"] != upstreamCauseOther {
+		t.Fatalf("upstream_cause = %v, want %q", entry.Fields["upstream_cause"], upstreamCauseOther)
+	}
 	errMessage, _ := entry.Fields["error"].(string)
 	if strings.Contains(errMessage, "private upstream detail") {
 		t.Fatalf("log leaked upstream detail: %q", errMessage)
 	}
 	if errMessage != "GitHub Copilot upstream stream failed" {
 		t.Fatalf("error message = %q", errMessage)
+	}
+}
+
+func TestForwardStreamUpstreamCancelLogsDebug(t *testing.T) {
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Error: "context canceled", Done: true})
+	executeOpenAIStream(t, bridge, "plugin-upstream-cancel", time.Unix(133_000, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.forward_failed") {
+		t.Fatal("a cancelled upstream read must not be logged as a forwarding failure")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.client_disconnected")
+	if entry.Level != "debug" {
+		t.Fatalf("client_disconnected level = %q, want debug", entry.Level)
+	}
+	if entry.Fields["reason"] != streamReasonUpstreamCanceled {
+		t.Fatalf("reason = %v, want %q", entry.Fields["reason"], streamReasonUpstreamCanceled)
+	}
+	if entry.Fields["upstream_cause"] != upstreamCauseCanceled {
+		t.Fatalf("upstream_cause = %v, want %q", entry.Fields["upstream_cause"], upstreamCauseCanceled)
+	}
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if !bridge.upstreamClosed || !bridge.pluginClosed {
+		t.Fatalf("close state: upstream=%v plugin=%v", bridge.upstreamClosed, bridge.pluginClosed)
+	}
+	if bridge.pluginError != "GitHub Copilot upstream stream canceled" {
+		t.Fatalf("plugin stream error = %q", bridge.pluginError)
+	}
+}
+
+func TestForwardStreamNonUpstreamFailureOmitsUpstreamCause(t *testing.T) {
+	bridge := newStreamBridgeFake() // no chunks: the host stream read call fails
+	executeOpenAIStream(t, bridge, "plugin-no-cause", time.Unix(134_000, 0).UTC())
+	entry := findLogEvent(t, bridge.snapshotLogs(), "inference.stream.forward_failed")
+	if _, hasCause := entry.Fields["upstream_cause"]; hasCause {
+		t.Fatalf("read failure should not carry an upstream_cause: %v", entry.Fields["upstream_cause"])
+	}
+}
+
+func TestClassifyUpstreamStreamError(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"", upstreamCauseOther},
+		{"context canceled", upstreamCauseCanceled},
+		{"stream error: stream ID 3; CANCEL", upstreamCauseCanceled},
+		{"net/http: request canceled", upstreamCauseCanceled},
+		{"context deadline exceeded", upstreamCauseTimeout},
+		{"read tcp 10.0.0.1:443: i/o timeout", upstreamCauseTimeout},
+		// net/http reports a client timeout as a cancellation; it must classify
+		// as a timeout rather than as a benign client abort.
+		{"net/http: request canceled (Client.Timeout exceeded while reading body)", upstreamCauseTimeout},
+		{"read tcp 10.0.0.1:443: connection reset by peer", upstreamCauseConnectionReset},
+		{"write tcp 10.0.0.1:443: broken pipe", upstreamCauseConnectionReset},
+		{"use of closed network connection", upstreamCauseConnectionReset},
+		{"unexpected EOF", upstreamCauseEOF},
+		{"stream error: stream ID 5; INTERNAL_ERROR", upstreamCauseOther},
+		{"private upstream detail", upstreamCauseOther},
+	}
+	allowed := map[string]bool{
+		upstreamCauseCanceled:        true,
+		upstreamCauseTimeout:         true,
+		upstreamCauseEOF:             true,
+		upstreamCauseConnectionReset: true,
+		upstreamCauseOther:           true,
+	}
+	for _, testCase := range cases {
+		got := classifyUpstreamStreamError(testCase.raw)
+		if got != testCase.want {
+			t.Fatalf("classifyUpstreamStreamError(%q) = %q, want %q", testCase.raw, got, testCase.want)
+		}
+		if !allowed[got] {
+			t.Fatalf("classifyUpstreamStreamError(%q) returned uncategorized %q", testCase.raw, got)
+		}
+	}
+}
+
+func TestNewUpstreamStreamErrorRedactsRawDetail(t *testing.T) {
+	const raw = "read tcp 10.0.0.1:443->140.82.113.22:443: private upstream detail"
+	forwardErr := newUpstreamStreamError(raw)
+	if strings.Contains(forwardErr.Error(), "private upstream detail") || strings.Contains(forwardErr.Error(), "10.0.0.1") {
+		t.Fatalf("forward error leaked upstream detail: %q", forwardErr.Error())
+	}
+	if forwardErr.cause != upstreamCauseOther || forwardErr.benign {
+		t.Fatalf("forward error = (cause=%q, benign=%v)", forwardErr.cause, forwardErr.benign)
+	}
+	if cause := upstreamStreamCause(forwardErr); cause != upstreamCauseOther {
+		t.Fatalf("upstreamStreamCause = %q, want %q", cause, upstreamCauseOther)
+	}
+	if cause := upstreamStreamCause(newStreamForwardError(streamReasonReadFailed, "boom", false)); cause != "" {
+		t.Fatalf("non-upstream error carried cause %q", cause)
+	}
+	if cause := upstreamStreamCause(nil); cause != "" {
+		t.Fatalf("nil error carried cause %q", cause)
 	}
 }
 

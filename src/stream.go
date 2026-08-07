@@ -65,6 +65,9 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 		fields := preparedInferenceLogFields(prepared, true)
 		fields["success"] = forwardErr == nil
 		fields["panicked"] = panicked
+		if cause := upstreamStreamCause(forwardErr); cause != "" {
+			fields["upstream_cause"] = cause
+		}
 		switch {
 		case forwardErr == nil:
 			s.logEvent(client.callbackID, "debug", "inference.stream.completed", fields)
@@ -89,17 +92,23 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 }
 
 // streamForwardError classifies why stream forwarding stopped so the deferred
-// logger in forwardCopilotStream can choose an appropriate level. Only a benign
-// downstream close is expected during normal operation and must not be logged as
-// a warning: when the client goes away the host rejects the next emit. Host read
-// failures are deliberately NOT treated as benign. The host dispatches plugin
-// stream reads on a background context, so a client disconnect surfaces either as
-// a normal end-of-stream (the upstream channel closes) or as a rejected emit,
+// logger in forwardCopilotStream can choose an appropriate level. Two benign
+// endings are expected during normal operation and must not be logged as
+// warnings: a downstream close, where the client goes away and the host rejects
+// the next emit, and a cancelled upstream read, where the client goes away while
+// the plugin is parked on a host read. Host read failures are deliberately NOT
+// treated as benign. The host dispatches plugin stream reads on a background
+// context, so a client disconnect surfaces as a normal end-of-stream (the
+// upstream channel closes), a rejected emit, or a cancelled upstream chunk,
 // never as a read error. A read error therefore signals a real host/ABI failure
 // (teardown, a closed-stream race, or an undecodable response) and must warn.
+//
+// cause carries the redacted upstream category for chunk errors and is empty for
+// every other reason.
 type streamForwardError struct {
 	reason  string
 	message string
+	cause   string
 	benign  bool
 }
 
@@ -107,12 +116,88 @@ const (
 	streamReasonDownstreamClosed = "downstream_closed"
 	streamReasonReadFailed       = "read_failed"
 	streamReasonUpstreamError    = "upstream_error"
+	streamReasonUpstreamCanceled = "upstream_canceled"
 	streamReasonBufferExceeded   = "buffer_exceeded"
 	streamReasonPanic            = "panic"
 )
 
+const (
+	upstreamCauseCanceled        = "canceled"
+	upstreamCauseTimeout         = "timeout"
+	upstreamCauseEOF             = "eof"
+	upstreamCauseConnectionReset = "connection_reset"
+	upstreamCauseOther           = "other"
+)
+
 func newStreamForwardError(reason, message string, benign bool) *streamForwardError {
 	return &streamForwardError{reason: reason, message: message, benign: benign}
+}
+
+// newUpstreamStreamError converts a host stream chunk error into a forward
+// error. The host derives the upstream stream context from the client request
+// context, so a cancelled read means the caller hung up rather than that GitHub
+// Copilot failed: that case is benign and must not warn, matching how a rejected
+// downstream emit is treated.
+func newUpstreamStreamError(rawError string) *streamForwardError {
+	cause := classifyUpstreamStreamError(rawError)
+	if cause == upstreamCauseCanceled {
+		return &streamForwardError{
+			reason:  streamReasonUpstreamCanceled,
+			message: "GitHub Copilot upstream stream canceled",
+			cause:   cause,
+			benign:  true,
+		}
+	}
+	return &streamForwardError{
+		reason:  streamReasonUpstreamError,
+		message: "GitHub Copilot upstream stream failed",
+		cause:   cause,
+	}
+}
+
+// classifyUpstreamStreamError maps a host stream error onto a fixed set of
+// categories so operators can tell a client abort apart from a real upstream
+// drop. The raw error may embed upstream response text, so it is inspected only
+// here: callers receive one of the upstreamCause constants and never the
+// original string.
+func classifyUpstreamStreamError(rawError string) string {
+	lower := strings.ToLower(strings.TrimSpace(rawError))
+	switch {
+	case lower == "":
+		return upstreamCauseOther
+	// Checked before cancellation because net/http reports a client timeout as
+	// "request canceled (Client.Timeout exceeded while reading body)".
+	case containsAny(lower, "deadline exceeded", "timed out", "timeout"):
+		return upstreamCauseTimeout
+	// "cancel" also covers the HTTP/2 "stream error: stream ID 3; CANCEL" form.
+	case containsAny(lower, "cancel"):
+		return upstreamCauseCanceled
+	case containsAny(lower, "connection reset", "broken pipe", "use of closed network connection"):
+		return upstreamCauseConnectionReset
+	case containsAny(lower, "eof"):
+		return upstreamCauseEOF
+	default:
+		return upstreamCauseOther
+	}
+}
+
+func containsAny(value string, fragments ...string) bool {
+	for _, fragment := range fragments {
+		if strings.Contains(value, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// upstreamStreamCause returns the redacted upstream category behind err, or an
+// empty string when err did not come from an upstream chunk error.
+func upstreamStreamCause(err error) string {
+	var forwardErr *streamForwardError
+	if err == nil || !errors.As(err, &forwardErr) {
+		return ""
+	}
+	return forwardErr.cause
 }
 
 func (e *streamForwardError) Error() string {
@@ -160,7 +245,7 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
 		if chunk.Error != "" {
-			return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
+			return newUpstreamStreamError(chunk.Error)
 		}
 		frames, errFrame := framer.Push(chunk.Payload)
 		if errFrame != nil {
@@ -220,7 +305,7 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
 		if chunk.Error != "" {
-			return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
+			return newUpstreamStreamError(chunk.Error)
 		}
 		frames, errFrame := framer.Push(chunk.Payload)
 		if errFrame != nil {
