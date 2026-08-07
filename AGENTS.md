@@ -4,7 +4,7 @@
 
 This repository is a single-package Go `c-shared` plugin for CLIProxyAPI. `main.go` implements the C ABI entry points, while `service.go` registers and dispatches plugin capabilities. Authentication and GitHub Device Flow live in `auth.go`; model discovery and routing are in `models.go`; request execution, headers, endpoint validation, and SSE handling are split across `executor.go`, `headers.go`, `endpoints.go`, and `stream.go`. Host callback wrappers are centralized in `host.go`, and shared RPC types are in `types.go`.
 
-Tests are colocated as `*_test.go`. `integration_test.go` loads the compiled library through CLIProxyAPI's real plugin loader. Generated libraries belong in `bin/`; design and usage documentation are in `PLAN.md` and `README.md`.
+Tests are colocated as `*_test.go`. `integration_test.go` loads the compiled library through CLIProxyAPI's real plugin loader. Generated libraries belong in `bin/`; usage documentation is in `README.md`, while architecture and pi synchronization guidance live in `PI_GITHUB_COPILOT_COMPARISON.md`.
 
 ## Build, Test, and Development Commands
 

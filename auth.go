@@ -21,8 +21,8 @@ import (
 const (
 	defaultPollInterval = 5 * time.Second
 	minPollInterval     = time.Second
-	// CPA 刷新失败后的退避时间是 5 分钟，刷新过程还强制请求 /models；模型接口偶发失败时，即使已经拿到新 session token，插件也会丢弃整个刷新结果。
-	// 如果刷新时间也是 5 分钟，可能会出现下一次重试时 token 已到期，因此插件返回 401：GitHub Copilot session requires refresh。
+	// CPA 刷新失败后退避 5 分钟，因此在 broker 到期前 10 分钟调度，为 session exchange
+	// 失败保留重试窗口。exchange 成功但 /models 失败时仍采用新 session，并保留旧模型状态。
 	refreshSafetyMargin = 10 * time.Minute
 	hostRefreshInterval = 15 * time.Minute
 )
