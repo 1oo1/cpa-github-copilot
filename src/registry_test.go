@@ -8,7 +8,7 @@ import (
 )
 
 func TestPluginStoreRegistry(t *testing.T) {
-	raw, errRead := os.ReadFile("registry.json")
+	raw, errRead := os.ReadFile("../registry.json")
 	if errRead != nil {
 		t.Fatalf("read registry: %v", errRead)
 	}

@@ -16,7 +16,7 @@ import (
 const (
 	compatibilitySchemaVersion = 1
 	maxCompatibilityBytes      = 1 << 20
-	remoteCompatibilityURL     = "https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/compatibility.json"
+	remoteCompatibilityURL     = "https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/src/compatibility.json"
 )
 
 //go:embed compatibility.json

@@ -78,31 +78,31 @@ CLIProxyAPI host
   +-- sdk/translator built-in conversions
   |
   `-- github-copilot plugin
-        +-- ABI entry and envelope ---------- main.go
-        +-- capability registration/dispatch  service.go, types.go
-        +-- typed host callback wrappers ----- host.go
-        +-- Device Flow/session lifecycle ---- auth.go
-        +-- trusted endpoint derivation ------ endpoints.go
-        +-- account catalog/model routes ----- models.go
-        +-- constrained compatibility overlay  compatibility.go/json
-        +-- Copilot headers ------------------ headers.go
-        +-- request shaping/non-stream ------- executor.go
-        +-- SSE framing/stream translation --- stream.go
-        `-- structured redacted logging ------ logging.go
+        +-- ABI entry and envelope ---------- src/main.go
+        +-- capability registration/dispatch  src/service.go, src/types.go
+        +-- typed host callback wrappers ----- src/host.go
+        +-- Device Flow/session lifecycle ---- src/auth.go
+        +-- trusted endpoint derivation ------ src/endpoints.go
+        +-- account catalog/model routes ----- src/models.go
+        +-- constrained compatibility overlay  src/compatibility.go/json
+        +-- Copilot headers ------------------ src/headers.go
+        +-- request shaping/non-stream ------- src/executor.go
+        +-- SSE framing/stream translation --- src/stream.go
+        `-- structured redacted logging ------ src/logging.go
 ```
 
 | 文件 | 直接决定的行为 |
 |---|---|
-| `main.go` | C ABI init/call/free/shutdown、panic 隔离、host callback envelope |
-| `service.go`、`types.go` | 配置、capability、RPC dispatch、服务内 session/route 状态 |
-| `host.go` | `host.http.*`、`host.stream.*` 的唯一插件侧调用入口 |
-| `auth.go` | 凭据 schema、legacy 迁移、登录状态机、broker exchange、刷新 |
-| `endpoints.go` | GitHub Enterprise 规范化、`proxy-ep` 信任校验、same-origin |
-| `models.go` | `/models` 解析、账户过滤、endpoint 选择、模型能力映射、policy enable |
-| `compatibility.go`、`compatibility.json` | 内置/远端兼容规则、严格 schema、ETag/TTL、字段白名单 |
-| `headers.go` | 静态身份头、动态 Copilot 头、Anthropic beta 选择 |
-| `executor.go` | 格式选择、translator 调用、payload 后处理、非流与 raw HTTP |
-| `stream.go` | SSE 分帧、透传/转换、缓冲上限、stream 清理和错误分类 |
+| `src/main.go` | C ABI init/call/free/shutdown、panic 隔离、host callback envelope |
+| `src/service.go`、`src/types.go` | 配置、capability、RPC dispatch、服务内 session/route 状态 |
+| `src/host.go` | `host.http.*`、`host.stream.*` 的唯一插件侧调用入口 |
+| `src/auth.go` | 凭据 schema、legacy 迁移、登录状态机、broker exchange、刷新 |
+| `src/endpoints.go` | GitHub Enterprise 规范化、`proxy-ep` 信任校验、same-origin |
+| `src/models.go` | `/models` 解析、账户过滤、endpoint 选择、模型能力映射、policy enable |
+| `src/compatibility.go`、`src/compatibility.json` | 内置/远端兼容规则、严格 schema、ETag/TTL、字段白名单 |
+| `src/headers.go` | 静态身份头、动态 Copilot 头、Anthropic beta 选择 |
+| `src/executor.go` | 格式选择、translator 调用、payload 后处理、非流与 raw HTTP |
+| `src/stream.go` | SSE 分帧、透传/转换、缓冲上限、stream 清理和错误分类 |
 | `registry.json` | CLIProxyAPI Plugin Store 发布登记；不是模型目录 |
 
 ### 3.3 插件与宿主责任边界
@@ -538,7 +538,7 @@ git -C ../pi diff --name-status "$PI_OLD..$PI_NEW" -- \
 
 ```bash
 jq -n \
-  --slurpfile plugin compatibility.json \
+  --slurpfile plugin src/compatibility.json \
   --slurpfile pi ../pi/packages/ai/src/providers/data/github-copilot.json '
   ($pi[0]
     | reduce (to_entries[] | .value | to_entries[]) as $entry

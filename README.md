@@ -106,7 +106,7 @@ fragment 或 IP；同时需要该实例可用的 OAuth public client ID。
 
 ### 远端兼容清单
 
-- 固定来源为项目 main 分支的 [compatibility.json](https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/compatibility.json)；请求不带 GitHub/Copilot 凭据。
+- 固定来源为项目 main 分支的 [compatibility.json](src/compatibility.json)（https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/src/compatibility.json）；请求不带 GitHub/Copilot 凭据。
 - 只覆盖账号 `/models` 已返回的同 ID 模型；协议、token 上限、reasoning 和已实现能力均按严格 schema 校验。
 - 仅允许四个客户端身份 header；manifest 不能控制 origin、任意路径、Authorization、OAuth 或 request body。
 - 使用 ETag 和 `StorageJSON` 缓存；失败时回退最后有效版本或内置规则，旧于内置版本的远端数据不生效。
@@ -166,6 +166,8 @@ Authorization。
 模型字段；已识别但缺少长期 token 的凭据会被禁用，不会落入其他 parser。
 
 ## 开发与文档
+
+Go 源码和测试统一位于 [src](src/)。它们属于同一个 `main` 包，因此按职责保留在同一目录：认证与端点（`auth.go`、`endpoints.go`）、模型与兼容性（`models.go`、`compatibility.go`）、请求执行与流处理（`executor.go`、`stream.go`）、宿主与插件生命周期（`host.go`、`service.go`、`main.go`）。测试文件与对应实现相邻。
 
 涉及 auth、路由或流处理时，提交前运行：
 
