@@ -5,7 +5,7 @@
         "claude-fable-5": {
             "id": "claude-fable-5",
             "name": "Claude Fable 5",
-            "api": "openai-completions",
+            "api": "anthropic-messages",
             "provider": "github-copilot",
             "baseUrl": "https://api.individual.githubcopilot.com",
             "reasoning": true,
@@ -27,15 +27,13 @@
                 "Editor-Plugin-Version": "copilot-chat/0.35.0",
                 "Copilot-Integration-Id": "vscode-chat"
             },
-            "compat": {
-                "supportsStore": false,
-                "supportsDeveloperRole": false,
-                "supportsReasoningEffort": false
-            },
             "thinkingLevelMap": {
                 "off": null,
                 "xhigh": "xhigh",
                 "max": "max"
+            },
+            "compat": {
+                "forceAdaptiveThinking": true
             }
         },
         "claude-haiku-4.5": {
@@ -475,6 +473,37 @@
             },
             "contextWindow": 128000,
             "maxTokens": 16384,
+            "headers": {
+                "User-Agent": "GitHubCopilotChat/0.35.0",
+                "Editor-Version": "vscode/1.107.0",
+                "Editor-Plugin-Version": "copilot-chat/0.35.0",
+                "Copilot-Integration-Id": "vscode-chat"
+            },
+            "compat": {
+                "supportsStore": false,
+                "supportsDeveloperRole": false,
+                "supportsReasoningEffort": false
+            }
+        },
+        "kimi-k2.7-code": {
+            "id": "kimi-k2.7-code",
+            "name": "Kimi K2.7 Code",
+            "api": "openai-completions",
+            "provider": "github-copilot",
+            "baseUrl": "https://api.individual.githubcopilot.com",
+            "reasoning": true,
+            "input": [
+                "text",
+                "image"
+            ],
+            "cost": {
+                "input": 0.95,
+                "output": 4,
+                "cacheRead": 0.19,
+                "cacheWrite": 0
+            },
+            "contextWindow": 256000,
+            "maxTokens": 32000,
             "headers": {
                 "User-Agent": "GitHubCopilotChat/0.35.0",
                 "Editor-Version": "vscode/1.107.0",
@@ -980,37 +1009,6 @@
                 "high": "high",
                 "xhigh": null,
                 "max": null
-            }
-        },
-        "kimi-k2.7-code": {
-            "id": "kimi-k2.7-code",
-            "name": "Kimi K2.7 Code",
-            "api": "openai-completions",
-            "provider": "github-copilot",
-            "baseUrl": "https://api.individual.githubcopilot.com",
-            "reasoning": true,
-            "input": [
-                "text",
-                "image"
-            ],
-            "cost": {
-                "input": 0.95,
-                "output": 4,
-                "cacheRead": 0.19,
-                "cacheWrite": 0
-            },
-            "contextWindow": 256000,
-            "maxTokens": 32000,
-            "headers": {
-                "User-Agent": "GitHubCopilotChat/0.35.0",
-                "Editor-Version": "vscode/1.107.0",
-                "Editor-Plugin-Version": "copilot-chat/0.35.0",
-                "Copilot-Integration-Id": "vscode-chat"
-            },
-            "compat": {
-                "supportsStore": false,
-                "supportsDeveloperRole": false,
-                "supportsReasoningEffort": false
             }
         },
         "mai-code-1-flash-picker": {
