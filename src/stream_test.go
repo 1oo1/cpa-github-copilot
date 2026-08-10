@@ -174,6 +174,37 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 	}
 }
 
+func TestExecuteStreamPassThroughAcceptsSingleNewlineChatEvents(t *testing.T) {
+	chatChunk := `{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n")},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n")},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(102_500, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		},
+		StreamID: "plugin-single-newline-chat", HostCallbackID: "callback-stream",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" || emitted != chatChunk {
+		t.Fatalf("single-newline stream: error=%q emitted=%q", pluginError, emitted)
+	}
+}
+
 func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 	bridge := newStreamBridgeFake(
 		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
@@ -468,6 +499,32 @@ func TestSSEFramerHandlesSplitAndMultipleFrames(t *testing.T) {
 	}
 	if tail := framer.Flush(); len(tail) != 0 {
 		t.Fatalf("tail = %q", tail)
+	}
+}
+
+func TestSSEFramerEmitsCompleteJSONDataLineWithoutBlankSeparator(t *testing.T) {
+	framer := newSSEFramer(1024)
+	frames, errPush := framer.Push([]byte("event: response.completed\ndata: {\"type\":\"response.completed\"}\n"))
+	if errPush != nil || len(frames) != 1 {
+		t.Fatalf("frames = %#v, error = %v", frames, errPush)
+	}
+	if got := string(normalizeSSEFrame(frames[0])); got != `data: {"type":"response.completed"}` {
+		t.Fatalf("normalized frame = %q", got)
+	}
+}
+
+func TestSSEFramerWaitsForSplitMultiLineJSONEvent(t *testing.T) {
+	framer := newSSEFramer(1024)
+	frames, errPush := framer.Push([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\n"))
+	if errPush != nil || len(frames) != 0 {
+		t.Fatalf("partial frames = %#v, error = %v", frames, errPush)
+	}
+	frames, errPush = framer.Push([]byte("data: \"response\":{\"id\":\"resp-1\"}}\n\n"))
+	if errPush != nil || len(frames) != 1 {
+		t.Fatalf("completed frames = %#v, error = %v", frames, errPush)
+	}
+	if got := string(normalizeSSEFrame(frames[0])); got != "data: {\"type\":\"response.completed\",\n\"response\":{\"id\":\"resp-1\"}}" {
+		t.Fatalf("normalized frame = %q", got)
 	}
 }
 
@@ -1153,6 +1210,41 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 			}
 			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
 		})
+	}
+}
+
+func TestExecuteStreamResponsesToChatAcceptsEventsWithoutSSESeparators(t *testing.T) {
+	delta := `{"type":"response.output_text.delta","response_id":"resp_1","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}`
+	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + delta)},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + completed)},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(194_750, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-responses-to-chat-no-separator",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	pluginError := bridge.pluginError
+	emitted := string(bytesJoin(bridge.emitted))
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	}
+	if !strings.Contains(emitted, "hello") || !strings.Contains(emitted, `"finish_reason":"stop"`) {
+		t.Fatalf("translated Chat terminal chunks missing: %q", emitted)
 	}
 }
 
