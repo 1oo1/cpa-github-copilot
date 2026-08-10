@@ -21,7 +21,7 @@ review_verdict: APPROVE
 1. `/chat/completions`、`/responses`、`/v1/messages` 的 URL、身份、受控 metadata、能力 gate 和 body normalizer 都有版本化 contract tests。
 2. 原生 Responses 的 server compaction request、opaque output、客户端 latest-item selection 和 next-turn replay 已形成自动化闭环。
 3. normal、translated、streaming 和 raw HTTP 路径都要求真实 source terminal，不能由 translator 或模糊 JSON 伪造 completed。
-4. endpoint、Authorization、manifest、caller header 和日志信任边界没有放宽。
+4. endpoint、Authorization、caller header 和日志信任边界没有放宽。
 5. 插件保持 stateless；公共 API、持久化、transport 和通用 translator 仍由 CLIProxyAPI 承担。
 
 ## 2. 原差异的关闭状态
@@ -86,7 +86,7 @@ flowchart TD
 
 ### D2：能力由账户 catalog 传播
 
-`/models` schema、`storedModel` 和 `modelRoute` 共同携带请求构造所需能力。nullable capability 缺失时默认关闭，避免按模型名称扩大权限。compatibility manifest 只能补充账户已发现模型的白名单字段，不能改变 origin、Authorization 或最终身份。
+`/models` schema、`storedModel` 和 `modelRoute` 共同携带请求构造所需能力。reasoning levels、adaptive thinking、thinking budget、context window 和 endpoint 均来自账户 catalog；nullable capability 缺失时默认关闭，不按模型名称扩大权限。
 
 ### D3：受控 request context
 
@@ -146,7 +146,7 @@ VS Code `1.132.0` 只提供 inline `context_management` 证据。`Alt:"responses
 
 ### 5.2 Body contract
 
-Chat 覆盖 supported/unsupported reasoning effort、roles、tools 和 stream；Responses 覆盖 defaults、caller override、threshold、excluded family、opaque markers 与 cross-format rejection；Messages 覆盖 adaptive/budget thinking、effort、cache、tool schema/ID、context editing 和 eager input。
+Chat 覆盖动态 supported/unsupported reasoning effort、roles、tools 和 stream；Responses 覆盖 catalog effort、defaults、caller override、threshold、excluded family、opaque markers 与 cross-format rejection；Messages 覆盖 catalog adaptive/budget/effort、cache、tool schema/ID 和 context editing。
 
 ### 5.3 Responses terminal
 
@@ -184,7 +184,7 @@ Chat 覆盖 supported/unsupported reasoning effort、roles、tools 和 stream；
 
 - [x] 更新 0.60/1.132 身份并保留最终 API `2026-06-01`。
 - [x] 增加 request/task/interaction correlation 和受控 vocabulary。
-- [x] 扩充 route capability并收紧 header/manifest 信任边界。
+- [x] 扩充 route capability并收紧 header 信任边界。
 
 ### Phase 2：原生 Responses 闭环
 
@@ -195,7 +195,7 @@ Chat 覆盖 supported/unsupported reasoning effort、roles、tools 和 stream；
 
 ### Phase 3：三协议 body parity
 
-- [x] Chat reasoning 与 compatibility rules。
+- [x] Chat reasoning 与账户 catalog capability 校验。
 - [x] Responses defaults、reasoning、cache 和 opaque state。
 - [x] Messages thinking、cache、context、tool 和 beta 联动。
 

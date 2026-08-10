@@ -14,51 +14,43 @@ import (
 )
 
 type storedModel struct {
-	ID                              string   `json:"id"`
-	Name                            string   `json:"name,omitempty"`
-	Version                         string   `json:"version,omitempty"`
-	Family                          string   `json:"family,omitempty"`
-	Format                          string   `json:"format"`
-	ContextWindow                   int64    `json:"context_window,omitempty"`
-	MaxPromptTokens                 int64    `json:"max_prompt_tokens,omitempty"`
-	MaxOutputTokens                 int64    `json:"max_output_tokens,omitempty"`
-	InputModalities                 []string `json:"input_modalities,omitempty"`
-	ReasoningLevels                 []string `json:"reasoning_levels,omitempty"`
-	MinThinking                     int      `json:"min_thinking,omitempty"`
-	MaxThinking                     int      `json:"max_thinking,omitempty"`
-	AdaptiveThinking                bool     `json:"adaptive_thinking,omitempty"`
-	ForceAdaptiveThinking           *bool    `json:"force_adaptive_thinking,omitempty"`
-	SupportsTemperature             *bool    `json:"supports_temperature,omitempty"`
-	SupportsEagerToolInputStreaming *bool    `json:"supports_eager_tool_input_streaming,omitempty"`
-	SupportsXHighEffort             *bool    `json:"supports_xhigh_effort,omitempty"`
+	ID                      string   `json:"id"`
+	Name                    string   `json:"name,omitempty"`
+	Version                 string   `json:"version,omitempty"`
+	Family                  string   `json:"family,omitempty"`
+	Format                  string   `json:"format"`
+	ContextWindow           int64    `json:"context_window,omitempty"`
+	MaxPromptTokens         int64    `json:"max_prompt_tokens,omitempty"`
+	MaxOutputTokens         int64    `json:"max_output_tokens,omitempty"`
+	InputModalities         []string `json:"input_modalities,omitempty"`
+	ReasoningLevels         []string `json:"reasoning_levels,omitempty"`
+	ReasoningLevelsDeclared bool     `json:"reasoning_levels_declared,omitempty"`
+	MinThinking             int      `json:"min_thinking,omitempty"`
+	MaxThinking             int      `json:"max_thinking,omitempty"`
+	AdaptiveThinking        bool     `json:"adaptive_thinking,omitempty"`
 	// Streaming、SupportsToolSearch、SupportsContextEditing 缺失表示未声明该能力，按禁用处理。
-	Streaming                 *bool             `json:"streaming,omitempty"`
-	SupportsToolSearch        *bool             `json:"supports_tool_search,omitempty"`
-	SupportsContextEditing    *bool             `json:"supports_context_editing,omitempty"`
-	CompatibilityHeaders      map[string]string `json:"-"`
-	ContextWindowOverridden   bool              `json:"-"`
-	ReasoningLevelsOverridden bool              `json:"-"`
+	Streaming              *bool `json:"streaming,omitempty"`
+	SupportsToolSearch     *bool `json:"supports_tool_search,omitempty"`
+	SupportsContextEditing *bool `json:"supports_context_editing,omitempty"`
 }
 
 type modelRoute struct {
-	Format                          string
-	Path                            string
-	Headers                         map[string]string
-	AdaptiveThinking                bool
-	ForceAdaptiveThinking           *bool
-	SupportsTemperature             *bool
-	SupportsEagerToolInputStreaming *bool
-	SupportsXHighEffort             *bool
+	Format           string
+	Path             string
+	AdaptiveThinking bool
+	MinThinking      int
+	MaxThinking      int
 	// 以下字段供请求构造使用（reasoning_effort 校验、Responses compaction 阈值、Anthropic beta 门控）；
 	// 缺失可选能力（nil）一律按禁用处理。
-	Family                 string
-	MaxPromptTokens        int64
-	MaxOutputTokens        int64
-	Streaming              *bool
-	Vision                 bool
-	ReasoningLevels        []string
-	SupportsToolSearch     *bool
-	SupportsContextEditing *bool
+	Family                  string
+	MaxPromptTokens         int64
+	MaxOutputTokens         int64
+	Streaming               *bool
+	Vision                  bool
+	ReasoningLevels         []string
+	ReasoningLevelsDeclared bool
+	SupportsToolSearch      *bool
+	SupportsContextEditing  *bool
 }
 
 type remoteModelsResponse struct {
@@ -126,16 +118,15 @@ func (s *pluginService) modelsForAuth(raw []byte) ([]byte, error) {
 		return nil, failure
 	}
 	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
-	manifest, manifestChanged := s.loadCompatibilityManifest(client, &storage)
-	models := applyCompatibilityManifest(storage.Models, manifest)
-	storageChanged := manifestChanged
+	models := storage.Models
+	storageChanged := false
 	cacheFresh := s.modelCacheFresh(storage)
 	source := "cache"
 	if !cacheFresh {
 		source = "discovery"
 		discovered, failure := s.discoverModels(client, storage)
 		if failure == nil {
-			models = applyCompatibilityManifest(discovered, manifest)
+			models = discovered
 			storage.Models = discovered
 			storage.ModelsFetchedAt = s.now().UTC().UnixMilli()
 			storageChanged = true
@@ -218,7 +209,7 @@ func (s *pluginService) discoverModels(client hostClient, storage copilotStorage
 	return models, nil
 }
 
-func parseDiscoveredModels(raw []byte, allowPolicyFallback bool) ([]storedModel, error) {
+func parseDiscoveredModels(raw []byte, includeEnabledPolicyModels bool) ([]storedModel, error) {
 	var response remoteModelsResponse
 	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil || response.Data == nil {
 		return nil, fmt.Errorf("GitHub Copilot returned an invalid model catalog")
@@ -243,8 +234,8 @@ func parseDiscoveredModels(raw []byte, allowPolicyFallback bool) ([]storedModel,
 		}
 	}
 	selectedModels := pickerModels
-	if len(selectedModels) == 0 && allowPolicyFallback {
-		selectedModels = policyModels
+	if includeEnabledPolicyModels {
+		selectedModels = append(selectedModels, policyModels...)
 	}
 	models := make([]storedModel, 0, len(selectedModels))
 	seen := make(map[string]struct{})
@@ -260,24 +251,25 @@ func parseDiscoveredModels(raw []byte, allowPolicyFallback bool) ([]storedModel,
 		if model.Capabilities.Supports.Vision || hasImageMediaType(model.Capabilities.Limits.Vision.SupportedMediaTypes) {
 			modalities = append(modalities, "image")
 		}
-		levels := copilotReasoningLevels(model.ID, model.Capabilities.Supports.ReasoningEffort)
+		levels := cleanLevels(model.Capabilities.Supports.ReasoningEffort)
 		models = append(models, storedModel{
-			ID:                     model.ID,
-			Name:                   valueOr(strings.TrimSpace(model.Name), model.ID),
-			Version:                strings.TrimSpace(model.Version),
-			Family:                 strings.TrimSpace(model.Capabilities.Family),
-			Format:                 format,
-			ContextWindow:          copilotContextWindow(model.ID, positiveInt64(model.Capabilities.Limits.MaxContextWindowTokens, model.Capabilities.Limits.MaxPromptTokens)),
-			MaxPromptTokens:        maxInt64(model.Capabilities.Limits.MaxPromptTokens, 0),
-			MaxOutputTokens:        maxInt64(model.Capabilities.Limits.MaxOutputTokens, 0),
-			InputModalities:        modalities,
-			ReasoningLevels:        levels,
-			MinThinking:            max(model.Capabilities.Supports.MinThinkingBudget, 0),
-			MaxThinking:            max(model.Capabilities.Supports.MaxThinkingBudget, 0),
-			AdaptiveThinking:       model.Capabilities.Supports.AdaptiveThinking || forcesAnthropicAdaptiveThinking(model.ID),
-			Streaming:              model.Capabilities.Supports.Streaming,
-			SupportsToolSearch:     model.Capabilities.Supports.ToolSearch,
-			SupportsContextEditing: model.Capabilities.Supports.ContextEditing,
+			ID:                      model.ID,
+			Name:                    valueOr(strings.TrimSpace(model.Name), model.ID),
+			Version:                 strings.TrimSpace(model.Version),
+			Family:                  strings.TrimSpace(model.Capabilities.Family),
+			Format:                  format,
+			ContextWindow:           positiveInt64(model.Capabilities.Limits.MaxContextWindowTokens, model.Capabilities.Limits.MaxPromptTokens),
+			MaxPromptTokens:         maxInt64(model.Capabilities.Limits.MaxPromptTokens, 0),
+			MaxOutputTokens:         maxInt64(model.Capabilities.Limits.MaxOutputTokens, 0),
+			InputModalities:         modalities,
+			ReasoningLevels:         levels,
+			ReasoningLevelsDeclared: model.Capabilities.Supports.ReasoningEffort != nil,
+			MinThinking:             max(model.Capabilities.Supports.MinThinkingBudget, 0),
+			MaxThinking:             max(model.Capabilities.Supports.MaxThinkingBudget, 0),
+			AdaptiveThinking:        model.Capabilities.Supports.AdaptiveThinking,
+			Streaming:               model.Capabilities.Supports.Streaming,
+			SupportsToolSearch:      model.Capabilities.Supports.ToolSearch,
+			SupportsContextEditing:  model.Capabilities.Supports.ContextEditing,
 		})
 		seen[model.ID] = struct{}{}
 	}
@@ -308,10 +300,9 @@ func selectModelFormat(modelID string, endpoints []string) string {
 		}
 		return inferred
 	}
-	if available[inferred] {
-		return inferred
-	}
-	for _, format := range []string{formatClaude, formatOpenAIResponse, formatOpenAI} {
+	// 与 VS Code ChatEndpoint 一致：账户声明的 Responses 优先，其次 Messages，
+	// 最后才是 Chat Completions。模型 ID 只用于 endpoint 元数据完全缺失时的旧缓存迁移。
+	for _, format := range []string{formatOpenAIResponse, formatClaude, formatOpenAI} {
 		if available[format] {
 			return format
 		}
@@ -343,13 +334,6 @@ func isCopilotClaude(modelID string) bool {
 	return false
 }
 
-func effectiveModelFormat(modelID, storedFormat string) string {
-	if strings.EqualFold(strings.TrimSpace(modelID), "claude-fable-5") {
-		return formatClaude
-	}
-	return storedFormat
-}
-
 func endpointPath(format string) string {
 	switch format {
 	case formatClaude:
@@ -369,32 +353,23 @@ func modelInfos(models []storedModel) []pluginapi.ModelInfo {
 		if strings.TrimSpace(model.ID) == "" {
 			continue
 		}
-		format := effectiveModelFormat(model.ID, model.Format)
-		adaptiveThinking := model.AdaptiveThinking || compatibilityBool(model.ForceAdaptiveThinking, forcesAnthropicAdaptiveThinking(model.ID))
-		reasoningLevels := copilotReasoningLevels(model.ID, model.ReasoningLevels)
-		if model.ReasoningLevelsOverridden {
-			reasoningLevels = cleanLevels(model.ReasoningLevels)
-		}
-		contextWindow := copilotContextWindow(model.ID, model.ContextWindow)
-		if model.ContextWindowOverridden {
-			contextWindow = model.ContextWindow
-		}
-		configurableThinking := format != formatOpenAI
+		format := model.Format
+		reasoningLevels := catalogReasoningLevels(model)
 		parameters := []string{"max_tokens"}
-		if format != formatClaude || compatibilityBool(model.SupportsTemperature, supportsAnthropicTemperature(model.ID)) {
+		if format != formatClaude {
 			parameters = append(parameters, "temperature")
 		}
 		parameters = append(parameters, "top_p", "tools", "tool_choice")
-		if compatibilityBool(model.Streaming, false) {
+		if optionalBool(model.Streaming) {
 			parameters = append(parameters, "stream")
 		}
 		var thinking *pluginapi.ThinkingSupport
-		if configurableThinking && (len(reasoningLevels) > 0 || model.MaxThinking > 0 || adaptiveThinking) {
+		if len(reasoningLevels) > 0 || model.MaxThinking > 0 || model.AdaptiveThinking {
 			thinking = &pluginapi.ThinkingSupport{
 				Min:            model.MinThinking,
 				Max:            model.MaxThinking,
-				ZeroAllowed:    supportsReasoningOff(model.ID, format),
-				DynamicAllowed: adaptiveThinking,
+				ZeroAllowed:    format != formatOpenAIResponse,
+				DynamicAllowed: model.AdaptiveThinking,
 				Levels:         reasoningLevels,
 			}
 			parameters = append(parameters, "reasoning_effort")
@@ -411,7 +386,7 @@ func modelInfos(models []storedModel) []pluginapi.ModelInfo {
 			InputTokenLimit:            model.MaxPromptTokens,
 			OutputTokenLimit:           model.MaxOutputTokens,
 			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              contextWindow,
+			ContextLength:              model.ContextWindow,
 			MaxCompletionTokens:        model.MaxOutputTokens,
 			SupportedParameters:        parameters,
 			SupportedInputModalities:   append([]string(nil), model.InputModalities...),
@@ -442,11 +417,6 @@ func (s *pluginService) setModelRoutes(authID string, models []storedModel) {
 func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilotStorage) modelRoute {
 	for _, model := range storage.Models {
 		if model.ID == modelID {
-			if s.loadedConfig().EnableRemoteCompatibility {
-				if manifest, ok := cachedCompatibilityManifest(&storage); ok {
-					model = applyCompatibilityManifest([]storedModel{model}, manifest)[0]
-				}
-			}
 			return routeForStoredModel(model)
 		}
 	}
@@ -460,34 +430,26 @@ func (s *pluginService) resolveModelRoute(authID, modelID string, storage copilo
 		return route
 	}
 	format := inferModelFormat(modelID)
-	return modelRoute{Format: format, Path: endpointPath(format), AdaptiveThinking: forcesAnthropicAdaptiveThinking(modelID)}
+	return modelRoute{Format: format, Path: endpointPath(format)}
 }
 
 func routeForStoredModel(model storedModel) modelRoute {
-	format := effectiveModelFormat(model.ID, model.Format)
-	reasoningLevels := model.ReasoningLevels
-	if model.ReasoningLevelsOverridden {
-		reasoningLevels = cleanLevels(model.ReasoningLevels)
-	} else {
-		reasoningLevels = copilotReasoningLevels(model.ID, model.ReasoningLevels)
-	}
+	reasoningLevels := catalogReasoningLevels(model)
 	return modelRoute{
-		Format:                          format,
-		Path:                            endpointPath(format),
-		Headers:                         cloneStringMap(model.CompatibilityHeaders),
-		AdaptiveThinking:                model.AdaptiveThinking || compatibilityBool(model.ForceAdaptiveThinking, forcesAnthropicAdaptiveThinking(model.ID)),
-		ForceAdaptiveThinking:           cloneBool(model.ForceAdaptiveThinking),
-		SupportsTemperature:             cloneBool(model.SupportsTemperature),
-		SupportsEagerToolInputStreaming: cloneBool(model.SupportsEagerToolInputStreaming),
-		SupportsXHighEffort:             cloneBool(model.SupportsXHighEffort),
-		Family:                          model.Family,
-		MaxPromptTokens:                 model.MaxPromptTokens,
-		MaxOutputTokens:                 model.MaxOutputTokens,
-		Streaming:                       cloneBool(model.Streaming),
-		Vision:                          hasModality(model.InputModalities, "image"),
-		ReasoningLevels:                 reasoningLevels,
-		SupportsToolSearch:              cloneBool(model.SupportsToolSearch),
-		SupportsContextEditing:          cloneBool(model.SupportsContextEditing),
+		Format:                  model.Format,
+		Path:                    endpointPath(model.Format),
+		AdaptiveThinking:        model.AdaptiveThinking,
+		MinThinking:             model.MinThinking,
+		MaxThinking:             model.MaxThinking,
+		Family:                  model.Family,
+		MaxPromptTokens:         model.MaxPromptTokens,
+		MaxOutputTokens:         model.MaxOutputTokens,
+		Streaming:               cloneBool(model.Streaming),
+		Vision:                  hasModality(model.InputModalities, "image"),
+		ReasoningLevels:         reasoningLevels,
+		ReasoningLevelsDeclared: model.ReasoningLevelsDeclared,
+		SupportsToolSearch:      cloneBool(model.SupportsToolSearch),
+		SupportsContextEditing:  cloneBool(model.SupportsContextEditing),
 	}
 }
 
@@ -500,11 +462,16 @@ func hasModality(modalities []string, want string) bool {
 	return false
 }
 
-func compatibilityBool(override *bool, fallback bool) bool {
-	if override != nil {
-		return *override
+func optionalBool(value *bool) bool {
+	return value != nil && *value
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
 	}
-	return fallback
+	cloned := *value
+	return &cloned
 }
 
 func (s *pluginService) enableKnownModels(client hostClient, storage copilotStorage) {
@@ -564,7 +531,7 @@ func cleanLevels(levels []string) []string {
 	out := make([]string, 0, len(levels))
 	for _, level := range levels {
 		level = strings.ToLower(strings.TrimSpace(level))
-		if level == "" {
+		if level == "" || level == "minimal" {
 			continue
 		}
 		if _, exists := seen[level]; !exists {
@@ -575,71 +542,11 @@ func cleanLevels(levels []string) []string {
 	return out
 }
 
-func copilotReasoningLevels(model string, discovered []string) []string {
-	levels := cleanLevels(discovered)
-	id := strings.ToLower(normalizeModelID(model))
-	var required []string
-	switch {
-	case forcesAnthropicAdaptiveThinking(id):
-		required = []string{"minimal", "low", "medium", "high"}
-		if supportsAnthropicXHighEffort(id) {
-			required = append(required, "xhigh")
-		}
-		required = append(required, "max")
-	case strings.HasPrefix(id, "gpt-5"):
-		required = []string{"minimal", "low", "medium", "high"}
-		if supportsCopilotGPTXHigh(id) {
-			required = append(required, "xhigh")
-		}
-		if supportsCopilotGPTMax(id) {
-			required = append(required, "max")
-		}
-	default:
-		return levels
+func catalogReasoningLevels(model storedModel) []string {
+	if !model.ReasoningLevelsDeclared {
+		return nil
 	}
-	seen := make(map[string]struct{}, len(required)+len(levels))
-	out := make([]string, 0, len(required)+len(levels))
-	for _, level := range append(required, levels...) {
-		if _, exists := seen[level]; exists {
-			continue
-		}
-		seen[level] = struct{}{}
-		out = append(out, level)
-	}
-	return out
-}
-
-func supportsCopilotGPTXHigh(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-		"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra":
-		return true
-	default:
-		return false
-	}
-}
-
-func supportsCopilotGPTMax(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra":
-		return true
-	default:
-		return false
-	}
-}
-
-func supportsReasoningOff(model, format string) bool {
-	return format != formatOpenAIResponse || !strings.HasPrefix(strings.ToLower(normalizeModelID(model)), "gpt-5")
-}
-
-func copilotContextWindow(model string, discovered int64) int64 {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-fable-5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5",
-		"claude-sonnet-4.6", "claude-sonnet-5", "gpt-5.3-codex", "gpt-5.4", "gpt-5.5":
-		return maxInt64(discovered, 1_000_000)
-	default:
-		return discovered
-	}
+	return cleanLevels(model.ReasoningLevels)
 }
 
 func positiveInt64(values ...int64) int64 {

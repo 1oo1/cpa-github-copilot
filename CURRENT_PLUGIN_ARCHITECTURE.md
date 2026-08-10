@@ -27,7 +27,7 @@ flowchart LR
     Host[CLIProxyAPI host]
     ABI[C ABI and RPC\nsrc/main.go · src/service.go]
     Auth[Copilot auth\nsrc/auth.go · src/endpoints.go]
-    Models[Account catalog and route\nsrc/models.go · src/compatibility.go]
+    Models[Account catalog and route\nsrc/models.go]
     Exec[Request and non-stream\nsrc/executor.go · src/headers.go]
     Stream[SSE state machine\nsrc/stream.go]
     SDK[CLIProxyAPI translators]
@@ -54,7 +54,6 @@ flowchart LR
 | `src/auth.go` | Device Flow、broker exchange、刷新、凭据解析和 legacy 字段迁移 |
 | `src/endpoints.go` | GitHub host、token `proxy-ep`、same-origin 和 canonical inference path 校验 |
 | `src/models.go` | `/models` schema、资格过滤、能力传播、endpoint 和 route 选择 |
-| `src/compatibility.go`、`src/compatibility.json` | 受限兼容覆盖、ETag/TTL、严格 schema |
 | `src/headers.go` | VS Code 1.132 身份、请求关联、受控 interaction/initiator、Anthropic beta |
 | `src/executor.go` | 请求转换、协议 normalizer、raw HTTP、非流终态验证 |
 | `src/stream.go` | SSE framing、source terminal 认证、转换、错误优先级和关闭 |
@@ -109,30 +108,27 @@ flowchart TD
     Catalog[GET /models]
     Filter[Picker / policy / tools / endpoint]
     Stored[StorageJSON model snapshot]
-    Manifest[Restricted compatibility overlay]
     Info[ModelInfo]
     Route[modelRoute]
 
     Catalog --> Filter --> Stored
-    Stored --> Manifest --> Info
-    Stored --> Manifest --> Route
+    Stored --> Info
+    Stored --> Route
 ```
 
 选择规则：
 
-1. 接受 `model_picker_enabled == true` 且 policy 不是 disabled 的模型。
-2. Individual endpoint 在 picker 为空时可回退到 `policy.state == enabled`。
+1. 所有账号接受 `model_picker_enabled == true` 且 policy 不是 disabled 的模型。
+2. Individual endpoint 还接受 `policy.state == enabled` 的模型，即使它未显示在 picker；Business endpoint 保持严格 picker 策略。
 3. 排除明确 `tool_calls == false` 的模型。
 4. 声明了 `supported_endpoints` 时，必须包含 `/chat/completions`、`/responses` 或 `/v1/messages`。
 5. 只有未声明 endpoint 时才按模型 ID 做 legacy 推断。
 6. 已有非空 snapshot 但找不到模型时直接拒绝，不按名称猜测。
-7. manifest 只能覆盖账户已发现的同 ID 模型和 schema 白名单字段。
-
-discovery 会把 family、prompt/output limit、vision、reasoning levels及 nullable `streaming`、`tool_search`、`context_editing` 保存到 route。缺失 optional capability 按关闭处理；只有显式 `streaming:true` 才发布 stream capability 并允许 `ExecuteStream`。
+discovery 会把 family、prompt/output limit、vision、adaptive thinking、thinking budget、reasoning levels 及 nullable `streaming`、`tool_search`、`context_editing` 原样保存到 route。不会按模型 ID 补齐等级、context window 或 thinking 能力；缺失 optional capability 按关闭处理，只有显式 `streaming:true` 才发布 stream capability 并允许 `ExecuteStream`。
 
 ## 6. VS Code 1.132 HTTP 身份与请求上下文
 
-固定且不可由 caller 或 compatibility manifest 覆盖：
+固定且不可由 caller 覆盖：
 
 ```http
 User-Agent: GitHubCopilotChat/0.60.0
@@ -162,10 +158,10 @@ vision header 同时要求 route 支持 vision 且 payload 含 image。Anthropic
 | 协议 | 当前后处理 |
 |---|---|
 | Chat Completions | 固定 model/stream；删除 `store`；只有 route 声明对应 level 时保留 `reasoning_effort`；developer role 改 system |
-| Responses | 固定 `store:false`；缺省 `truncation:disabled` 与 encrypted reasoning include；清理空 reasoning；GPT-5 minimal 改 low；按 policy 注入 context management |
-| Messages | 缺省 `max_tokens:4096`；删除 `stream_options`；按能力处理 thinking、temperature、system、tool schema/ID、context management、effort 和 eager tool input |
+| Responses | 固定 `store:false`；缺省 `truncation:disabled` 与 encrypted reasoning include；只保留 route 声明的 reasoning effort；按 policy 注入 context management |
+| Messages | 缺省 `max_tokens:4096`；删除 `stream_options`；按动态 adaptive/budget/effort 能力处理 thinking、system、tool schema/ID 和 context management；不生成 pi 的 eager tool 扩展 |
 
-caller 已提供合法 `truncation`、`include` 或 `context_management` 时不会被默认值覆盖。Chat 与 Messages 的特殊规则由 discovery/compatibility route 能力驱动，不把所有模型行为硬编码到 ID。
+caller 已提供合法 `truncation`、`include` 或 `context_management` 时不会被默认值覆盖。三协议的思考等级均来自 `/models.capabilities.supports.reasoning_effort`，未知未来等级无需修改客户端型号清单。
 
 ## 8. Responses compaction 与 continuation
 

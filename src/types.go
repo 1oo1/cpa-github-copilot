@@ -56,13 +56,11 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	ClientID                    string `yaml:"client_id"`
-	GitHubHost                  string `yaml:"github_host"`
-	EnableModels                bool   `yaml:"enable_models"`
-	ModelCacheTTL               int    `yaml:"model_cache_ttl_seconds"`
-	EnableRemoteCompatibility   bool   `yaml:"enable_remote_compatibility"`
-	RemoteCompatibilityCacheTTL int    `yaml:"remote_compatibility_cache_ttl_seconds"`
-	MaxStreamBytes              int    `yaml:"max_stream_buffer_bytes"`
+	ClientID       string `yaml:"client_id"`
+	GitHubHost     string `yaml:"github_host"`
+	EnableModels   bool   `yaml:"enable_models"`
+	ModelCacheTTL  int    `yaml:"model_cache_ttl_seconds"`
+	MaxStreamBytes int    `yaml:"max_stream_buffer_bytes"`
 	// EnableResponsesContextManagement 控制是否在原生 Responses 路由上默认启用
 	// VS Code feature-on 的 server-side context compaction（context_management 阈值）。
 	EnableResponsesContextManagement bool `yaml:"enable_responses_context_management"`

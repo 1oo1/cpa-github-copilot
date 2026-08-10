@@ -15,8 +15,6 @@ func defaultPluginConfig() pluginConfig {
 		GitHubHost:                       defaultGitHubHost,
 		EnableModels:                     true,
 		ModelCacheTTL:                    300,
-		EnableRemoteCompatibility:        true,
-		RemoteCompatibilityCacheTTL:      4 * 60 * 60,
 		MaxStreamBytes:                   4 << 20,
 		EnableResponsesContextManagement: true,
 	}
@@ -47,9 +45,6 @@ func (s *pluginService) configure(raw []byte) error {
 	if cfg.ModelCacheTTL < 0 {
 		return &pluginFailure{code: "invalid_config", message: "model_cache_ttl_seconds must not be negative"}
 	}
-	if cfg.RemoteCompatibilityCacheTTL < 0 {
-		return &pluginFailure{code: "invalid_config", message: "remote_compatibility_cache_ttl_seconds must not be negative"}
-	}
 	if cfg.MaxStreamBytes < 64<<10 || cfg.MaxStreamBytes > 64<<20 {
 		return &pluginFailure{code: "invalid_config", message: "max_stream_buffer_bytes must be between 65536 and 67108864"}
 	}
@@ -67,15 +62,13 @@ func (s *pluginService) configure(raw []byte) error {
 		clearLoginSessionSecrets(session)
 	}
 	s.logEvent("", "info", "plugin.configured", map[string]any{
-		"github_host":                            cfg.GitHubHost,
-		"enable_models":                          cfg.EnableModels,
-		"model_cache_ttl_seconds":                cfg.ModelCacheTTL,
-		"enable_remote_compatibility":            cfg.EnableRemoteCompatibility,
-		"remote_compatibility_cache_ttl_seconds": cfg.RemoteCompatibilityCacheTTL,
-		"max_stream_buffer_bytes":                cfg.MaxStreamBytes,
-		"enable_responses_context_management":    cfg.EnableResponsesContextManagement,
-		"credential_identity_changed":            changedIdentity,
-		"discarded_login_session_count":          len(staleSessions),
+		"github_host":                         cfg.GitHubHost,
+		"enable_models":                       cfg.EnableModels,
+		"model_cache_ttl_seconds":             cfg.ModelCacheTTL,
+		"max_stream_buffer_bytes":             cfg.MaxStreamBytes,
+		"enable_responses_context_management": cfg.EnableResponsesContextManagement,
+		"credential_identity_changed":         changedIdentity,
+		"discarded_login_session_count":       len(staleSessions),
 	})
 	return nil
 }
@@ -99,8 +92,6 @@ func (s *pluginService) registration() registration {
 				{Name: "github_host", Type: pluginapi.ConfigFieldTypeString, Description: "GitHub.com or a trusted GitHub Enterprise hostname."},
 				{Name: "enable_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Best-effort enable Copilot model policies after login."},
 				{Name: "model_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a non-empty account model catalog before rediscovery."},
-				{Name: "enable_remote_compatibility", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Apply newer compatibility metadata from the fixed project manifest."},
-				{Name: "remote_compatibility_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a checked remote compatibility manifest."},
 				{Name: "max_stream_buffer_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum buffered partial SSE event size."},
 				{Name: "enable_responses_context_management", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Default-enable native Responses server-side context compaction (VS Code feature-on behavior)."},
 			},

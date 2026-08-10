@@ -78,20 +78,11 @@ func TestInferenceHeadersProtectAuthorization(t *testing.T) {
 	}
 }
 
-func TestInferenceHeadersApplyCompatibilityIdentityHeaders(t *testing.T) {
-	route := modelRoute{
-		Format: formatOpenAI,
-		Headers: map[string]string{
-			"User-Agent":             "GitHubCopilotChat/remote",
-			"Editor-Version":         "vscode/remote",
-			"Editor-Plugin-Version":  "copilot-chat/remote",
-			"Copilot-Integration-Id": "remote-chat",
-		},
-	}
+func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
+	route := modelRoute{Format: formatOpenAI}
 	headers := inferenceHeadersForRoute("real-session", route, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), http.Header{
 		"Authorization": []string{"Bearer attacker"},
 	}, formatOpenAI)
-	// The compatibility manifest must never override the versioned identity profile at send time.
 	if headers.Get("User-Agent") != copilotUserAgent || headers.Get("Editor-Version") != copilotEditorVersion ||
 		headers.Get("Editor-Plugin-Version") != copilotPluginVersion || headers.Get("Copilot-Integration-Id") != copilotIntegrationID {
 		t.Fatalf("identity headers = %#v, want canonical versioned identity", headers)

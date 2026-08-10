@@ -31,8 +31,8 @@ GitHub Device Flow
 ```
 
 - 同时提供 `auth_provider`、`model_provider` 和 OAuth `executor`。
-- 模型目录按 picker、policy、tool calls 和可路由 endpoint 过滤；Individual 账号在
-  picker 结果为空时回退到 enabled policy。
+- 模型目录按 picker、policy、tool calls 和可路由 endpoint 过滤；Individual 账号同时
+  接受 picker 模型和 enabled policy 模型，Business 账号保持严格 picker 策略。
 - session 刷新成功但 `/models` 暂时失败时，保留新 session 和旧模型状态。
 - 所有 GitHub/Copilot HTTP 与流请求都经过 `host.http.*`；token 仅进入
   provider-owned `StorageJSON` 和上游 Authorization。
@@ -111,21 +111,11 @@ Store 与手工安装共用 `plugins.configs.github-copilot-go`。除 `enabled`�
 | `github_host` | `github.com` | GitHub.com 或管理员信任的 GitHub Enterprise 主机名 |
 | `enable_models` | `true` | 登录后 best-effort 启用已知模型 policy |
 | `model_cache_ttl_seconds` | `300` | 非空账号模型目录的复用时间；`0` 表示每次发现都刷新 |
-| `enable_remote_compatibility` | `true` | 从固定 manifest 应用较新的受限兼容覆盖 |
-| `remote_compatibility_cache_ttl_seconds` | `14400` | manifest 成功检查后的缓存时间；`0` 表示每次检查 |
 | `max_stream_buffer_bytes` | `4194304` | 未完成 SSE 事件的缓存上限；允许 64 KiB 到 64 MiB |
 | `enable_responses_context_management` | `true` | 为 eligible 原生 Responses 模型缺省启用服务端 compaction |
 
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
 fragment 或 IP；同时需要该实例可用的 OAuth public client ID。
-
-### 远端兼容清单
-
-- 固定来源为项目 main 分支的 [compatibility.json](src/compatibility.json)（https://raw.githubusercontent.com/1oo1/cpa-github-copilot/main/src/compatibility.json）；请求不带 GitHub/Copilot 凭据。
-- 只覆盖账号 `/models` 已返回的同 ID 模型；协议、token 上限、reasoning 和已实现能力均按严格 schema 校验。
-- 仅允许四个客户端身份 header；manifest 不能控制 origin、任意路径、Authorization、OAuth 或 request body。
-- 使用 ETag 和 `StorageJSON` 缓存；失败时回退最后有效版本或内置规则，旧于内置版本的远端数据不生效。
-- 远端文件与源码共享仓库信任边界且无独立签名；关闭开关即可只使用随二进制发布的规则。
 
 ## 登录与调用
 
@@ -189,7 +179,7 @@ finish。
   模型、policy 与推理端点。
 - token 仅持久化在 provider-owned `StorageJSON`；凭据文件是明文 JSON，应保护 CPA
   auth 目录及备份。
-- 推理限制在凭据解析出的 API origin；调用方和兼容清单都不能重定向 bearer token。
+- 推理限制在凭据解析出的 API origin；调用方不能重定向 bearer token。
 - 插件不记录 `RawJSON`、`StorageJSON`、Authorization、token、device/user code、请求
   或响应正文。
 - caller 只能使用 VS Code 1.132 的 interaction vocabulary、`user|agent` initiator 和合法
@@ -203,7 +193,7 @@ finish。
 
 ## 开发与文档
 
-Go 源码和测试统一位于 [src](src/)。它们属于同一个 `main` 包，因此按职责保留在同一目录：认证与端点（`auth.go`、`endpoints.go`）、模型与兼容性（`models.go`、`compatibility.go`）、请求执行与流处理（`executor.go`、`stream.go`）、宿主与插件生命周期（`host.go`、`service.go`、`main.go`）。测试文件与对应实现相邻。
+Go 源码和测试统一位于 [src](src/)。它们属于同一个 `main` 包，因此按职责保留在同一目录：认证与端点（`auth.go`、`endpoints.go`）、模型发现与路由（`models.go`）、请求执行与流处理（`executor.go`、`stream.go`）、宿主与插件生命周期（`host.go`、`service.go`、`main.go`）。测试文件与对应实现相邻。
 
 涉及 auth、路由或流处理时，提交前运行：
 

@@ -104,8 +104,7 @@ func inferenceHeadersForRoute(sessionToken string, route modelRoute, payload []b
 	return headers
 }
 
-// anthropicBetaHeader 只计算 VS Code 1.132.0 源码证明存在的四个 beta，不透传调用方任意值，
-// 也不受 compatibility manifest 影响（manifest 只能覆盖身份 header 的白名单，不含 Anthropic-Beta）。
+// anthropicBetaHeader 只计算 VS Code 1.132.0 源码证明存在的四个 beta，不透传调用方任意值。
 func anthropicBetaHeader(route modelRoute, payload []byte) string {
 	var betas []string
 	if !route.AdaptiveThinking {
@@ -113,10 +112,10 @@ func anthropicBetaHeader(route modelRoute, payload []byte) string {
 		// 不判断本次请求是否真正开启 thinking（VS Code 源码 TODO 记录的差异）。
 		betas = append(betas, interleavedThinkingBeta)
 	}
-	if compatibilityBool(route.SupportsToolSearch, false) && payloadUsesToolSearch(payload) {
+	if optionalBool(route.SupportsToolSearch) && payloadUsesToolSearch(payload) {
 		betas = append(betas, advancedToolUseBeta)
 	}
-	if compatibilityBool(route.SupportsContextEditing, false) && payloadHasContextManagement(payload) {
+	if optionalBool(route.SupportsContextEditing) && payloadHasContextManagement(payload) {
 		betas = append(betas, contextManagementBeta)
 	}
 	if payloadRequestsExtendedCacheTTL(payload) {

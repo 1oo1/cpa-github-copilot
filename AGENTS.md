@@ -10,9 +10,8 @@ handles GitHub Device Flow, and `models.go` discovers and routes models.
 requests, validation, and SSE forwarding. Keep host callback wrappers in
 `host.go` and shared RPC types in `types.go`.
 
-`registry.json` defines the Plugin Store entry; `src/compatibility.json` contains
-the built-in compatibility rules. Generated libraries belong in `bin/` and must
-not be committed. Consult `README.md` for user-facing setup and
+`registry.json` defines the Plugin Store entry. Generated libraries belong in
+`bin/` and must not be committed. Consult `README.md` for user-facing setup and
 `PI_GITHUB_COPILOT_COMPARISON.md` for compatibility rationale.
 
 ## Build, Test, and Development Commands

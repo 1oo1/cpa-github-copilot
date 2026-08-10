@@ -16,11 +16,6 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 	service := newPluginService(nil)
 	service.now = func() time.Time { return time.Unix(50_000, 0).UTC() }
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-4.1", Format: formatOpenAI})
-	storage.CompatibilityManifest = []byte(`{
-		"schema_version":1,
-		"generated_at":"2026-08-06T00:00:00Z",
-		"models":{"gpt-4.1":{"headers":{"User-Agent":"GitHubCopilotChat/remote","Editor-Version":"vscode/remote"}}}
-	}`)
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
 		if method != pluginabi.MethodHostHTTPDo {
@@ -37,7 +32,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 			t.Fatalf("X-Initiator = %q", got)
 		}
 		if headers := http.Header(req.Headers); headers.Get("User-Agent") != copilotUserAgent || headers.Get("Editor-Version") != copilotEditorVersion {
-			t.Fatalf("compatibility manifest must not override versioned identity headers: %#v", headers)
+			t.Fatalf("versioned identity headers = %#v", headers)
 		}
 		var body map[string]any
 		if json.Unmarshal(req.Body, &body) != nil || body["model"] != "gpt-4.1" || body["stream"] != false {
@@ -446,7 +441,7 @@ func TestPrepareInferencePreservesNativeAnthropicXHighEffort(t *testing.T) {
 		OriginalRequest: payload, Payload: payload,
 		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
 			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
-			ReasoningLevels: []string{"minimal", "low", "medium", "high", "xhigh", "max"},
+			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
 		})),
 	}, false)
 	if failure != nil {
@@ -463,7 +458,7 @@ func TestPrepareInferencePreservesNativeAnthropicXHighEffort(t *testing.T) {
 	}
 }
 
-func TestGitHubCopilotResponsesCompatibility(t *testing.T) {
+func TestResponsesReasoningEffortUsesCatalogLevels(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		reasoning     string
@@ -471,8 +466,9 @@ func TestGitHubCopilotResponsesCompatibility(t *testing.T) {
 		wantEffort    string
 	}{
 		{name: "disabled reasoning is omitted", reasoning: "none", wantReasoning: false},
-		{name: "minimal reasoning maps to low", reasoning: "minimal", wantReasoning: true, wantEffort: "low"},
+		{name: "pi minimal compatibility is removed", reasoning: "minimal", wantReasoning: false},
 		{name: "enabled reasoning is preserved", reasoning: "high", wantReasoning: true, wantEffort: "high"},
+		{name: "future catalog level is preserved", reasoning: "ultra", wantReasoning: true, wantEffort: "ultra"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw := []byte(`{
@@ -481,7 +477,8 @@ func TestGitHubCopilotResponsesCompatibility(t *testing.T) {
 				"reasoning":{"effort":"` + test.reasoning + `"},
 				"input":[{"role":"user","content":"hi"}]
 			}`)
-			normalized, errNormalize := normalizeInferencePayload(raw, "gpt-5.4", formatOpenAIResponse, false, false)
+			route := modelRoute{Format: formatOpenAIResponse, ReasoningLevels: []string{"low", "high", "ultra"}, ReasoningLevelsDeclared: true}
+			normalized, errNormalize := normalizeInferencePayloadForRoute(raw, "gpt-5.4", route, false, true)
 			if errNormalize != nil {
 				t.Fatal(errNormalize)
 			}
@@ -503,7 +500,7 @@ func TestGitHubCopilotResponsesCompatibility(t *testing.T) {
 	}
 }
 
-func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
+func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(75_000, 0).UTC()
 	service.now = func() time.Time { return now }
@@ -513,6 +510,8 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		stored := storedModel{ID: model, Format: formatClaude}
 		if model == "claude-opus-4.8" {
 			stored.AdaptiveThinking = true
+			stored.ReasoningLevels = []string{"low", "medium", "high", "xhigh"}
+			stored.ReasoningLevelsDeclared = true
 		}
 		prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
 			AuthID: "auth", Model: model, Format: formatClaude, SourceFormat: formatClaude,
@@ -532,7 +531,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		return payload
 	}
 
-	t.Run("enables eager input streaming for newer models", func(t *testing.T) {
+	t.Run("does not invent eager input streaming or undeclared context editing", func(t *testing.T) {
 		prepared := prepare(t, "claude-opus-4.8", `{
 			"model":"claude-opus-4.8",
 			"messages":[
@@ -553,18 +552,18 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		if !ok {
 			t.Fatalf("first tool = %#v", tools[0])
 		}
-		if eager, exists := tool["eager_input_streaming"]; !exists || eager != true {
-			t.Fatalf("eager_input_streaming was not enabled: %#v", tool)
+		if _, exists := tool["eager_input_streaming"]; exists {
+			t.Fatalf("eager_input_streaming was invented: %#v", tool)
 		}
 		if _, exists := payload["output_config"]; !exists {
 			t.Fatal("newer model output_config was removed")
 		}
-		if _, exists := payload["context_management"]; !exists {
-			t.Fatal("newer model context_management was removed")
+		if _, exists := payload["context_management"]; exists {
+			t.Fatal("undeclared context_management was retained")
 		}
 		messages, ok := payload["messages"].([]any)
-		if !ok || len(messages) != 2 || messages[1].(map[string]any)["role"] != "system" {
-			t.Fatalf("newer model messages were rewritten: %#v", payload["messages"])
+		if !ok || len(messages) != 1 || payload["system"] == nil {
+			t.Fatalf("system message was not normalized: %#v", payload)
 		}
 		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
 			t.Fatalf("Anthropic-Beta = %q", beta)
@@ -602,6 +601,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 	})
 
 	t.Run("converts Claude Code enabled thinking for adaptive models", func(t *testing.T) {
+		contextEditing := true
 		prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
 			AuthID: "auth", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
 			Payload: []byte(`{
@@ -614,6 +614,8 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 			}`),
 			StorageJSON: mustJSON(t, executorStorage(now, storedModel{
 				ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+				ReasoningLevels: []string{"xhigh"}, ReasoningLevelsDeclared: true,
+				SupportsContextEditing: &contextEditing,
 			})),
 			Headers: http.Header{"Anthropic-Beta": []string{
 				"claude-code-20250219,context-1m-2025-08-07,context-management-2025-06-27,advisor-tool-2026-03-01",
@@ -639,9 +641,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 		if !ok || !editsOK || len(edits) != 1 {
 			t.Fatalf("context_management = %#v", payload["context_management"])
 		}
-		// Adaptive route + no declared tool-search/context-editing capability: an arbitrary
-		// caller-supplied beta must never reach the wire.
-		if beta := prepared.headers.Get("Anthropic-Beta"); beta != "" {
+		if beta := prepared.headers.Get("Anthropic-Beta"); beta != contextManagementBeta {
 			t.Fatalf("Anthropic-Beta = %q", beta)
 		}
 	})
@@ -689,7 +689,7 @@ func TestAnthropicEagerToolInputStreamingCompatibility(t *testing.T) {
 	})
 }
 
-func TestHaikuNormalizesClaudeCodeRequestLikePi(t *testing.T) {
+func TestBudgetThinkingNormalizesFromCatalogCapabilities(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(77_000, 0).UTC()
 	service.now = func() time.Time { return now }
@@ -709,7 +709,9 @@ func TestHaikuNormalizesClaudeCodeRequestLikePi(t *testing.T) {
 	}`)
 	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
 		AuthID: "auth", Model: model, Format: formatClaude, SourceFormat: formatClaude,
-		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: model, Format: formatClaude})),
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+			ID: model, Format: formatClaude, MinThinking: 1024, MaxThinking: 32000,
+		})),
 		Headers: http.Header{"Anthropic-Beta": []string{
 			"interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,claude-code-20250219,effort-2025-11-24",
 		}},
@@ -731,7 +733,7 @@ func TestHaikuNormalizesClaudeCodeRequestLikePi(t *testing.T) {
 		t.Fatalf("context_management was retained: %#v", body["context_management"])
 	}
 	thinking, ok := body["thinking"].(map[string]any)
-	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(16384) || thinking["display"] != "summarized" {
+	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(16000) || thinking["display"] != "summarized" {
 		t.Fatalf("thinking = %#v", body["thinking"])
 	}
 	messages, ok := body["messages"].([]any)
@@ -751,26 +753,21 @@ func TestHaikuNormalizesClaudeCodeRequestLikePi(t *testing.T) {
 	}
 }
 
-func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
+func TestAnthropicBudgetThinkingUsesCatalogLimits(t *testing.T) {
 	for _, test := range []struct {
-		effort    string
-		maxTokens int
-		want      int
+		name            string
+		min, max, limit int
+		want            int
 	}{
-		{effort: "minimal", maxTokens: 32000, want: 1024},
-		{effort: "low", maxTokens: 32000, want: 2048},
-		{effort: "medium", maxTokens: 32000, want: 8192},
-		{effort: "high", maxTokens: 32000, want: 16384},
-		{effort: "xhigh", maxTokens: 32000, want: 16384},
-		{effort: "high", maxTokens: 4096, want: 3072},
+		{name: "default", min: 1024, max: 32000, limit: 32000, want: 16000},
+		{name: "catalog minimum", min: 20000, max: 32000, limit: 32000, want: 20000},
+		{name: "catalog maximum", min: 1024, max: 8000, limit: 32000, want: 8000},
+		{name: "output room", min: 1024, max: 32000, limit: 4096, want: 4095},
 	} {
-		t.Run(fmt.Sprintf("%s-%d", test.effort, test.maxTokens), func(t *testing.T) {
-			payload := map[string]any{
-				"max_tokens":    test.maxTokens,
-				"thinking":      map[string]any{"type": "adaptive"},
-				"output_config": map[string]any{"effort": test.effort},
-			}
-			if !normalizeAnthropicPayload(payload, "claude-haiku-4.5", false) {
+		t.Run(test.name, func(t *testing.T) {
+			payload := map[string]any{"max_tokens": test.limit, "thinking": map[string]any{"type": "adaptive"}}
+			route := modelRoute{MinThinking: test.min, MaxThinking: test.max}
+			if !normalizeAnthropicPayloadForRoute(payload, route) {
 				t.Fatal("payload was not normalized")
 			}
 			thinking := payload["thinking"].(map[string]any)
@@ -781,46 +778,40 @@ func TestAnthropicBudgetThinkingLeavesOutputRoom(t *testing.T) {
 	}
 }
 
-func TestAnthropicAdaptiveThinkingMapsLegacyBudgetsToEffort(t *testing.T) {
+func TestAnthropicAdaptiveThinkingUsesCatalogEffortLevels(t *testing.T) {
 	for _, test := range []struct {
-		model     string
-		maxTokens int
-		budget    int
-		want      string
+		name     string
+		levels   []string
+		declared bool
+		effort   string
+		want     string
 	}{
-		{model: "claude-opus-4.8", maxTokens: 32000, budget: 0, want: "high"},
-		{model: "claude-opus-4.8", maxTokens: 1536, budget: 1024, want: "low"},
-		{model: "claude-opus-4.8", maxTokens: 32000, budget: 2048, want: "low"},
-		{model: "claude-opus-4.8", maxTokens: 32000, budget: 8192, want: "medium"},
-		{model: "claude-opus-4.8", maxTokens: 32000, budget: 16384, want: "high"},
-		{model: "claude-opus-4.8", maxTokens: 128000, budget: 24576, want: "high"},
-		{model: "claude-opus-4.8", maxTokens: 128000, budget: 32768, want: "xhigh"},
-		{model: "claude-opus-4.6", maxTokens: 128000, budget: 32768, want: "max"},
-		{model: "claude-opus-4.8", maxTokens: 32000, budget: 31999, want: "xhigh"},
-		{model: "claude-opus-4.8", maxTokens: 128000, budget: 32769, want: "max"},
+		{name: "future level", levels: []string{"low", "ultra"}, declared: true, effort: "ultra", want: "ultra"},
+		{name: "catalog medium default", levels: []string{"low", "medium", "high"}, declared: true, want: "medium"},
+		{name: "catalog midpoint default", levels: []string{"high", "max"}, declared: true, want: "high"},
+		{name: "missing metadata follows VS Code adaptive default", want: "high"},
 	} {
-		payload := map[string]any{
-			"max_tokens": test.maxTokens,
-			"thinking": map[string]any{
-				"type":          "enabled",
-				"budget_tokens": test.budget,
-				"display":       "omitted",
-			},
-		}
-		if !normalizeAnthropicPayload(payload, test.model, true) {
-			t.Fatalf("budget %d was not normalized", test.budget)
-		}
-		thinking := payload["thinking"].(map[string]any)
-		if thinking["type"] != "adaptive" || thinking["display"] != "omitted" {
-			t.Fatalf("budget %d thinking = %#v", test.budget, thinking)
-		}
-		if got := payload["output_config"].(map[string]any)["effort"]; got != test.want {
-			t.Fatalf("budget %d effort = %q, want %q", test.budget, got, test.want)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			payload := map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": 32768, "display": "omitted"}}
+			if test.effort != "" {
+				payload["output_config"] = map[string]any{"effort": test.effort}
+			}
+			route := modelRoute{AdaptiveThinking: true, ReasoningLevels: test.levels, ReasoningLevelsDeclared: test.declared}
+			if !normalizeAnthropicPayloadForRoute(payload, route) {
+				t.Fatal("payload was not normalized")
+			}
+			thinking := payload["thinking"].(map[string]any)
+			if thinking["type"] != "adaptive" || thinking["display"] != "omitted" {
+				t.Fatalf("thinking = %#v", thinking)
+			}
+			if got := payload["output_config"].(map[string]any)["effort"]; got != test.want {
+				t.Fatalf("effort = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
-func TestAnthropicForcedAdaptiveThinkingDoesNotDependOnDiscoveredCapability(t *testing.T) {
+func TestAnthropicThinkingIsNotForcedByModelName(t *testing.T) {
 	payload := map[string]any{
 		"max_tokens": 32000,
 		"thinking": map[string]any{
@@ -828,182 +819,21 @@ func TestAnthropicForcedAdaptiveThinkingDoesNotDependOnDiscoveredCapability(t *t
 			"budget_tokens": 16384,
 		},
 	}
-	if !normalizeAnthropicPayload(payload, "claude-sonnet-4.6", false) {
+	if !normalizeAnthropicPayloadForRoute(payload, modelRoute{}) {
 		t.Fatal("payload was not normalized")
 	}
-	thinking := payload["thinking"].(map[string]any)
-	if thinking["type"] != "adaptive" {
-		t.Fatalf("thinking = %#v", thinking)
-	}
-	if effort := payload["output_config"].(map[string]any)["effort"]; effort != "high" {
-		t.Fatalf("effort = %q, want high", effort)
+	if _, exists := payload["thinking"]; exists {
+		t.Fatalf("undeclared thinking was retained: %#v", payload)
 	}
 }
 
-func TestAnthropicTemperatureCompatibility(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		model    string
-		thinking map[string]any
-		wantTemp bool
-	}{
-		{name: "unsupported model", model: "claude-opus-4.7", wantTemp: false},
-		{name: "unsupported model with thinking", model: "claude-opus-4.8", thinking: map[string]any{"type": "adaptive"}, wantTemp: false},
-		{name: "thinking enabled", model: "claude-opus-4.6", thinking: map[string]any{"type": "adaptive"}, wantTemp: false},
-		{name: "supported without thinking", model: "claude-opus-4.6", wantTemp: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			payload := map[string]any{"temperature": 0.7}
-			if test.thinking != nil {
-				payload["thinking"] = test.thinking
-			}
-			normalizeAnthropicPayload(payload, test.model, false)
-			_, hasTemperature := payload["temperature"]
-			if hasTemperature != test.wantTemp {
-				t.Fatalf("temperature present = %t, want %t: %#v", hasTemperature, test.wantTemp, payload)
-			}
-		})
+func TestAnthropicMessagesOmitsTemperatureLikeVSCodeBuilder(t *testing.T) {
+	payload := map[string]any{"temperature": 0.7}
+	if !normalizeAnthropicPayloadForRoute(payload, modelRoute{}) {
+		t.Fatal("payload was not normalized")
 	}
-}
-
-func TestAnthropicCompatibilityMatchesPiCatalog(t *testing.T) {
-	for _, test := range []struct {
-		model         string
-		forceAdaptive bool
-		eagerTools    bool
-		temperature   bool
-		xhigh         bool
-	}{
-		{model: "claude-fable-5", forceAdaptive: true, eagerTools: true, temperature: true, xhigh: true},
-		{model: "claude-haiku-4.5", eagerTools: false, temperature: true},
-		{model: "claude-opus-4.5", eagerTools: true, temperature: true},
-		{model: "claude-opus-4.6", forceAdaptive: true, eagerTools: true, temperature: true},
-		{model: "claude-opus-4.7", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
-		{model: "claude-opus-4.8", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
-		{model: "claude-opus-5", forceAdaptive: true, eagerTools: true, temperature: false, xhigh: true},
-		{model: "claude-sonnet-4", eagerTools: false, temperature: true},
-		{model: "claude-sonnet-4.5", eagerTools: false, temperature: true},
-		{model: "claude-sonnet-4.6", forceAdaptive: true, eagerTools: true, temperature: true},
-		{model: "claude-sonnet-5", forceAdaptive: true, eagerTools: true, temperature: true, xhigh: true},
-	} {
-		t.Run(test.model, func(t *testing.T) {
-			if got := forcesAnthropicAdaptiveThinking(test.model); got != test.forceAdaptive {
-				t.Fatalf("forces adaptive = %t, want %t", got, test.forceAdaptive)
-			}
-			if got := supportsAnthropicEagerToolInputStreaming(test.model); got != test.eagerTools {
-				t.Fatalf("supports eager tools = %t, want %t", got, test.eagerTools)
-			}
-			if got := supportsAnthropicTemperature(test.model); got != test.temperature {
-				t.Fatalf("supports temperature = %t, want %t", got, test.temperature)
-			}
-			if got := supportsAnthropicXHighEffort(test.model); got != test.xhigh {
-				t.Fatalf("supports xhigh = %t, want %t", got, test.xhigh)
-			}
-		})
-	}
-}
-
-func TestRemoteCompatibilityControlsAnthropicPayload(t *testing.T) {
-	forceAdaptive := true
-	supportsTemperature := false
-	supportsEager := false
-	supportsXHigh := true
-	now := time.Now().UTC()
-	storage := executorStorage(now, storedModel{
-		ID:                              "claude-sonnet-4.6",
-		Format:                          formatClaude,
-		ForceAdaptiveThinking:           &forceAdaptive,
-		SupportsTemperature:             &supportsTemperature,
-		SupportsEagerToolInputStreaming: &supportsEager,
-		SupportsXHighEffort:             &supportsXHigh,
-	})
-	payload := []byte(`{
-		"model":"claude-sonnet-4.6",
-		"max_tokens":128000,
-		"temperature":0.7,
-		"thinking":{"type":"enabled","budget_tokens":32768},
-		"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{},"required":[]}}]
-	}`)
-	prepared, failure := newPluginService(nil).prepareInference(pluginapi.ExecutorRequest{
-		Model:       "claude-sonnet-4.6",
-		Format:      formatClaude,
-		Payload:     payload,
-		StorageJSON: mustJSON(t, storage),
-	}, false)
-	if failure != nil {
-		t.Fatal(failure)
-	}
-	var normalized map[string]any
-	if errDecode := json.Unmarshal(prepared.upstreamPayload, &normalized); errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if _, exists := normalized["temperature"]; exists {
-		t.Fatalf("temperature was retained: %#v", normalized)
-	}
-	if effort := normalized["output_config"].(map[string]any)["effort"]; effort != "xhigh" {
-		t.Fatalf("effort = %q, want xhigh", effort)
-	}
-	tool := normalized["tools"].([]any)[0].(map[string]any)
-	if _, exists := tool["eager_input_streaming"]; exists {
-		t.Fatalf("eager input streaming was retained: %#v", tool)
-	}
-}
-
-func TestRemoteCompatibilityCanDisableForcedAdaptiveThinking(t *testing.T) {
-	forceAdaptive := false
-	now := time.Now().UTC()
-	storage := executorStorage(now, storedModel{
-		ID:                    "claude-sonnet-4.6",
-		Format:                formatClaude,
-		ForceAdaptiveThinking: &forceAdaptive,
-	})
-	payload := []byte(`{
-		"model":"claude-sonnet-4.6",
-		"max_tokens":32000,
-		"thinking":{"type":"enabled","budget_tokens":16384}
-	}`)
-	prepared, failure := newPluginService(nil).prepareInference(pluginapi.ExecutorRequest{
-		Model:       "claude-sonnet-4.6",
-		Format:      formatClaude,
-		Payload:     payload,
-		StorageJSON: mustJSON(t, storage),
-	}, false)
-	if failure != nil {
-		t.Fatal(failure)
-	}
-	var normalized map[string]any
-	if errDecode := json.Unmarshal(prepared.upstreamPayload, &normalized); errDecode != nil {
-		t.Fatal(errDecode)
-	}
-	if thinking := normalized["thinking"].(map[string]any); thinking["type"] != "enabled" {
-		t.Fatalf("thinking = %#v", thinking)
-	}
-}
-
-func TestDisabledRemoteCompatibilityIgnoresCachedExecutorOverlay(t *testing.T) {
-	storage := executorStorage(time.Now().UTC(), storedModel{
-		ID: "gpt-4.1", Format: formatOpenAI,
-	})
-	storage.CompatibilityManifest = []byte(`{
-		"schema_version":1,
-		"generated_at":"2026-08-07T00:00:00Z",
-		"models":{"gpt-4.1":{"format":"openai-response"}}
-	}`)
-	service := newPluginService(nil)
-	config := service.loadedConfig()
-	config.EnableRemoteCompatibility = false
-	service.config = config
-	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
-		Model:       "gpt-4.1",
-		Format:      formatOpenAI,
-		Payload:     []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hello"}]}`),
-		StorageJSON: mustJSON(t, storage),
-	}, false)
-	if failure != nil {
-		t.Fatal(failure)
-	}
-	if prepared.upstreamFormat != formatOpenAI || prepared.upstreamPath != "/chat/completions" {
-		t.Fatalf("prepared route = %#v", prepared)
+	if _, exists := payload["temperature"]; exists {
+		t.Fatalf("temperature was retained: %#v", payload)
 	}
 }
 
@@ -1016,7 +846,7 @@ func TestGitHubCopilotOpenAICompatibility(t *testing.T) {
 				"reasoning_effort":"high",
 				"messages":[{"role":"developer","content":"system prompt"},{"role":"user","content":"hello"}]
 			}`)
-			normalized, errNormalize := normalizeInferencePayload(raw, model, formatOpenAI, false, false)
+			normalized, errNormalize := normalizeInferencePayloadForRoute(raw, model, modelRoute{Format: formatOpenAI}, false, true)
 			if errNormalize != nil {
 				t.Fatal(errNormalize)
 			}
@@ -1404,16 +1234,14 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	}
 }
 
-func TestExecuteHTTPRequestAppliesForcedAdaptiveCompatibilityToOldCredentials(t *testing.T) {
+func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(96_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude})
-	storage.CompatibilityManifest = []byte(`{
-		"schema_version":1,
-		"generated_at":"2026-08-06T00:00:00Z",
-		"models":{"claude-opus-4.8":{"headers":{"Copilot-Integration-Id":"remote-chat"}}}
-	}`)
+	storage := executorStorage(now, storedModel{
+		ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+		ReasoningLevels: []string{"low", "medium", "high"}, ReasoningLevelsDeclared: true,
+	})
 	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
 		if method != pluginabi.MethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
@@ -1455,11 +1283,16 @@ func TestExecuteHTTPRequestAppliesForcedAdaptiveCompatibilityToOldCredentials(t 
 	}
 }
 
-func TestExecuteHTTPRequestPreservesNewAnthropicFieldsAndEnablesEagerTools(t *testing.T) {
+func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(97_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true})
+	contextEditing := true
+	storage := executorStorage(now, storedModel{
+		ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+		ReasoningLevels: []string{"low", "medium", "high", "xhigh"}, ReasoningLevelsDeclared: true,
+		SupportsContextEditing: &contextEditing,
+	})
 	body := []byte(`{
 		"model":"claude-opus-4.8",
 		"messages":[{"role":"user","content":"Use the tool"}],
@@ -1483,13 +1316,14 @@ func TestExecuteHTTPRequestPreservesNewAnthropicFieldsAndEnablesEagerTools(t *te
 		tools := upstream["tools"].([]any)
 		tool := tools[0].(map[string]any)
 		if thinking["type"] != "adaptive" || thinking["display"] != "omitted" || outputConfig["effort"] != "xhigh" ||
-			contextManagement["edits"] == nil || tool["eager_input_streaming"] != true {
+			contextManagement["edits"] == nil {
 			t.Fatalf("newer model body = %#v", upstream)
 		}
-		// The model has no declared tool-search/context-editing capability, so an arbitrary
-		// caller-supplied beta must never reach the wire, even though the body superficially
-		// resembles context management.
-		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != "" {
+		if _, exists := tool["eager_input_streaming"]; exists {
+			t.Fatalf("eager input streaming was invented: %#v", tool)
+		}
+		// 任意 caller beta 不透传；只按动态 context-editing capability 生成已知 beta。
+		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != contextManagementBeta {
 			t.Fatalf("Anthropic-Beta = %q", beta)
 		}
 		return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil

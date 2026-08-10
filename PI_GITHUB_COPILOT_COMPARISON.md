@@ -33,10 +33,9 @@ review: GPT-5.6 Terra final APPROVE
 | 3 | `@vscode/copilot-api@0.4.3` | CAPI endpoint 映射、最终身份 header 和 API version 覆盖 |
 | 4 | CLIProxyAPI `9e9230a...` | ABI v1、host callback、public executor adapter 和 translator contract |
 | 5 | GitHub Copilot 运行时 `/models` | 当前账户可见模型、endpoint 和 capability |
-| 6 | 本仓库受限 `compatibility.json` | 已发现模型的白名单补充，不能扩大 origin 或 identity trust |
-| 7 | `pi` | legacy credential migration 与非权威交叉检查 |
+| 6 | `pi` | legacy credential migration 与非权威交叉检查 |
 
-发现冲突时，不以较低优先级覆盖较高优先级。尤其不能用 `pi` 静态目录覆盖账户 `/models.supported_endpoints`，也不能用 compatibility manifest 或 caller header 覆盖 pinned identity、Authorization 或 API origin。
+发现冲突时，不以较低优先级覆盖较高优先级。尤其不能用 `pi` 静态目录覆盖账户 `/models` 的 endpoint、reasoning levels、thinking budget 或 context window，也不能用 caller header 覆盖 pinned identity、Authorization 或 API origin。
 
 ## 3. 固定基线
 
@@ -82,7 +81,7 @@ Copilot-Integration-Id: vscode-chat
 X-GitHub-Api-Version: 2026-06-01
 ```
 
-这些值来自 pinned VS Code/CAPI HTTP path，不来自 `pi`。caller 与 compatibility manifest 不能在发送时覆盖它们。
+这些值来自 pinned VS Code/CAPI HTTP path，不来自 `pi`。caller 不能在发送时覆盖它们。
 
 插件不伪造正式 VS Code runtime 才能提供的 `VScode-SessionId`、`VScode-MachineId`、`Editor-Device-Id` 或 fetcher library version。
 
@@ -104,12 +103,11 @@ X-GitHub-Api-Version: 2026-06-01
 Copilot GET /models
   -> picker / policy / tool-call / endpoint filter
   -> StorageJSON model snapshot
-  -> restricted compatibility overlay
   -> ModelInfo + modelRoute
   -> request normalizer and headers
 ```
 
-route 保存 family、prompt/output limits、vision、reasoning levels、streaming、tool search 和 context editing。`supported_endpoints` 优先于模型名称推断；只有服务未声明 endpoint 时才用 legacy ID fallback。optional capability 缺失时关闭对应行为。
+route 保存 family、prompt/output limits、vision、adaptive thinking、thinking budget、reasoning levels、streaming、tool search 和 context editing。等级与限制原样来自账户 catalog，不按模型名补齐；`supported_endpoints` 优先选择 Responses、Messages、Chat，只有服务未声明 endpoint 时才用 legacy ID fallback。optional capability 缺失时关闭对应行为。
 
 `knownCopilotModels` 只用于 best-effort policy enable，不是模型暴露白名单。新模型能否路由取决于账户 `/models` 和安全 endpoint 规则，不取决于 `pi` catalog。
 
@@ -133,7 +131,7 @@ route 保存 family、prompt/output limits、vision、reasoning levels、streami
 | `store` | 固定 false |
 | `truncation` | caller 缺省时 `disabled` |
 | encrypted reasoning include | caller 缺省时加入 |
-| reasoning | 清理空/none/off；GPT-5 minimal 归一为 low |
+| reasoning | 清理空/none/off；只保留账户 catalog 声明的 effort，不再提供 pi `minimal` 映射 |
 | context management | eligible 原生 route 默认 feature-on，可配置关闭 |
 | opaque state | 原生无损；跨格式 fail closed |
 | separate compact route | 明确不支持 |
@@ -146,7 +144,7 @@ route 保存 family、prompt/output limits、vision、reasoning levels、streami
 | thinking/effort | adaptive 或 budget route 分别归一 |
 | tool schema/ID | object schema、合法字段和 call/result 配对兼容 |
 | cache/context editing | capability 与 body 联合 gate |
-| eager tool input | route compatibility 控制 |
+| eager tool input | 不按模型名生成；删除 caller 注入的非 VS Code 字段 |
 | beta | 只生成 pinned 四种，不透传 caller 任意值 |
 
 与 pinned VS Code 源码一致的已知例外：非 adaptive Messages route 总是发送 interleaved-thinking beta，即使当前 body 未明确开启 thinking。源码已有对应 TODO，本插件不擅自改变。
@@ -201,7 +199,6 @@ native Responses 只接受三类精确结构：bare Response；event type 与 ne
 - raw HTTP 必须 HTTPS same-origin；
 - inference method/path 必须 canonical，不能带 query 或 fragment；
 - caller 不能注入 Authorization、API key、identity、API version 或任意 beta；
-- compatibility manifest 不能改变 origin、path、Authorization 或最终 identity；
 - 日志和错误不能包含 token、headers、request/response body、prompt、tool argument 或 encrypted continuation；
 - source error body 在翻译前分类，但不向下游或日志展开。
 

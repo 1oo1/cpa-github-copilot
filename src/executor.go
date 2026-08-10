@@ -190,7 +190,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if route.Path == "" || route.Format == "" {
 		return preparedInference{}, &pluginFailure{code: "model_not_supported", message: "GitHub Copilot model has no supported endpoint", httpStatus: http.StatusBadRequest}
 	}
-	if stream && !compatibilityBool(route.Streaming, false) {
+	if stream && !optionalBool(route.Streaming) {
 		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
 	}
 	payload := append([]byte(nil), req.Payload...)
@@ -198,6 +198,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: "GitHub Copilot request payload must be a JSON object", httpStatus: http.StatusBadRequest}
 	}
 	translationTarget := translatorTargetFormat(route.Format, inputFormat)
+	requestedReasoningEffort := reasoningEffortFromPayload(payload, inputFormat)
 	// 带有 Responses stateful/opaque continuation 的请求只能在完全原生的 openai-response 链路上
 	// 无损传递；一旦涉及任何跨格式转换，就必须在发出 HTTP 请求前 fail closed，而不是依赖
 	// translator 碰巧保留这些字段。只在调用方本身就是 openai-response 协议时检查，避免和
@@ -217,6 +218,9 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 			payload,
 			stream,
 		)
+	}
+	if route.Format == formatClaude && declaresReasoningLevel(route.ReasoningLevels, requestedReasoningEffort) {
+		payload = preserveAnthropicReasoningEffort(payload, requestedReasoningEffort)
 	}
 	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream, s.loadedConfig().EnableResponsesContextManagement)
 	if errPrepare != nil {
@@ -319,10 +323,6 @@ func responsesCompactionThresholdFromPayload(payload []byte) (threshold int64, e
 	return 0, false
 }
 
-func normalizeInferencePayload(raw []byte, model, format string, stream, supportsAdaptiveThinking bool) ([]byte, error) {
-	return normalizeInferencePayloadForRoute(raw, model, modelRoute{Format: format, AdaptiveThinking: supportsAdaptiveThinking}, stream, true)
-}
-
 func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRoute, stream bool, responsesContextManagementEnabled bool) ([]byte, error) {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil || payload == nil {
@@ -338,10 +338,10 @@ func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRout
 			payload["max_tokens"] = 4096
 		}
 		delete(payload, "stream_options")
-		normalizeAnthropicPayloadForRoute(payload, model, route)
+		normalizeAnthropicPayloadForRoute(payload, route)
 	}
 	if route.Format == formatOpenAIResponse {
-		normalizeOpenAIResponsesCompatibility(payload, model, route, responsesContextManagementEnabled)
+		normalizeOpenAIResponsesCompatibility(payload, route, responsesContextManagementEnabled)
 	}
 	out, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
@@ -424,6 +424,46 @@ func declaresReasoningLevel(levels []string, value string) bool {
 	return false
 }
 
+func reasoningEffortFromPayload(raw []byte, format string) string {
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return ""
+	}
+	switch format {
+	case formatOpenAI:
+		return strings.ToLower(strings.TrimSpace(stringValue(payload["reasoning_effort"])))
+	case formatOpenAIResponse:
+		if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+			return strings.ToLower(strings.TrimSpace(stringValue(reasoning["effort"])))
+		}
+	case formatClaude:
+		if outputConfig, ok := payload["output_config"].(map[string]any); ok {
+			return strings.ToLower(strings.TrimSpace(stringValue(outputConfig["effort"])))
+		}
+	}
+	return ""
+}
+
+func preserveAnthropicReasoningEffort(raw []byte, effort string) []byte {
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return raw
+	}
+	outputConfig, _ := payload["output_config"].(map[string]any)
+	if outputConfig == nil {
+		outputConfig = map[string]any{}
+	}
+	if strings.TrimSpace(stringValue(outputConfig["effort"])) == "" {
+		outputConfig["effort"] = effort
+		payload["output_config"] = outputConfig
+	}
+	out, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return raw
+	}
+	return out
+}
+
 // responsesContextManagementExcludedFamilies 是 VS Code 1.132.0 源码证明的排除集合
 // （openai.ts modelsWithoutResponsesContextManagement）。
 var responsesContextManagementExcludedFamilies = map[string]bool{
@@ -441,7 +481,7 @@ func responsesCompactionThreshold(route modelRoute) int64 {
 	return 50000
 }
 
-func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string, route modelRoute, contextManagementEnabled bool) bool {
+func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRoute, contextManagementEnabled bool) bool {
 	changed := payload["store"] != false
 	payload["store"] = false
 	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
@@ -449,8 +489,11 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string,
 		if len(reasoning) == 0 || effort == "none" || effort == "off" {
 			delete(payload, "reasoning")
 			changed = true
-		} else if strings.HasPrefix(strings.ToLower(normalizeModelID(model)), "gpt-5") && effort == "minimal" {
-			reasoning["effort"] = "low"
+		} else if effort != "" && !declaresReasoningLevel(route.ReasoningLevels, effort) {
+			delete(reasoning, "effort")
+			if len(reasoning) == 0 {
+				delete(payload, "reasoning")
+			}
 			changed = true
 		}
 	}
@@ -476,126 +519,145 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string,
 	return changed
 }
 
-func normalizeAnthropicPayload(payload map[string]any, model string, supportsAdaptiveThinking bool) bool {
-	return normalizeAnthropicPayloadForRoute(payload, model, modelRoute{AdaptiveThinking: supportsAdaptiveThinking})
-}
-
-func normalizeAnthropicPayloadForRoute(payload map[string]any, model string, route modelRoute) bool {
-	compatibility := anthropicCompatibilityForRoute(model, route)
-	changed := normalizeAnthropicTemperature(payload, compatibility.supportsTemperature)
-	if normalizeAnthropicToolInputStreaming(payload, compatibility.supportsEagerToolInputStreaming) {
+func normalizeAnthropicPayloadForRoute(payload map[string]any, route modelRoute) bool {
+	changed := normalizeAnthropicTemperature(payload)
+	if normalizeAnthropicTools(payload) {
 		changed = true
-	}
-	if compatibility.adaptiveThinking {
-		return normalizeAnthropicAdaptiveThinking(payload, compatibility.supportsXHighEffort) || changed
-	}
-	if !usesAnthropicBudgetThinking(model) && compatibility.supportsEagerToolInputStreaming {
-		return changed
-	}
-	if !usesAnthropicBudgetThinking(model) {
-		return changed
-	}
-	thinking, hasThinking := payload["thinking"].(map[string]any)
-	adaptiveThinking := hasThinking && strings.EqualFold(stringValue(thinking["type"]), "adaptive")
-	budget := 0
-	if adaptiveThinking {
-		budget = anthropicThinkingBudget(payload, thinking)
 	}
 	if normalizeAnthropicSystemMessages(payload) {
 		changed = true
 	}
-	if _, exists := payload["context_management"]; exists {
+	if _, exists := payload["context_management"]; exists && !optionalBool(route.SupportsContextEditing) {
 		delete(payload, "context_management")
 		changed = true
 	}
-	if outputConfig, ok := payload["output_config"].(map[string]any); ok {
-		if _, exists := outputConfig["effort"]; exists {
-			delete(outputConfig, "effort")
+	if route.AdaptiveThinking {
+		if normalizeAnthropicAdaptiveThinking(payload, route) {
 			changed = true
 		}
-		if len(outputConfig) == 0 {
-			delete(payload, "output_config")
-		}
-	}
-	if !adaptiveThinking {
 		return changed
 	}
 
-	if budget < 1024 {
-		delete(payload, "thinking")
-		return true
+	thinking, hasThinking := payload["thinking"].(map[string]any)
+	thinkingType := strings.ToLower(stringValue(thinking["type"]))
+	budgetThinking := route.MinThinking > 0 || route.MaxThinking > 0
+	if !budgetThinking {
+		if hasThinking && (thinkingType == "adaptive" || thinkingType == "enabled") {
+			delete(payload, "thinking")
+			changed = true
+		}
+		if normalizeAnthropicReasoningEffort(payload, route, false) {
+			changed = true
+		}
+		return changed
 	}
-	payload["thinking"] = map[string]any{
-		"type":          "enabled",
-		"budget_tokens": budget,
-		"display":       "summarized",
+	if thinkingType == "adaptive" {
+		budget := anthropicThinkingBudget(payload, route)
+		if budget <= 0 {
+			delete(payload, "thinking")
+			thinkingType = ""
+		} else {
+			payload["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": budget,
+				"display":       "summarized",
+			}
+			thinkingType = "enabled"
+		}
+		changed = true
 	}
-	return true
+	if normalizeAnthropicReasoningEffort(payload, route, thinkingType == "enabled") {
+		changed = true
+	}
+	return changed
 }
 
-func anthropicThinkingBudget(payload, thinking map[string]any) int {
-	effort := ""
-	if outputConfig, ok := payload["output_config"].(map[string]any); ok {
-		effort = stringValue(outputConfig["effort"])
+func anthropicThinkingBudget(payload map[string]any, route modelRoute) int {
+	budget := 16000
+	if route.MinThinking > 0 && budget < route.MinThinking {
+		budget = route.MinThinking
 	}
-	if effort == "" {
-		effort = stringValue(thinking["effort"])
-	}
-	budget := 16384
-	switch strings.ToLower(effort) {
-	case "minimal":
-		budget = 1024
-	case "low":
-		budget = 2048
-	case "medium":
-		budget = 8192
+	if route.MaxThinking > 0 && budget > route.MaxThinking {
+		budget = route.MaxThinking
 	}
 	maxTokens := intFromJSONNumber(payload["max_tokens"])
-	if maxTokens > 0 && budget > maxTokens-1024 {
-		budget = maxTokens - 1024
+	if maxTokens > 0 && budget >= maxTokens {
+		budget = maxTokens - 1
 	}
 	return budget
 }
 
-func normalizeAnthropicAdaptiveThinking(payload map[string]any, supportsXHighEffort bool) bool {
+func normalizeAnthropicAdaptiveThinking(payload map[string]any, route modelRoute) bool {
 	thinking, ok := payload["thinking"].(map[string]any)
-	if !ok || !strings.EqualFold(stringValue(thinking["type"]), "enabled") {
-		return false
-	}
-
-	normalized := map[string]any{"type": "adaptive"}
-	if display := stringValue(thinking["display"]); display != "" {
-		normalized["display"] = display
-	}
-	payload["thinking"] = normalized
-
-	outputConfig, ok := payload["output_config"].(map[string]any)
 	if !ok {
-		outputConfig = make(map[string]any)
+		return normalizeAnthropicReasoningEffort(payload, route, false)
 	}
-	if stringValue(outputConfig["effort"]) == "" {
-		outputConfig["effort"] = anthropicAdaptiveEffort(thinking, supportsXHighEffort)
+	changed := false
+	thinkingType := strings.ToLower(stringValue(thinking["type"]))
+	if thinkingType == "enabled" {
+		normalized := map[string]any{"type": "adaptive"}
+		if display := stringValue(thinking["display"]); display != "" {
+			normalized["display"] = display
+		}
+		payload["thinking"] = normalized
+		thinkingType = "adaptive"
+		changed = true
 	}
-	payload["output_config"] = outputConfig
-	return true
+	if normalizeAnthropicReasoningEffort(payload, route, thinkingType == "adaptive") {
+		changed = true
+	}
+	return changed
 }
 
-func anthropicAdaptiveEffort(thinking map[string]any, supportsXHighEffort bool) string {
-	budget := intFromJSONNumber(thinking["budget_tokens"])
-	switch {
-	case budget <= 0:
-		return "high"
-	case budget <= 2048:
-		return "low"
-	case budget <= 8192:
-		return "medium"
-	case budget <= 24576:
-		return "high"
-	case budget <= 32768 && supportsXHighEffort:
-		return "xhigh"
-	default:
-		return "max"
+func normalizeAnthropicReasoningEffort(payload map[string]any, route modelRoute, thinkingEnabled bool) bool {
+	outputConfig, ok := payload["output_config"].(map[string]any)
+	if !ok {
+		if !thinkingEnabled {
+			return false
+		}
+		outputConfig = map[string]any{}
 	}
+	effort := strings.ToLower(strings.TrimSpace(stringValue(outputConfig["effort"])))
+	changed := false
+	if !thinkingEnabled || (!route.ReasoningLevelsDeclared && !route.AdaptiveThinking) ||
+		(effort != "" && route.ReasoningLevelsDeclared && !declaresReasoningLevel(route.ReasoningLevels, effort)) {
+		if _, exists := outputConfig["effort"]; exists {
+			delete(outputConfig, "effort")
+			changed = true
+		}
+	} else if effort == "" {
+		defaultEffort := defaultReasoningEffort(route.ReasoningLevels)
+		if defaultEffort == "" && route.AdaptiveThinking && !route.ReasoningLevelsDeclared {
+			defaultEffort = "high"
+		}
+		if defaultEffort != "" {
+			outputConfig["effort"] = defaultEffort
+			changed = true
+		}
+	} else if stringValue(outputConfig["effort"]) != effort {
+		outputConfig["effort"] = effort
+		changed = true
+	}
+	if len(outputConfig) == 0 {
+		if _, exists := payload["output_config"]; exists {
+			delete(payload, "output_config")
+			changed = true
+		}
+		return changed
+	}
+	payload["output_config"] = outputConfig
+	return changed
+}
+
+func defaultReasoningEffort(levels []string) string {
+	levels = cleanLevels(levels)
+	if len(levels) == 0 {
+		return ""
+	}
+	if declaresReasoningLevel(levels, "medium") {
+		return "medium"
+	}
+	return levels[(len(levels)-1)/2]
 }
 
 func intFromJSONNumber(value any) int {
@@ -684,7 +746,7 @@ func anthropicSystemBlocks(content any) ([]any, bool) {
 	}
 }
 
-func normalizeAnthropicToolInputStreaming(payload map[string]any, supportsEager bool) bool {
+func normalizeAnthropicTools(payload map[string]any) bool {
 	rawTools, exists := payload["tools"]
 	if !exists {
 		return false
@@ -726,13 +788,6 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, supportsEager 
 				"required":   required,
 			}
 		}
-		if supportsEager {
-			if eager, exists := tool["eager_input_streaming"]; !exists || eager != true {
-				tool["eager_input_streaming"] = true
-				changed = true
-			}
-			continue
-		}
 		if _, exists := tool["eager_input_streaming"]; exists {
 			delete(tool, "eager_input_streaming")
 			changed = true
@@ -741,99 +796,12 @@ func normalizeAnthropicToolInputStreaming(payload map[string]any, supportsEager 
 	return changed
 }
 
-func normalizeAnthropicPayloadBytes(raw []byte, model string, supportsAdaptiveThinking bool) []byte {
-	return normalizeAnthropicPayloadBytesForRoute(raw, model, modelRoute{AdaptiveThinking: supportsAdaptiveThinking})
-}
-
-func normalizeAnthropicPayloadBytesForRoute(raw []byte, model string, route modelRoute) []byte {
-	var payload map[string]any
-	if json.Unmarshal(raw, &payload) != nil || payload == nil || !normalizeAnthropicPayloadForRoute(payload, model, route) {
-		return raw
-	}
-	out, errMarshal := json.Marshal(payload)
-	if errMarshal != nil {
-		return raw
-	}
-	return out
-}
-
-func supportsAnthropicEagerToolInputStreaming(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-haiku-4.5", "claude-sonnet-4", "claude-sonnet-4.5":
-		return false
-	default:
-		return true
-	}
-}
-
-func forcesAnthropicAdaptiveThinking(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-fable-5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5",
-		"claude-sonnet-4.6", "claude-sonnet-5":
-		return true
-	default:
-		return false
-	}
-}
-
-func supportsAnthropicTemperature(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5":
-		return false
-	default:
-		return true
-	}
-}
-
-func supportsAnthropicXHighEffort(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-fable-5", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "claude-sonnet-5":
-		return true
-	default:
-		return false
-	}
-}
-
-func normalizeAnthropicTemperature(payload map[string]any, supportsTemperature bool) bool {
+func normalizeAnthropicTemperature(payload map[string]any) bool {
 	if _, exists := payload["temperature"]; !exists {
-		return false
-	}
-	thinking, hasThinking := payload["thinking"].(map[string]any)
-	thinkingType := strings.ToLower(stringValue(thinking["type"]))
-	if supportsTemperature && (!hasThinking || (thinkingType != "enabled" && thinkingType != "adaptive")) {
 		return false
 	}
 	delete(payload, "temperature")
 	return true
-}
-
-func usesAnthropicBudgetThinking(model string) bool {
-	switch strings.ToLower(normalizeModelID(model)) {
-	case "claude-haiku-4.5", "claude-opus-4.5", "claude-sonnet-4", "claude-sonnet-4.5":
-		return true
-	default:
-		return false
-	}
-}
-
-type anthropicCompatibility struct {
-	adaptiveThinking                bool
-	supportsTemperature             bool
-	supportsEagerToolInputStreaming bool
-	supportsXHighEffort             bool
-}
-
-func anthropicCompatibilityForRoute(model string, route modelRoute) anthropicCompatibility {
-	adaptiveThinking := route.AdaptiveThinking
-	if route.ForceAdaptiveThinking == nil {
-		adaptiveThinking = adaptiveThinking || forcesAnthropicAdaptiveThinking(model)
-	}
-	return anthropicCompatibility{
-		adaptiveThinking:                adaptiveThinking,
-		supportsTemperature:             compatibilityBool(route.SupportsTemperature, supportsAnthropicTemperature(model)),
-		supportsEagerToolInputStreaming: compatibilityBool(route.SupportsEagerToolInputStreaming, supportsAnthropicEagerToolInputStreaming(model)),
-		supportsXHighEffort:             compatibilityBool(route.SupportsXHighEffort, supportsAnthropicXHighEffort(model)),
-	}
 }
 
 func normalizeFormat(raw string) string {
@@ -1200,7 +1168,7 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 			return nil, failure
 		}
 		requestedStream = streamRequested(body)
-		if requestedStream && !compatibilityBool(route.Streaming, false) {
+		if requestedStream && !optionalBool(route.Streaming) {
 			failure := &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
 			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "capability_validation", "model": model})
 			return nil, failure
