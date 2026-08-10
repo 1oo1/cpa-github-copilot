@@ -126,6 +126,10 @@ const (
 	streamReasonMissingTerminal  = "missing_terminal_event"
 )
 
+// The host classifies an unexpected EOF as a connection-lifecycle failure, so
+// a truncated Responses stream remains an error without cooling the credential.
+const responsesMissingTerminalError = "GitHub Copilot Responses stream ended without a terminal event: unexpected EOF"
+
 const (
 	upstreamCauseCanceled        = "canceled"
 	upstreamCauseTimeout         = "timeout"
@@ -539,7 +543,7 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 			}
 			// Responses 输出协议下，没有真实终态事件就结束是协议错误，绝不能伪造成功。
 			if tracker.missingTerminal() {
-				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
+				return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
 			}
 			return nil
 		}
@@ -622,10 +626,10 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 				}
 			}
 			if requireResponsesSourceTerminal && responsesSourceStatus == "" {
-				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
+				return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
 			}
 			if tracker.missingTerminal() {
-				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
+				return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
 			}
 			return nil
 		}

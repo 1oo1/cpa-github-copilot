@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -615,6 +617,9 @@ func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
 	if pluginError == "" {
 		t.Fatalf("stream without a terminal Responses event unexpectedly closed cleanly; emitted=%q", emitted)
 	}
+	if !strings.Contains(strings.ToLower(pluginError), "unexpected eof") {
+		t.Fatalf("missing-terminal stream error must be classified as a connection-lifecycle failure: %q", pluginError)
+	}
 	if !strings.Contains(emitted, "response.output_text.delta") {
 		t.Fatalf("non-terminal event was not preserved byte-for-byte: %q", emitted)
 	}
@@ -624,6 +629,31 @@ func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
 	entry := findLogEvent(t, logs, "inference.stream.forward_failed")
 	if entry.Fields["reason"] != streamReasonMissingTerminal {
 		t.Fatalf("forward_failed reason = %#v", entry.Fields["reason"])
+	}
+}
+
+func TestResponsesMissingTerminalErrorDoesNotCoolHostCredential(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{ID: "auth", Provider: pluginIdentifier}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+
+	const model = "gpt-5.4"
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &coreauth.Error{Message: responsesMissingTerminalError},
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("registered auth disappeared")
+	}
+	if state := updated.ModelStates[model]; state != nil && (state.Unavailable || !state.NextRetryAfter.IsZero()) {
+		t.Fatalf("missing-terminal stream error cooled credential: %#v", state)
 	}
 }
 
