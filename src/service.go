@@ -16,6 +16,7 @@ func defaultPluginConfig() pluginConfig {
 		EnableModels:                     true,
 		ModelCacheTTL:                    300,
 		MaxStreamBytes:                   4 << 20,
+		WebSearchModel:                   "gpt-5.6-terra",
 		EnableResponsesContextManagement: true,
 	}
 }
@@ -34,6 +35,7 @@ func (s *pluginService) configure(raw []byte) error {
 		}
 	}
 	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
+	cfg.WebSearchModel = normalizeModelID(cfg.WebSearchModel)
 	if cfg.ClientID == "" {
 		return &pluginFailure{code: "invalid_config", message: "client_id is required"}
 	}
@@ -66,6 +68,7 @@ func (s *pluginService) configure(raw []byte) error {
 		"enable_models":                       cfg.EnableModels,
 		"model_cache_ttl_seconds":             cfg.ModelCacheTTL,
 		"max_stream_buffer_bytes":             cfg.MaxStreamBytes,
+		"web_search_model":                    cfg.WebSearchModel,
 		"enable_responses_context_management": cfg.EnableResponsesContextManagement,
 		"credential_identity_changed":         changedIdentity,
 		"discarded_login_session_count":       len(staleSessions),
@@ -93,6 +96,7 @@ func (s *pluginService) registration() registration {
 				{Name: "enable_models", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Best-effort enable Copilot model policies after login."},
 				{Name: "model_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a non-empty account model catalog before rediscovery."},
 				{Name: "max_stream_buffer_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum buffered partial SSE event size."},
+				{Name: "web_search_model", Type: pluginapi.ConfigFieldTypeString, Description: "Responses model used only for standalone Anthropic server web search requests; empty disables routing."},
 				{Name: "enable_responses_context_management", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Default-enable native Responses server-side context compaction (VS Code feature-on behavior)."},
 			},
 		},

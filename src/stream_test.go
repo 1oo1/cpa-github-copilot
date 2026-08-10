@@ -200,6 +200,62 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
+	frames := []string{
+		`data: {"type":"response.created","response":{"id":"resp-search","model":"gpt-5.6-terra"}}` + "\n\n",
+		`data: {"type":"response.output_item.added","item":{"id":"ws_123","type":"web_search_call","status":"in_progress"}}` + "\n\n",
+		`data: {"type":"response.web_search_call.searching","item_id":"ws_123"}` + "\n\n",
+		`data: {"type":"response.web_search_call.completed","item_id":"ws_123"}` + "\n\n",
+		`data: {"type":"response.output_item.done","item":{"id":"ws_123","type":"web_search_call","status":"completed","action":{"type":"search","query":"HarmonyOS command-line tools"}}}` + "\n\n",
+		`data: {"type":"response.completed","response":{"id":"resp-search","status":"completed","stop_reason":"stop","error":null,"usage":{"input_tokens":3,"output_tokens":2}}}` + "\n\n",
+	}
+	chunks := make([]rpcHostHTTPStreamReadResponse, 0, len(frames))
+	for index, frame := range frames {
+		chunks = append(chunks, rpcHostHTTPStreamReadResponse{Payload: []byte(frame), Done: index == len(frames)-1})
+	}
+	bridge := newStreamBridgeFake(chunks...)
+	service := newPluginService(bridge)
+	now := time.Unix(115_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{
+		"model":"claude-sonnet-5",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":"Perform a web search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
+		"tool_choice":{"type":"tool","name":"web_search"}
+	}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now,
+				storedModel{ID: "claude-sonnet-5", Format: formatClaude},
+				storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse},
+			)),
+		},
+		StreamID: "plugin-web-search", HostCallbackID: "callback-web-search",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("plugin stream error = %q", pluginError)
+	}
+	for _, needle := range []string{`"type":"server_tool_use"`, `"type":"web_search_tool_result"`, "HarmonyOS command-line tools", `"type":"message_stop"`} {
+		if !strings.Contains(emitted, needle) {
+			t.Fatalf("translated web search stream missing %q: %s", needle, emitted)
+		}
+	}
+	if strings.Index(emitted, `"type":"web_search_tool_result"`) < strings.Index(emitted, `"type":"server_tool_use"`) {
+		t.Fatalf("web search result preceded server tool use: %s", emitted)
+	}
+}
+
 func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
 	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
 	bridge.emitError = true

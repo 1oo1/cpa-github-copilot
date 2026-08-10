@@ -29,6 +29,14 @@ type preparedInference struct {
 	headers          http.Header
 }
 
+type anthropicWebSearchRequestClass uint8
+
+const (
+	anthropicWebSearchNone anthropicWebSearchRequestClass = iota
+	anthropicWebSearchOnly
+	anthropicWebSearchMixed
+)
+
 func (s *pluginService) execute(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -164,8 +172,9 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if strings.TrimSpace(storage.CopilotSessionToken) == "" || (storage.ExpiresAt > 0 && !s.now().UTC().Before(timeFromUnixMilli(storage.ExpiresAt))) {
 		return preparedInference{}, &pluginFailure{code: "reauth_required", message: "GitHub Copilot session requires refresh", httpStatus: http.StatusUnauthorized}
 	}
+	cfg := s.loadedConfig()
 	githubHost, errHost := normalizeGitHubHost(storage.GitHubHost)
-	if errHost != nil || githubHost != s.loadedConfig().GitHubHost {
+	if errHost != nil || githubHost != cfg.GitHubHost {
 		return preparedInference{}, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
 	}
 	model := normalizeModelID(req.Model)
@@ -190,12 +199,31 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if route.Path == "" || route.Format == "" {
 		return preparedInference{}, &pluginFailure{code: "model_not_supported", message: "GitHub Copilot model has no supported endpoint", httpStatus: http.StatusBadRequest}
 	}
-	if stream && !optionalBool(route.Streaming) {
-		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
-	}
 	payload := append([]byte(nil), req.Payload...)
 	if len(payload) == 0 || !json.Valid(payload) {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: "GitHub Copilot request payload must be a JSON object", httpStatus: http.StatusBadRequest}
+	}
+	if inputFormat == formatClaude && route.Format == formatClaude {
+		switch classifyAnthropicServerWebSearchRequest(payload) {
+		case anthropicWebSearchMixed:
+			return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot can route only standalone Anthropic server web search requests", httpStatus: http.StatusBadRequest}
+		case anthropicWebSearchOnly:
+			if cfg.WebSearchModel == "" {
+				return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot Anthropic server web search routing is disabled", httpStatus: http.StatusBadRequest}
+			}
+			webSearchRoute := s.resolveModelRoute(req.AuthID, cfg.WebSearchModel, storage)
+			if webSearchRoute.Path == "" || webSearchRoute.Format == "" {
+				return preparedInference{}, &pluginFailure{code: "model_not_supported", message: "Configured GitHub Copilot web search model is unavailable", httpStatus: http.StatusBadRequest}
+			}
+			if webSearchRoute.Format != formatOpenAIResponse {
+				return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "Configured GitHub Copilot web search model does not use Responses", httpStatus: http.StatusBadRequest}
+			}
+			model = cfg.WebSearchModel
+			route = webSearchRoute
+		}
+	}
+	if stream && !optionalBool(route.Streaming) {
+		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
 	}
 	translationTarget := translatorTargetFormat(route.Format, inputFormat)
 	requestedReasoningEffort := reasoningEffortFromPayload(payload, inputFormat)
@@ -222,7 +250,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if route.Format == formatClaude && declaresReasoningLevel(route.ReasoningLevels, requestedReasoningEffort) {
 		payload = preserveAnthropicReasoningEffort(payload, requestedReasoningEffort)
 	}
-	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream, s.loadedConfig().EnableResponsesContextManagement)
+	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream, cfg.EnableResponsesContextManagement)
 	if errPrepare != nil {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: errPrepare.Error(), httpStatus: http.StatusBadRequest}
 	}
@@ -285,6 +313,14 @@ func preparedInferenceLogFields(prepared preparedInference, stream bool) map[str
 		"endpoint_path":      prepared.upstreamPath,
 		"stream":             stream,
 		"upstream_bytes":     len(prepared.upstreamPayload),
+	}
+	requestedModel := normalizeModelID(prepared.request.Model)
+	if requestedModel == "" {
+		requestedModel = modelFromPayload(prepared.request.Payload)
+	}
+	if requestedModel != "" && requestedModel != prepared.model {
+		fields["requested_model"] = requestedModel
+		fields["web_search_routed"] = true
 	}
 	// 只在原生 Responses 路由记录压缩诊断字段，不记录 prompt/tool 内容。
 	if prepared.upstreamFormat == formatOpenAIResponse {
@@ -794,6 +830,42 @@ func normalizeAnthropicTools(payload map[string]any) bool {
 		}
 	}
 	return changed
+}
+
+func classifyAnthropicServerWebSearchRequest(raw []byte) anthropicWebSearchRequestClass {
+	var payload struct {
+		Tools []json.RawMessage `json:"tools"`
+	}
+	if json.Unmarshal(raw, &payload) != nil || len(payload.Tools) == 0 {
+		return anthropicWebSearchNone
+	}
+	hasWebSearch := false
+	onlyWebSearch := true
+	for _, rawTool := range payload.Tools {
+		var tool struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(rawTool, &tool) != nil {
+			onlyWebSearch = false
+			continue
+		}
+		if tool.Type == "web_search_20250305" || tool.Type == "web_search_20260209" {
+			hasWebSearch = true
+			if tool.Name != "web_search" {
+				onlyWebSearch = false
+			}
+			continue
+		}
+		onlyWebSearch = false
+	}
+	if !hasWebSearch {
+		return anthropicWebSearchNone
+	}
+	if onlyWebSearch {
+		return anthropicWebSearchOnly
+	}
+	return anthropicWebSearchMixed
 }
 
 func normalizeAnthropicTemperature(payload map[string]any) bool {

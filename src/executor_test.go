@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
@@ -421,6 +422,134 @@ func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
 			}
 			if !strings.HasSuffix(prepared.upstreamURL, test.path) || prepared.upstreamFormat != test.format {
 				t.Fatalf("prepared = %#v", prepared)
+			}
+		})
+	}
+}
+
+func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testing.T) {
+	service := newPluginService(nil)
+	now := time.Unix(71_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	storage := executorStorage(now,
+		storedModel{ID: "claude-sonnet-5", Format: formatClaude},
+		storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse, Family: "gpt-5.6-terra", MaxPromptTokens: 922_000},
+	)
+	payload := []byte(`{
+		"model":"claude-sonnet-5",
+		"max_tokens":64000,
+		"messages":[{"role":"user","content":"Perform a web search"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
+		"tool_choice":{"type":"tool","name":"web_search"}
+	}`)
+	prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+		AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
+	}, true)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	if prepared.model != "gpt-5.6-terra" || prepared.upstreamFormat != formatOpenAIResponse ||
+		prepared.translatorFormat != string(sdktranslator.FormatCodex) || prepared.outputFormat != formatClaude ||
+		!strings.HasSuffix(prepared.upstreamURL, "/responses") {
+		t.Fatalf("prepared route = %#v", prepared)
+	}
+	if prepared.headers.Get("X-Interaction-Type") != "messages-proxy" {
+		t.Fatalf("interaction type = %q", prepared.headers.Get("X-Interaction-Type"))
+	}
+	var upstream map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &upstream); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	tools, ok := upstream["tools"].([]any)
+	if !ok || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" || upstream["model"] != "gpt-5.6-terra" {
+		t.Fatalf("upstream payload = %s", prepared.upstreamPayload)
+	}
+	fields := preparedInferenceLogFields(prepared, true)
+	if fields["requested_model"] != "claude-sonnet-5" || fields["web_search_routed"] != true {
+		t.Fatalf("prepared log fields = %#v", fields)
+	}
+}
+
+func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
+	now := time.Unix(71_500, 0).UTC()
+	standalone := `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
+	for _, test := range []struct {
+		name       string
+		config     string
+		models     []storedModel
+		payload    string
+		wantCode   string
+		wantModel  string
+		wantFormat string
+	}{
+		{
+			name: "ordinary Anthropic tool stays on Claude", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			payload:   `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`,
+			wantModel: "claude-sonnet-5", wantFormat: formatClaude,
+		},
+		{
+			name: "mixed tools fail closed", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			payload:  `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup","input_schema":{"type":"object"}}]}`,
+			wantCode: "unsupported_feature",
+		},
+		{
+			name: "disabled route fails closed", config: `web_search_model: ""`, models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			payload: standalone, wantCode: "unsupported_feature",
+		},
+		{
+			name: "missing configured model fails closed", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			payload: standalone, wantCode: "model_not_supported",
+		},
+		{
+			name: "configured model must use Responses", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}, {ID: "gpt-5.6-terra", Format: formatOpenAI}},
+			payload: standalone, wantCode: "unsupported_feature",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := newPluginService(nil)
+			service.now = func() time.Time { return now }
+			if test.config != "" {
+				if errConfigure := service.configure(mustJSON(t, lifecycleRequest{ConfigYAML: []byte(test.config)})); errConfigure != nil {
+					t.Fatal(errConfigure)
+				}
+			}
+			prepared, failure := service.prepareInference(pluginapi.ExecutorRequest{
+				AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+				Payload: []byte(test.payload), StorageJSON: mustJSON(t, executorStorage(now, test.models...)),
+			}, true)
+			if test.wantCode != "" {
+				if failure == nil || failure.code != test.wantCode {
+					t.Fatalf("failure = %#v, want code %q", failure, test.wantCode)
+				}
+				return
+			}
+			if failure != nil {
+				t.Fatal(failure)
+			}
+			if prepared.model != test.wantModel || prepared.upstreamFormat != test.wantFormat {
+				t.Fatalf("prepared route = %#v", prepared)
+			}
+		})
+	}
+}
+
+func TestClassifyAnthropicServerWebSearchRequest(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want anthropicWebSearchRequestClass
+	}{
+		{name: "absent", body: `{"messages":[]}`, want: anthropicWebSearchNone},
+		{name: "ordinary", body: `{"tools":[{"name":"lookup"}]}`, want: anthropicWebSearchNone},
+		{name: "20250305", body: `{"tools":[{"type":"web_search_20250305","name":"web_search"}]}`, want: anthropicWebSearchOnly},
+		{name: "20260209", body: `{"tools":[{"type":"web_search_20260209","name":"web_search"}]}`, want: anthropicWebSearchOnly},
+		{name: "mixed", body: `{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup"}]}`, want: anthropicWebSearchMixed},
+		{name: "invalid name", body: `{"tools":[{"type":"web_search_20250305","name":"browser_search"}]}`, want: anthropicWebSearchMixed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyAnthropicServerWebSearchRequest([]byte(test.body)); got != test.want {
+				t.Fatalf("class = %v, want %v", got, test.want)
 			}
 		})
 	}

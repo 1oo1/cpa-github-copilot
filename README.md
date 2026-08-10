@@ -62,10 +62,15 @@ Store 与手工安装共用 `plugins.configs.github-copilot-go`：
 | `enable_models` | `true` | 登录后 best-effort 启用已知模型 policy |
 | `model_cache_ttl_seconds` | `300` | 非空账户模型目录缓存秒数；`0` 表示每次刷新 |
 | `max_stream_buffer_bytes` | `4194304` | 未完成 SSE event 的缓存上限，范围 64 KiB–64 MiB |
+| `web_search_model` | `gpt-5.6-terra` | 仅将 Anthropic 原生 Web Search 独占请求分流到该 Responses 模型；空值禁用 |
 | `enable_responses_context_management` | `true` | 为符合条件的原生 Responses 请求启用服务端 compaction |
 
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
 fragment 或 IP，并需要该实例可用的 OAuth public client ID。
+
+Claude Code 的 `web_search_20250305`/`web_search_20260209` 是提供方执行的服务端工具，
+Copilot Claude Messages 路由不执行它。插件只在工具列表全部为原生 Web Search 时使用
+`web_search_model`，再将 Responses 结果转换回 Anthropic 事件；普通请求不切换，混合工具请求在本地拒绝。
 
 ## 登录与调用
 
