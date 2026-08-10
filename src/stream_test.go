@@ -530,3 +530,506 @@ func TestSSEFramerBufferExceededReturnsTypedError(t *testing.T) {
 		t.Fatalf("framer error = (reason=%q, benign=%v)", forwardErr.reason, forwardErr.benign)
 	}
 }
+
+func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(190_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-missing-terminal",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	logs := append([]rpcHostLogRequest(nil), bridge.logs...)
+	bridge.mu.Unlock()
+	if pluginError == "" {
+		t.Fatalf("stream without a terminal Responses event unexpectedly closed cleanly; emitted=%q", emitted)
+	}
+	if !strings.Contains(emitted, "response.output_text.delta") {
+		t.Fatalf("non-terminal event was not preserved byte-for-byte: %q", emitted)
+	}
+	if strings.Contains(emitted, "response.completed") {
+		t.Fatalf("must never synthesize response.completed: emitted=%q", emitted)
+	}
+	entry := findLogEvent(t, logs, "inference.stream.forward_failed")
+	if entry.Fields["reason"] != streamReasonMissingTerminal {
+		t.Fatalf("forward_failed reason = %#v", entry.Fields["reason"])
+	}
+}
+
+func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
+	for _, terminal := range []string{
+		`{"type":"response.completed","response":{"id":"resp_1"}}`,
+		`{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete"}}`,
+		`{"type":"response.failed","response":{"id":"resp_1","status":"failed"}}`,
+		`{"type":"error","error":{"message":"boom"}}`,
+	} {
+		t.Run(terminal, func(t *testing.T) {
+			bridge := newStreamBridgeFake(
+				rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n"), Done: true},
+			)
+			service := newPluginService(bridge)
+			now := time.Unix(191_000, 0).UTC()
+			service.now = func() time.Time { return now }
+			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+			_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+					Payload: payload, OriginalRequest: payload,
+					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+				},
+				StreamID: "plugin-terminal-ok",
+			}))
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			bridge.wait(t)
+			bridge.mu.Lock()
+			pluginError := bridge.pluginError
+			bridge.mu.Unlock()
+			if pluginError != "" {
+				t.Fatalf("unexpected error = %q", pluginError)
+			}
+		})
+	}
+}
+
+func TestResponsesStreamLogsTerminalStatus(t *testing.T) {
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(196_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-terminal-status-log",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	logs := append([]rpcHostLogRequest(nil), bridge.logs...)
+	bridge.mu.Unlock()
+	entry := findLogEvent(t, logs, "inference.stream.completed")
+	if entry.Fields["responses_terminal_status"] != "response.completed" {
+		t.Fatalf("responses_terminal_status = %#v", entry.Fields["responses_terminal_status"])
+	}
+}
+
+func TestResponsesStreamLogsNeverContainCompactionOrPromptContent(t *testing.T) {
+	const encryptedSentinel = "SENTINEL_ENCRYPTED_REASONING_PAYLOAD"
+	const promptSentinel = "SENTINEL_USER_PROMPT_TEXT"
+	compaction := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"` + encryptedSentinel + `"}}`
+	completed := `{"type":"response.completed","response":{"id":"resp_1"}}`
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(197_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"` + promptSentinel + `"}]}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-log-content-sentinel",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	logs := append([]rpcHostLogRequest(nil), bridge.logs...)
+	bridge.mu.Unlock()
+	// The client-facing stream must carry the real content...
+	if !strings.Contains(emitted, encryptedSentinel) {
+		t.Fatalf("compaction content was not forwarded to the client: %q", emitted)
+	}
+	// ...but diagnostic logs must never contain prompt text or encrypted reasoning content.
+	assertLogsExclude(t, logs, encryptedSentinel, promptSentinel)
+}
+
+func TestResponsesPassthroughPreservesCompactionEventsBeforeTerminal(t *testing.T) {
+	compaction := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc"}}`
+	completed := `{"type":"response.completed","response":{"id":"resp_1"}}`
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(192_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-compaction-before-terminal",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	}
+	if !strings.Contains(emitted, "cmp_1") || !strings.Contains(emitted, "response.completed") {
+		t.Fatalf("compaction or terminal event missing: %q", emitted)
+	}
+}
+
+func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t *testing.T) {
+	// Chat 的 [DONE] 只是传输哨兵；没有非空 finish_reason 时不能把 translator 合成的
+	// response.completed 当成真实 Responses 终态。
+	const sentinel = "PRIVATE_TRANSLATED_STREAM_FAILURE"
+	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	done := "data: [DONE]\n\n"
+	errorFrame := `data: {"error":{"message":"` + sentinel + `","type":"server_error"}}` + "\n\n"
+	for _, test := range []struct {
+		name   string
+		frames string
+	}{
+		{name: "done", frames: chunk + done},
+		{name: "error then done", frames: chunk + errorFrame + done},
+		{name: "finish then error then done", frames: chunk + finish + errorFrame + done},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames), Done: true})
+			service := newPluginService(bridge)
+			now := time.Unix(193_000, 0).UTC()
+			service.now = func() time.Time { return now }
+			payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
+			_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+					Payload: payload, OriginalRequest: payload,
+					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+				},
+				StreamID: "plugin-translated-missing-terminal",
+			}))
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			bridge.wait(t)
+			bridge.mu.Lock()
+			emitted := string(bytesJoin(bridge.emitted))
+			pluginError := bridge.pluginError
+			bridge.mu.Unlock()
+			if pluginError == "" {
+				t.Fatalf("translated stream without a terminal Responses event unexpectedly closed cleanly; emitted=%q", emitted)
+			}
+			if strings.Contains(emitted, "response.completed") {
+				t.Fatalf("must never synthesize response.completed: emitted=%q", emitted)
+			}
+			if strings.Contains(pluginError, sentinel) {
+				t.Fatalf("stream error leaked upstream body: %q", pluginError)
+			}
+			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+		})
+	}
+}
+
+func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
+	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	done := "data: [DONE]\n\n"
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done), Done: true})
+	service := newPluginService(bridge)
+	now := time.Unix(194_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		},
+		StreamID: "plugin-translated-terminal",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	}
+	if !strings.Contains(emitted, "response.completed") {
+		t.Fatalf("terminal response.completed event missing: emitted=%q", emitted)
+	}
+}
+
+func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
+	chatChunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	chatFinish := func(reason string) string {
+		return `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"` + reason + `"}]}` + "\n\ndata: [DONE]\n\n"
+	}
+	claudeFrames := func(reason string) string {
+		return strings.Join([]string{
+			`data: {"type":"message_start","message":{"id":"msg-1","model":"claude-sonnet-4.6","usage":{"input_tokens":1,"output_tokens":0}}}`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`,
+			`data: {"type":"content_block_stop","index":0}`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"` + reason + `","stop_sequence":null},"usage":{"output_tokens":1}}`,
+			`data: {"type":"message_stop"}`,
+		}, "\n\n") + "\n\n"
+	}
+	for _, test := range []struct {
+		name           string
+		model          string
+		upstreamFormat string
+		frames         string
+		wantStatus     string
+		wantReason     string
+	}{
+		{name: "chat length", model: "gpt-4.1", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("length"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "chat content filter", model: "gpt-4.1", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("content_filter"), wantStatus: "response.incomplete", wantReason: "content_filter"},
+		{name: "claude max tokens", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("max_tokens"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "claude context window", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("model_context_window_exceeded"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "claude end turn", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("end_turn"), wantStatus: "response.completed"},
+		{name: "claude tool use", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("tool_use"), wantStatus: "response.completed"},
+		{name: "claude refusal", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("refusal"), wantStatus: "response.completed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames), Done: true})
+			service := newPluginService(bridge)
+			now := time.Unix(194_250, 0).UTC()
+			service.now = func() time.Time { return now }
+			payload := []byte(`{"model":"` + test.model + `","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`)
+			_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					AuthID: "auth", Model: test.model, Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+					Payload: payload, OriginalRequest: payload,
+					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: test.model, Format: test.upstreamFormat})),
+				},
+				StreamID: "plugin-translated-terminal-reason",
+			}))
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			bridge.wait(t)
+			bridge.mu.Lock()
+			emitted := string(bytesJoin(bridge.emitted))
+			pluginError := bridge.pluginError
+			bridge.mu.Unlock()
+			if pluginError != "" {
+				t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+			}
+			if !strings.Contains(emitted, test.wantStatus) {
+				t.Fatalf("terminal %s missing: emitted=%q", test.wantStatus, emitted)
+			}
+			if test.wantStatus == "response.incomplete" && strings.Contains(emitted, "response.completed") {
+				t.Fatalf("incomplete source became completed: emitted=%q", emitted)
+			}
+			if test.wantReason != "" && !strings.Contains(emitted, `"reason":"`+test.wantReason+`"`) {
+				t.Fatalf("incomplete reason %q missing: emitted=%q", test.wantReason, emitted)
+			}
+		})
+	}
+}
+
+func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing.T) {
+	const sentinel = "PRIVATE_RESPONSES_STREAM_FAILURE"
+	for _, test := range []struct {
+		name  string
+		frame string
+	}{
+		{
+			name:  "failed",
+			frame: `data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"message":"` + sentinel + `"}}}` + "\n\n",
+		},
+		{
+			name:  "missing terminal",
+			frame: `data: {"type":"response.output_text.delta","response_id":"resp_1","delta":"partial"}` + "\n\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frame), Done: true})
+			service := newPluginService(bridge)
+			now := time.Unix(194_500, 0).UTC()
+			service.now = func() time.Time { return now }
+			payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+			_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+				ExecutorRequest: pluginapi.ExecutorRequest{
+					AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+					Payload: payload, OriginalRequest: payload,
+					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+				},
+				StreamID: "plugin-responses-to-chat-failure",
+			}))
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			bridge.wait(t)
+			bridge.mu.Lock()
+			pluginError := bridge.pluginError
+			emitted := string(bytesJoin(bridge.emitted))
+			bridge.mu.Unlock()
+			if pluginError == "" {
+				t.Fatalf("Responses-to-Chat stream closed cleanly; emitted=%q", emitted)
+			}
+			if strings.Contains(pluginError, sentinel) {
+				t.Fatalf("stream error leaked upstream body: %q", pluginError)
+			}
+			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+		})
+	}
+}
+
+// TestResponsesCompactionRoundTripPreservesClientManagedState proves the plugin performs no
+// selection or history management of its own: request 1 streams multiple compaction items and
+// a terminal response.completed; this TEST (playing the role of the VS Code client) selects the
+// item at the highest output_index and builds request 2. The plugin must send that second
+// request with the selected compaction item, previous_response_id, and input ordering preserved,
+// only adding the documented Responses defaults.
+func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
+	item1 := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc-old"}}`
+	item2 := `{"type":"response.output_item.done","output_index":1,"item":{"type":"compaction","id":"cmp_2","encrypted_content":"enc-new"}}`
+	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}`
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + item1 + "\n\ndata: " + item2 + "\n\n")},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + completed + "\n\n"), Done: true},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(195_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	firstPayload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: firstPayload, OriginalRequest: firstPayload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-compaction-1",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" {
+		t.Fatalf("unexpected stream error = %q", pluginError)
+	}
+
+	latestID, latestEncrypted, responseID := selectLatestCompactionForTest(t, emitted)
+	if latestID != "cmp_2" || latestEncrypted != "enc-new" || responseID != "resp_1" {
+		t.Fatalf("test client selection = id=%q encrypted=%q responseID=%q", latestID, latestEncrypted, responseID)
+	}
+
+	secondPayload := mustJSON(t, map[string]any{
+		"model":                "gpt-5.4",
+		"previous_response_id": responseID,
+		"input": []any{
+			map[string]any{"type": "compaction", "id": latestID, "encrypted_content": latestEncrypted},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+		},
+	})
+	var capturedBody []byte
+	bridge2 := &fakeBridge{handler: func(_ string, payload any) (any, error) {
+		req := payload.(rpcHostHTTPRequest)
+		capturedBody = req.Body
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp_2","object":"response","status":"completed","output":[]}`)}, nil
+	}}
+	service2 := newPluginService(bridge2)
+	service2.now = func() time.Time { return now }
+	_, errExecute := service2.execute(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: secondPayload, OriginalRequest: secondPayload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		},
+	}))
+	if errExecute != nil {
+		t.Fatal(errExecute)
+	}
+	var upstreamBody map[string]any
+	if json.Unmarshal(capturedBody, &upstreamBody) != nil {
+		t.Fatalf("decode upstream body: %s", capturedBody)
+	}
+	if upstreamBody["previous_response_id"] != "resp_1" {
+		t.Fatalf("previous_response_id = %#v", upstreamBody["previous_response_id"])
+	}
+	input, ok := upstreamBody["input"].([]any)
+	if !ok || len(input) != 2 {
+		t.Fatalf("input = %#v", upstreamBody["input"])
+	}
+	compactionItem, ok := input[0].(map[string]any)
+	if !ok || compactionItem["id"] != "cmp_2" || compactionItem["encrypted_content"] != "enc-new" || compactionItem["type"] != "compaction" {
+		t.Fatalf("compaction item was not preserved byte-for-byte: %#v", compactionItem)
+	}
+	userItem, ok := input[1].(map[string]any)
+	if !ok || userItem["role"] != "user" {
+		t.Fatalf("incremental input item = %#v", input[1])
+	}
+}
+
+func selectLatestCompactionForTest(t *testing.T, emitted string) (id, encryptedContent, responseID string) {
+	t.Helper()
+	bestIndex := -1
+	for _, frame := range strings.Split(emitted, "\n\n") {
+		frame = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(frame), "data:"))
+		if frame == "" {
+			continue
+		}
+		var event struct {
+			Type        string `json:"type"`
+			OutputIndex int    `json:"output_index"`
+			Item        struct {
+				Type             string `json:"type"`
+				ID               string `json:"id"`
+				EncryptedContent string `json:"encrypted_content"`
+			} `json:"item"`
+			Response struct {
+				ID string `json:"id"`
+			} `json:"response"`
+		}
+		if json.Unmarshal([]byte(frame), &event) != nil {
+			continue
+		}
+		if event.Type == "response.output_item.done" && event.Item.Type == "compaction" && event.OutputIndex >= bestIndex {
+			bestIndex = event.OutputIndex
+			id = event.Item.ID
+			encryptedContent = event.Item.EncryptedContent
+		}
+		if event.Type == "response.completed" {
+			responseID = event.Response.ID
+		}
+	}
+	return id, encryptedContent, responseID
+}

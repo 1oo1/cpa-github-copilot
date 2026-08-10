@@ -11,13 +11,14 @@ import (
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		ClientID:                    defaultClientID,
-		GitHubHost:                  defaultGitHubHost,
-		EnableModels:                true,
-		ModelCacheTTL:               300,
-		EnableRemoteCompatibility:   true,
-		RemoteCompatibilityCacheTTL: 4 * 60 * 60,
-		MaxStreamBytes:              4 << 20,
+		ClientID:                         defaultClientID,
+		GitHubHost:                       defaultGitHubHost,
+		EnableModels:                     true,
+		ModelCacheTTL:                    300,
+		EnableRemoteCompatibility:        true,
+		RemoteCompatibilityCacheTTL:      4 * 60 * 60,
+		MaxStreamBytes:                   4 << 20,
+		EnableResponsesContextManagement: true,
 	}
 }
 
@@ -72,6 +73,7 @@ func (s *pluginService) configure(raw []byte) error {
 		"enable_remote_compatibility":            cfg.EnableRemoteCompatibility,
 		"remote_compatibility_cache_ttl_seconds": cfg.RemoteCompatibilityCacheTTL,
 		"max_stream_buffer_bytes":                cfg.MaxStreamBytes,
+		"enable_responses_context_management":    cfg.EnableResponsesContextManagement,
 		"credential_identity_changed":            changedIdentity,
 		"discarded_login_session_count":          len(staleSessions),
 	})
@@ -100,6 +102,7 @@ func (s *pluginService) registration() registration {
 				{Name: "enable_remote_compatibility", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Apply newer compatibility metadata from the fixed project manifest."},
 				{Name: "remote_compatibility_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a checked remote compatibility manifest."},
 				{Name: "max_stream_buffer_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum buffered partial SSE event size."},
+				{Name: "enable_responses_context_management", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Default-enable native Responses server-side context compaction (VS Code feature-on behavior)."},
 			},
 		},
 		Capabilities: registrationCapabilities{

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -141,4 +142,31 @@ func sameOrigin(raw, base string) bool {
 		return false
 	}
 	return strings.EqualFold(u.Scheme, b.Scheme) && strings.EqualFold(u.Host, b.Host) && u.User == nil
+}
+
+func classifyInferenceEndpoint(raw string) (format string, compact, exact bool) {
+	u, errParse := url.Parse(raw)
+	if errParse != nil {
+		return "", false, false
+	}
+	canonicalPath := path.Clean("/" + strings.TrimPrefix(u.Path, "/"))
+	exact = u.Path == canonicalPath && u.EscapedPath() == canonicalPath && u.RawQuery == "" && !u.ForceQuery && u.Fragment == ""
+	switch canonicalPath {
+	case "/chat/completions":
+		return formatOpenAI, false, exact
+	case "/responses":
+		return formatOpenAIResponse, false, exact
+	case "/responses/compact":
+		return formatOpenAIResponse, true, exact
+	case "/v1/messages":
+		return formatClaude, false, exact
+	case "/v1/chat/completions":
+		return formatOpenAI, false, false
+	case "/v1/responses":
+		return formatOpenAIResponse, false, false
+	case "/messages":
+		return formatClaude, false, false
+	default:
+		return "", false, false
+	}
 }

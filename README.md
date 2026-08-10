@@ -12,6 +12,10 @@ provider `github-copilot` 接入；插件配置 ID 为 `github-copilot-go`。
 插件按账号 `/models.supported_endpoints` 选择真实上游协议；入口与上游不一致时，
 使用 CLIProxyAPI translator 转换请求、非流式响应和 SSE 流。
 
+当前 HTTP wire 基线为 VS Code `1.132.0`、Copilot Chat `0.60.0`、
+`@vscode/copilot-api@0.4.3` 和最终 API version `2026-06-01`。`pi` 不再作为请求实现
+参考，只在读取旧凭据字段时保留兼容。
+
 > Copilot token broker 和模型接口不是面向通用第三方客户端的稳定公共 API，可能
 > 随 GitHub 服务变化。使用前请确认符合订阅条款和组织策略。
 
@@ -32,6 +36,8 @@ GitHub Device Flow
 - session 刷新成功但 `/models` 暂时失败时，保留新 session 和旧模型状态。
 - 所有 GitHub/Copilot HTTP 与流请求都经过 `host.http.*`；token 仅进入
   provider-owned `StorageJSON` 和上游 Authorization。
+- Responses continuation 由客户端管理；插件不保存 history，只保证原生路径 opaque
+  state 无损，并在跨格式可能丢失 state 时提前拒绝。
 
 ## 前置条件
 
@@ -65,7 +71,7 @@ curl -X POST \
   "http://127.0.0.1:<PORT>/v0/management/plugin-store/github-copilot-go/install"
 ```
 
-追加 `?version=0.1.3` 可安装指定版本（版本号不带 `v`）。Store 会把产物写入
+追加 `?version=0.1.5` 可安装指定版本（版本号不带 `v`）。Store 会把产物写入
 `plugins.dir/<goos>/<goarch>/`、记录版本并接管后续更新；既有手工安装也应通过
 Store 安装一次，确认版本化文件生效后再删除旧的无版本动态库。
 
@@ -100,6 +106,7 @@ Store 与手工安装共用 `plugins.configs.github-copilot-go`。除 `enabled`�
 | `enable_remote_compatibility` | `true` | 从固定 manifest 应用较新的受限兼容覆盖 |
 | `remote_compatibility_cache_ttl_seconds` | `14400` | manifest 成功检查后的缓存时间；`0` 表示每次检查 |
 | `max_stream_buffer_bytes` | `4194304` | 未完成 SSE 事件的缓存上限；允许 64 KiB 到 64 MiB |
+| `enable_responses_context_management` | `true` | 为 eligible 原生 Responses 模型缺省启用服务端 compaction |
 
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
 fragment 或 IP；同时需要该实例可用的 OAuth public client ID。
@@ -149,6 +156,25 @@ Chat Completions 请求示例；模型 ID 应来自当前账号的 `/v1/models`�
 插件按模型能力选择上游并在必要时跨协议转换；客户端 header 不能覆盖 Copilot
 Authorization。
 
+### Responses 状态与终态
+
+原生 Responses 请求缺省发送 `store:false`、`truncation:disabled` 和
+`include:["reasoning.encrypted_content"]`。启用 context management 时，eligible 模型的
+compaction threshold 是 prompt window 的 90%，window 缺失时回退 `50000`；caller 已提供
+合法 `context_management` 时不会被覆盖。
+
+插件保持 stateless。`previous_response_id`、compaction item 和 encrypted reasoning 由客户端
+保存并在下一轮提交；插件原样运输这些值，但含 opaque state 的跨格式请求返回
+`format_mismatch`，不会尝试有损转换。独立 `/v1/responses/compact` 没有 pinned Copilot
+provider 证据，当前明确返回 `unsupported_feature`；应使用 `/v1/responses` 的 inline
+`context_management`。
+
+Responses 输出必须出现真实 `response.completed`、`response.incomplete`、
+`response.failed` 或 `error`。无终态 EOF、`in_progress`、矛盾 event wrapper、malformed JSON
+和重复 JSON member 都是协议错误；插件不会合成 completed 或可复用 response ID。Chat/Claude
+转 Responses 时，truncation 会保留为 authoritative incomplete reason，late error 优先于早先
+finish。
+
 ## 安全与诊断
 
 - GitHub access token 只访问 broker 和 GitHub account；Copilot session token 只访问
@@ -158,10 +184,12 @@ Authorization。
 - 推理限制在凭据解析出的 API origin；调用方和兼容清单都不能重定向 bearer token。
 - 插件不记录 `RawJSON`、`StorageJSON`、Authorization、token、device/user code、请求
   或响应正文。
+- caller 只能使用 VS Code 1.132 的 interaction vocabulary、`user|agent` initiator 和合法
+  interaction UUID；Authorization、identity、API version 与任意 Anthropic beta 不会透传。
 - `debug: true` 时可查看 `auth.*`、`models.*`、`inference.*` 结构化事件及宿主附加的
   `request_id`；默认日志仍保留关键 info/warn 状态。
 
-`auth.parse` 只认顶层 `type: github-copilot`，并兼容 pi 旧字段：`refresh`、`access`、
+`auth.parse` 只认顶层 `type: github-copilot`，并兼容历史 pi 凭据字段：`refresh`、`access`、
 `expires`、`enterpriseUrl`、`availableModelIds` 会分别迁移到语义化 token、host 和
 模型字段；已识别但缺少长期 token 的凭据会被禁用，不会落入其他 parser。
 
@@ -178,8 +206,15 @@ make vet
 make integration
 ```
 
+`make integration` 会构建本机 c-shared 产物，通过真实 CLIProxyAPI loader 和 host callback
+执行注册、`Execute`、`ExecuteStream` 与 `HttpRequest`，不只是检查动态库可加载。
+
 发布 tag 使用 `vX.Y.Z`；Release workflow 生成 Store 所需双架构资产和 checksum，
 [registry.json](registry.json) 无需随版本更新。
 
-模块职责、完整技术路线、安全边界、与 `pi` 的实现映射及后续同步手册见
-[PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)。
+进一步文档：
+
+- [CURRENT_PLUGIN_ARCHITECTURE.md](CURRENT_PLUGIN_ARCHITECTURE.md)：当前插件架构、终态和安全边界；
+- [VSCODE_COPILOT_1_132_ARCHITECTURE.md](VSCODE_COPILOT_1_132_ARCHITECTURE.md)：pinned VS Code/Copilot Chat 上游实现；
+- [VSCODE_COPILOT_ALIGNMENT_PLAN.md](VSCODE_COPILOT_ALIGNMENT_PLAN.md)：已完成的对齐决策、测试与验收记录；
+- [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)：VS Code 基线与历史 pi 参考的优先级和维护手册。

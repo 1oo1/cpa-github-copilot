@@ -56,6 +56,7 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 
 func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
 	var forwardErr error
+	tracker := newResponsesTerminalTracker(prepared.outputFormat)
 	defer func() {
 		panicked := recover() != nil
 		if panicked {
@@ -67,6 +68,9 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 		fields["panicked"] = panicked
 		if cause := upstreamStreamCause(forwardErr); cause != "" {
 			fields["upstream_cause"] = cause
+		}
+		if status, observed := tracker.terminalStatus(); observed {
+			fields["responses_terminal_status"] = status
 		}
 		switch {
 		case forwardErr == nil:
@@ -85,10 +89,10 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 	}()
 	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		forwardErr = forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer)
+		forwardErr = forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer, tracker)
 		return
 	}
-	forwardErr = forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer)
+	forwardErr = forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
 }
 
 // streamForwardError classifies why stream forwarding stopped so the deferred
@@ -119,6 +123,7 @@ const (
 	streamReasonUpstreamCanceled = "upstream_canceled"
 	streamReasonBufferExceeded   = "buffer_exceeded"
 	streamReasonPanic            = "panic"
+	streamReasonMissingTerminal  = "missing_terminal_event"
 )
 
 const (
@@ -128,6 +133,275 @@ const (
 	upstreamCauseConnectionReset = "connection_reset"
 	upstreamCauseOther           = "other"
 )
+
+// responsesTerminalTracker 记录 openai-response 输出协议的流是否出现过终态事件
+// （response.completed/incomplete/failed 或顶层 error），以及具体是哪一种，供关闭时的
+// 诊断日志使用。outputFormat 不是 openai-response 时 tracker 处于非激活状态，不影响
+// 其他协议的流语义。
+type responsesTerminalTracker struct {
+	active       bool
+	seen         bool
+	sourceStatus string
+	sourceReason string
+	status       string
+}
+
+func newResponsesTerminalTracker(outputFormat string) *responsesTerminalTracker {
+	return &responsesTerminalTracker{active: outputFormat == formatOpenAIResponse}
+}
+
+// observe 检查即将发给下游的帧（passthrough 为原始帧，translated 为转换后的帧），
+// 只要出现过一次终态事件就记住其类型，不会被后续非终态帧清除。
+func (t *responsesTerminalTracker) observe(frame []byte) {
+	if t == nil || !t.active || t.seen {
+		return
+	}
+	if status, terminal := responsesFrameTerminalStatus(frame); terminal {
+		t.seen = true
+		t.status = status
+	}
+}
+
+// observeSource 只记录源协议自己的终态信号；error 可推翻先前的暂定成功，incomplete
+// 也可推翻 completed，避免多 choice 或迟到错误被第一个 finish_reason 掩盖。
+func (t *responsesTerminalTracker) observeSource(status, reason string) {
+	if t == nil || !t.active || sourceTerminalPriority(status) <= sourceTerminalPriority(t.sourceStatus) {
+		return
+	}
+	t.sourceStatus = status
+	t.sourceReason = reason
+}
+
+func (t *responsesTerminalTracker) translatedFrame(frame []byte) ([]byte, bool) {
+	if t == nil || !t.active {
+		return frame, true
+	}
+	status, terminal := responsesFrameTerminalStatus(frame)
+	if !terminal {
+		return frame, true
+	}
+	if status == "response.completed" && t.sourceStatus == "response.incomplete" {
+		return rewriteResponsesIncompleteFrame(frame, t.sourceReason)
+	}
+	return frame, sourceAuthorizesTranslatedTerminal(t.sourceStatus, status)
+}
+
+func (t *responsesTerminalTracker) allowsSourceTranslation(frame []byte) bool {
+	return t == nil || !t.active || !bytes.Equal(streamFrameData(frame), []byte("[DONE]")) ||
+		t.sourceStatus == "response.completed" || t.sourceStatus == "response.incomplete"
+}
+
+func (t *responsesTerminalTracker) missingTerminal() bool {
+	return t != nil && t.active && !t.seen
+}
+
+// terminalStatus 返回用于诊断日志的终态取值：观察到的事件类型，或者 tracker 已激活但
+// 还没有出现终态事件时返回 "missing"。tracker 未激活（非 Responses 输出协议）时
+// observed 为 false。
+func (t *responsesTerminalTracker) terminalStatus() (status string, observed bool) {
+	if t == nil || !t.active {
+		return "", false
+	}
+	if t.seen {
+		return t.status, true
+	}
+	return "missing", true
+}
+
+var responsesTerminalEventTypes = map[string]bool{
+	"response.completed":  true,
+	"response.incomplete": true,
+	"response.failed":     true,
+	"error":               true,
+}
+
+func responsesFrameTerminalStatus(frame []byte) (status string, terminal bool) {
+	data := streamFrameData(frame)
+	if len(data) == 0 {
+		return "", false
+	}
+	var event struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &event) != nil || !responsesTerminalEventTypes[event.Type] {
+		return "", false
+	}
+	return event.Type, true
+}
+
+func sourceFrameTerminalStatus(frame []byte, format string) (status, reason string, terminal bool) {
+	data := streamFrameData(frame)
+	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+		return "", "", false
+	}
+	if format == formatOpenAIResponse || format == string(sdktranslator.FormatCodex) {
+		if status, terminal := responsesFrameTerminalStatus(frame); terminal {
+			var event map[string]any
+			_ = json.Unmarshal(data, &event)
+			return status, responsesIncompleteReason(event), true
+		}
+		var event map[string]any
+		if json.Unmarshal(data, &event) == nil {
+			if errorValue, exists := event["error"]; exists && errorValue != nil {
+				return "error", "", true
+			}
+		}
+		return "", "", false
+	}
+	var event map[string]any
+	if json.Unmarshal(data, &event) != nil {
+		return "", "", false
+	}
+	switch format {
+	case formatOpenAI:
+		if errorValue, exists := event["error"]; exists && errorValue != nil {
+			return "error", "", true
+		}
+		bestStatus := ""
+		bestReason := ""
+		choices, _ := event["choices"].([]any)
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			choiceStatus, choiceReason, choiceTerminal := sourceStopReasonStatus(stringValue(choice["finish_reason"]), format)
+			if choiceTerminal && sourceTerminalPriority(choiceStatus) > sourceTerminalPriority(bestStatus) {
+				bestStatus = choiceStatus
+				bestReason = choiceReason
+			}
+		}
+		if bestStatus != "" {
+			return bestStatus, bestReason, true
+		}
+	case formatClaude:
+		switch stringValue(event["type"]) {
+		case "message_delta":
+			delta, _ := event["delta"].(map[string]any)
+			return sourceStopReasonStatus(stringValue(delta["stop_reason"]), format)
+		case "message_stop":
+			return "response.completed", "", true
+		case "message":
+			return sourceStopReasonStatus(stringValue(event["stop_reason"]), format)
+		case "error":
+			return "error", "", true
+		}
+	}
+	return "", "", false
+}
+
+func sourceNonStreamTerminalStatus(raw []byte, format string) (status, reason string, terminal bool) {
+	if status, reason, terminal := sourceFrameTerminalStatus(raw, format); terminal {
+		return status, reason, true
+	}
+	bestStatus := ""
+	bestReason := ""
+	for _, line := range bytes.Split(bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n")), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		lineStatus, lineReason, lineTerminal := sourceFrameTerminalStatus(line, format)
+		if lineTerminal && sourceTerminalPriority(lineStatus) > sourceTerminalPriority(bestStatus) {
+			bestStatus = lineStatus
+			bestReason = lineReason
+		}
+	}
+	return bestStatus, bestReason, bestStatus != ""
+}
+
+func sourceStopReasonStatus(rawReason, format string) (status, reason string, terminal bool) {
+	stopReason := strings.ToLower(strings.TrimSpace(rawReason))
+	if stopReason == "" {
+		return "", "", false
+	}
+	switch format {
+	case formatOpenAI:
+		switch stopReason {
+		case "length":
+			return "response.incomplete", "max_output_tokens", true
+		case "content_filter":
+			return "response.incomplete", "content_filter", true
+		}
+	case formatClaude:
+		if stopReason == "max_tokens" || stopReason == "model_context_window_exceeded" {
+			return "response.incomplete", "max_output_tokens", true
+		}
+	}
+	return "response.completed", "", true
+}
+
+func sourceTerminalPriority(status string) int {
+	switch status {
+	case "response.failed", "error":
+		return 3
+	case "response.incomplete":
+		return 2
+	case "response.completed":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func responsesIncompleteReason(event map[string]any) string {
+	response := event
+	if nested, ok := event["response"].(map[string]any); ok {
+		response = nested
+	}
+	details, _ := response["incomplete_details"].(map[string]any)
+	return strings.TrimSpace(stringValue(details["reason"]))
+}
+
+func rewriteResponsesIncompleteFrame(frame []byte, reason string) ([]byte, bool) {
+	var event map[string]any
+	if json.Unmarshal(streamFrameData(frame), &event) != nil || event == nil {
+		return nil, false
+	}
+	response, ok := event["response"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	event["type"] = "response.incomplete"
+	response["status"] = "incomplete"
+	response["incomplete_details"] = map[string]any{"reason": reason}
+	encoded, errMarshal := json.Marshal(event)
+	if errMarshal != nil {
+		return nil, false
+	}
+	return append([]byte("event: response.incomplete\ndata: "), encoded...), true
+}
+
+func sourceAuthorizesTranslatedTerminal(sourceStatus, translatedStatus string) bool {
+	switch translatedStatus {
+	case "response.completed":
+		return sourceStatus == "response.completed"
+	case "response.incomplete":
+		return sourceStatus == "response.incomplete"
+	case "response.failed", "error":
+		return sourceStatus == "response.failed" || sourceStatus == "error"
+	default:
+		return false
+	}
+}
+
+func streamFrameData(frame []byte) []byte {
+	if data := sseFrameData(frame); len(data) > 0 {
+		return data
+	}
+	return bytes.TrimSpace(frame)
+}
+
+// sseFrameData 提取一个 SSE frame 中所有 data: 行并按行拼接，兼容 passthrough 的裸
+// "data: {...}" 帧和 translated 路径的 "event: X\ndata: {...}" 帧。
+func sseFrameData(frame []byte) []byte {
+	lines := bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n"))
+	data := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			data = append(data, bytes.TrimSpace(line[len("data:"):]))
+		}
+	}
+	return bytes.Join(data, []byte("\n"))
+}
 
 func newStreamForwardError(reason, message string, benign bool) *streamForwardError {
 	return &streamForwardError{reason: reason, message: message, benign: benign}
@@ -225,12 +499,13 @@ func classifyStreamForwardError(err error) (reason, message string, benign bool)
 	return "unknown", err.Error(), false
 }
 
-func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string, maxBuffer int) error {
+func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
 	emitFrame := func(frame []byte) error {
 		if len(frame) == 0 {
 			return nil
 		}
+		tracker.observe(frame)
 		payload := make([]byte, 0, len(frame)+2)
 		payload = append(payload, frame...)
 		payload = append(payload, '\n', '\n')
@@ -262,14 +537,20 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 					return errEmit
 				}
 			}
+			// Responses 输出协议下，没有真实终态事件就结束是协议错误，绝不能伪造成功。
+			if tracker.missingTerminal() {
+				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
+			}
 			return nil
 		}
 	}
 }
 
-func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int) error {
+func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
 	var state any
+	requireResponsesSourceTerminal := prepared.upstreamFormat == formatOpenAIResponse
+	responsesSourceStatus := ""
 	original := prepared.request.OriginalRequest
 	if len(original) == 0 {
 		original = prepared.request.Payload
@@ -277,6 +558,19 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 	emitFrame := func(frame []byte) error {
 		normalized := normalizeSSEFrame(frame)
 		if len(normalized) == 0 {
+			return nil
+		}
+		sourceStatus, sourceReason, sourceTerminal := sourceFrameTerminalStatus(normalized, prepared.translatorFormat)
+		if sourceTerminal {
+			tracker.observeSource(sourceStatus, sourceReason)
+			if sourceStatus == "response.failed" || sourceStatus == "error" {
+				return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
+			}
+			if requireResponsesSourceTerminal {
+				responsesSourceStatus = sourceStatus
+			}
+		}
+		if !tracker.allowsSourceTranslation(normalized) {
 			return nil
 		}
 		outputs := sdktranslator.TranslateStream(
@@ -293,6 +587,11 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 			if len(output) == 0 {
 				continue
 			}
+			output, allowed := tracker.translatedFrame(output)
+			if !allowed {
+				continue
+			}
+			tracker.observe(output)
 			if errEmit := client.emit(pluginStreamID, output); errEmit != nil {
 				return newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 			}
@@ -321,6 +620,12 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 				if errEmit := emitFrame(tail); errEmit != nil {
 					return errEmit
 				}
+			}
+			if requireResponsesSourceTerminal && responsesSourceStatus == "" {
+				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
+			}
+			if tracker.missingTerminal() {
+				return newStreamForwardError(streamReasonMissingTerminal, "GitHub Copilot Responses stream ended without a terminal event", false)
 			}
 			return nil
 		}

@@ -431,3 +431,166 @@ func TestStoredModelsJSONContainsNoSessionOutsideStorageBoundary(t *testing.T) {
 		t.Fatalf("model route unexpectedly has credential field: %s", raw)
 	}
 }
+
+func TestParseDiscoveredModelsCapturesStreamingToolSearchAndContextEditing(t *testing.T) {
+	model := remoteModelFixture("gpt-5.4", true, "", true, []string{"/responses"})
+	supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
+	supports["streaming"] = true
+	supports["tool_search"] = true
+	supports["context_editing"] = true
+	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+	if errParse != nil || len(models) != 1 {
+		t.Fatalf("models = %#v, error = %v", models, errParse)
+	}
+	got := models[0]
+	if got.Streaming == nil || !*got.Streaming || got.SupportsToolSearch == nil || !*got.SupportsToolSearch ||
+		got.SupportsContextEditing == nil || !*got.SupportsContextEditing {
+		t.Fatalf("stored model = %#v", got)
+	}
+}
+
+func TestParseDiscoveredModelsDefaultsMissingOptionalCapabilitiesToDisabled(t *testing.T) {
+	model := remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"})
+	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+	if errParse != nil || len(models) != 1 {
+		t.Fatalf("models = %#v, error = %v", models, errParse)
+	}
+	got := models[0]
+	if got.SupportsToolSearch != nil || got.SupportsContextEditing != nil {
+		t.Fatalf("undeclared optional capabilities were not left disabled: %#v", got)
+	}
+}
+
+func TestModelInfosAdvertiseStreamOnlyWhenExplicitlySupported(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	for _, test := range []struct {
+		name      string
+		streaming *bool
+		want      bool
+	}{
+		{name: "true", streaming: &trueValue, want: true},
+		{name: "false", streaming: &falseValue},
+		{name: "omitted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			infos := modelInfos([]storedModel{{ID: "gpt-4.1", Format: formatOpenAI, Streaming: test.streaming}})
+			if len(infos) != 1 {
+				t.Fatalf("model infos = %#v", infos)
+			}
+			got := false
+			for _, parameter := range infos[0].SupportedParameters {
+				got = got || parameter == "stream"
+			}
+			if got != test.want {
+				t.Fatalf("stream advertised = %v, want %v; parameters=%v", got, test.want, infos[0].SupportedParameters)
+			}
+		})
+	}
+}
+
+func TestRouteForStoredModelCarriesRequestConstructionCapabilities(t *testing.T) {
+	toolSearch := true
+	contextEditing := false
+	streaming := true
+	model := storedModel{
+		ID: "custom-model-x", Format: formatOpenAI, Family: "custom-family",
+		MaxPromptTokens: 200_000, MaxOutputTokens: 32_000,
+		Streaming: &streaming, InputModalities: []string{"text", "image"},
+		ReasoningLevels:        []string{"low", "high"},
+		SupportsToolSearch:     &toolSearch,
+		SupportsContextEditing: &contextEditing,
+	}
+	route := routeForStoredModel(model)
+	if route.Family != "custom-family" || route.MaxPromptTokens != 200_000 || route.MaxOutputTokens != 32_000 ||
+		route.Streaming == nil || !*route.Streaming || !route.Vision ||
+		strings.Join(route.ReasoningLevels, ",") != "low,high" ||
+		route.SupportsToolSearch == nil || !*route.SupportsToolSearch ||
+		route.SupportsContextEditing == nil || *route.SupportsContextEditing {
+		t.Fatalf("route = %#v", route)
+	}
+}
+
+func TestStoredModelBackwardCompatibleWithoutNewCapabilityFields(t *testing.T) {
+	legacy := []byte(`{"id":"gpt-4.1","format":"openai"}`)
+	var model storedModel
+	if errUnmarshal := json.Unmarshal(legacy, &model); errUnmarshal != nil {
+		t.Fatalf("decode legacy stored model: %v", errUnmarshal)
+	}
+	if model.Streaming != nil || model.SupportsToolSearch != nil || model.SupportsContextEditing != nil {
+		t.Fatalf("legacy model unexpectedly populated new fields: %#v", model)
+	}
+}
+
+func TestModelsForAuthPropagatesCapabilitiesFromDiscoveryToRoute(t *testing.T) {
+	models := make([]any, 0, 3)
+	for _, test := range []struct {
+		id       string
+		declared bool
+		value    bool
+	}{
+		{id: "test-capability-true", declared: true, value: true},
+		{id: "test-capability-false", declared: true},
+		{id: "test-capability-omitted"},
+	} {
+		model := remoteModelFixture(test.id, true, "", true, []string{"/responses"})
+		supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
+		if test.declared {
+			supports["streaming"] = test.value
+			supports["tool_search"] = test.value
+			supports["context_editing"] = test.value
+		}
+		models = append(models, model)
+	}
+	raw := mustJSON(t, map[string]any{"data": models})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return pluginapi.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newPluginService(bridge)
+	config := service.loadedConfig()
+	config.EnableRemoteCompatibility = false
+	service.config = config
+	service.now = func() time.Time { return time.Unix(120_000, 0).UTC() }
+	storage := copilotStorage{
+		Type:                pluginIdentifier,
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	}
+	responseRaw, errModels := service.modelsForAuth(mustJSON(t, rpcAuthModelRequest{AuthModelRequest: pluginapi.AuthModelRequest{AuthID: "auth-caps", StorageJSON: mustJSON(t, storage)}}))
+	if errModels != nil {
+		t.Fatal(errModels)
+	}
+	result := decodePluginResult[pluginapi.ModelResponse](t, responseRaw)
+	if len(result.AuthUpdate.StorageJSON) == 0 {
+		t.Fatal("model discovery did not return persisted storage")
+	}
+	persisted, errStorage := decodeCopilotStorage(result.AuthUpdate.StorageJSON)
+	if errStorage != nil {
+		t.Fatal(errStorage)
+	}
+	freshService := newPluginService(nil)
+	for _, test := range []struct {
+		id       string
+		declared bool
+		value    bool
+	}{
+		{id: "test-capability-true", declared: true, value: true},
+		{id: "test-capability-false", declared: true},
+		{id: "test-capability-omitted"},
+	} {
+		route := freshService.resolveModelRoute("auth-caps", test.id, persisted)
+		if route.Family != "test-family" || route.MaxPromptTokens != 90000 || route.MaxOutputTokens != 10000 {
+			t.Fatalf("persisted route %s = %#v", test.id, route)
+		}
+		for name, capability := range map[string]*bool{
+			"streaming": route.Streaming, "tool_search": route.SupportsToolSearch, "context_editing": route.SupportsContextEditing,
+		} {
+			if !test.declared && capability != nil {
+				t.Fatalf("%s %s = %#v, want omitted", test.id, name, capability)
+			}
+			if test.declared && (capability == nil || *capability != test.value) {
+				t.Fatalf("%s %s = %#v, want %v", test.id, name, capability, test.value)
+			}
+		}
+	}
+}

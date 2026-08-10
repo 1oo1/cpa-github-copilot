@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -55,7 +57,45 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		return nil, failure
 	}
 	payload := append([]byte(nil), resp.Body...)
+	responsesSourceStatus := ""
+	if prepared.upstreamFormat == formatOpenAIResponse {
+		status, terminal := responsesNonStreamTerminalStatus(payload)
+		if !terminal || (prepared.translatorFormat != prepared.outputFormat && (status == "response.failed" || status == "error")) {
+			code := "upstream_protocol_error"
+			message := "GitHub Copilot Responses request ended without a terminal response"
+			if terminal {
+				code = "upstream_response_failed"
+				message = "GitHub Copilot Responses request failed"
+			}
+			failure = &pluginFailure{code: code, message: message, httpStatus: http.StatusBadGateway}
+			fields := preparedInferenceLogFields(prepared, false)
+			fields["responses_terminal_status"] = valueOr(status, "missing")
+			s.logFailure(req.HostCallbackID, "inference.failed", failure, fields)
+			return nil, failure
+		}
+		responsesSourceStatus = status
+	}
 	if prepared.translatorFormat != prepared.outputFormat {
+		sourceStatus := ""
+		sourceReason := ""
+		if prepared.upstreamFormat != formatOpenAIResponse && prepared.outputFormat == formatOpenAIResponse {
+			status, reason, terminal := sourceNonStreamTerminalStatus(payload, prepared.translatorFormat)
+			if !terminal || status == "response.failed" || status == "error" {
+				code := "upstream_protocol_error"
+				message := "GitHub Copilot response ended without a terminal status"
+				if terminal {
+					code = "upstream_response_failed"
+					message = "GitHub Copilot upstream response failed"
+				}
+				failure = &pluginFailure{code: code, message: message, httpStatus: http.StatusBadGateway}
+				fields := preparedInferenceLogFields(prepared, false)
+				fields["source_terminal_status"] = valueOr(status, "missing")
+				s.logFailure(req.HostCallbackID, "inference.failed", failure, fields)
+				return nil, failure
+			}
+			sourceStatus = status
+			sourceReason = reason
+		}
 		if !sdktranslator.HasNonStreamResponseTransformer(
 			sdktranslator.Format(prepared.outputFormat),
 			sdktranslator.Format(prepared.translatorFormat),
@@ -69,6 +109,8 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		translatorPayload := payload
 		if prepared.upstreamFormat == formatOpenAIResponse && prepared.translatorFormat == string(sdktranslator.FormatCodex) {
 			translatorPayload = wrapResponsesNonStreamEvent(payload)
+		} else if prepared.translatorFormat == formatClaude && prepared.outputFormat == formatOpenAIResponse {
+			translatorPayload = wrapClaudeNonStreamResponse(payload)
 		}
 		payload = sdktranslator.TranslateNonStream(
 			context.Background(),
@@ -83,11 +125,21 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		if len(payload) == 0 {
 			return nil, &pluginFailure{code: "format_mismatch", message: "GitHub Copilot response conversion produced no output"}
 		}
+		if sourceStatus == "response.incomplete" {
+			var rewritten bool
+			payload, rewritten = rewriteResponsesNonStreamIncomplete(payload, sourceReason)
+			if !rewritten {
+				return nil, &pluginFailure{code: "format_mismatch", message: "GitHub Copilot response conversion produced an invalid terminal response"}
+			}
+		}
 	}
 	headers := cloneResponseHeaders(resp.Headers, "application/json")
 	completedFields := preparedInferenceLogFields(prepared, false)
 	completedFields["upstream_status"] = resp.StatusCode
 	completedFields["output_bytes"] = len(payload)
+	if responsesSourceStatus != "" {
+		completedFields["responses_terminal_status"] = responsesSourceStatus
+	}
 	s.logEvent(req.HostCallbackID, "debug", "inference.completed", completedFields)
 	return okEnvelope(pluginapi.ExecutorResponse{
 		Payload: payload,
@@ -100,6 +152,11 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 }
 
 func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream bool) (preparedInference, *pluginFailure) {
+	// VS Code 1.132.0 没有独立 /responses/compact endpoint 的源码证据，GitHub Copilot 提供该
+	// endpoint 也无从证实；在发出 HTTP 请求前拒绝，不误发普通 /responses 也不臆造新 endpoint。
+	if strings.TrimSpace(req.Alt) == "responses/compact" {
+		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot does not support a separate Responses compaction endpoint", httpStatus: http.StatusNotImplemented}
+	}
 	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil || strings.TrimSpace(storage.GitHubAccessToken) == "" {
 		return preparedInference{}, &pluginFailure{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
@@ -133,11 +190,22 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if route.Path == "" || route.Format == "" {
 		return preparedInference{}, &pluginFailure{code: "model_not_supported", message: "GitHub Copilot model has no supported endpoint", httpStatus: http.StatusBadRequest}
 	}
+	if stream && !compatibilityBool(route.Streaming, false) {
+		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
+	}
 	payload := append([]byte(nil), req.Payload...)
 	if len(payload) == 0 || !json.Valid(payload) {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: "GitHub Copilot request payload must be a JSON object", httpStatus: http.StatusBadRequest}
 	}
 	translationTarget := translatorTargetFormat(route.Format, inputFormat)
+	// 带有 Responses stateful/opaque continuation 的请求只能在完全原生的 openai-response 链路上
+	// 无损传递；一旦涉及任何跨格式转换，就必须在发出 HTTP 请求前 fail closed，而不是依赖
+	// translator 碰巧保留这些字段。只在调用方本身就是 openai-response 协议时检查，避免和
+	// Anthropic/Chat 自身同名但语义不同的字段（例如 Anthropic 的 context_management）误判。
+	if inputFormat == formatOpenAIResponse && responsesStatefulMarkersPresent(payload) &&
+		(outputFormat != formatOpenAIResponse || route.Format != formatOpenAIResponse || translationTarget != formatOpenAIResponse) {
+		return preparedInference{}, &pluginFailure{code: "format_mismatch", message: "GitHub Copilot cannot preserve Responses stateful continuation across a cross-format request", httpStatus: http.StatusBadRequest}
+	}
 	if inputFormat != translationTarget {
 		if !sdktranslator.HasRequestTransformer(sdktranslator.Format(inputFormat), sdktranslator.Format(translationTarget)) {
 			return preparedInference{}, &pluginFailure{code: "format_mismatch", message: "GitHub Copilot request format cannot be converted", httpStatus: http.StatusBadRequest}
@@ -150,7 +218,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 			stream,
 		)
 	}
-	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream)
+	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream, s.loadedConfig().EnableResponsesContextManagement)
 	if errPrepare != nil {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: errPrepare.Error(), httpStatus: http.StatusBadRequest}
 	}
@@ -174,7 +242,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 		upstreamURL:      baseURL + route.Path,
 		upstreamPath:     route.Path,
 		upstreamPayload:  payload,
-		headers:          inferenceHeadersForRoute(storage.CopilotSessionToken, route, payload, req.Headers),
+		headers:          inferenceHeadersForRoute(storage.CopilotSessionToken, route, payload, req.Headers, outputFormat),
 	}, nil
 }
 
@@ -202,7 +270,7 @@ func inferenceRequestLogFields(req pluginapi.ExecutorRequest, stream bool, now t
 }
 
 func preparedInferenceLogFields(prepared preparedInference, stream bool) map[string]any {
-	return map[string]any{
+	fields := map[string]any{
 		"auth_id":            prepared.request.AuthID,
 		"model":              prepared.model,
 		"input_format":       prepared.inputFormat,
@@ -214,13 +282,48 @@ func preparedInferenceLogFields(prepared preparedInference, stream bool) map[str
 		"stream":             stream,
 		"upstream_bytes":     len(prepared.upstreamPayload),
 	}
+	// 只在原生 Responses 路由记录压缩诊断字段，不记录 prompt/tool 内容。
+	if prepared.upstreamFormat == formatOpenAIResponse {
+		if threshold, enabled := responsesCompactionThresholdFromPayload(prepared.upstreamPayload); enabled {
+			fields["responses_context_management_enabled"] = true
+			fields["responses_compact_threshold"] = threshold
+		} else {
+			fields["responses_context_management_enabled"] = false
+		}
+		original := prepared.request.OriginalRequest
+		if len(original) == 0 {
+			original = prepared.request.Payload
+		}
+		fields["responses_state_present"] = responsesStatefulMarkersPresent(original)
+	}
+	return fields
+}
+
+// responsesCompactionThresholdFromPayload 从最终上行 body 中读取 compaction 阈值，仅用于
+// 日志诊断，不影响请求语义。
+func responsesCompactionThresholdFromPayload(payload []byte) (threshold int64, enabled bool) {
+	var root struct {
+		ContextManagement []struct {
+			Type             string  `json:"type"`
+			CompactThreshold float64 `json:"compact_threshold"`
+		} `json:"context_management"`
+	}
+	if json.Unmarshal(payload, &root) != nil {
+		return 0, false
+	}
+	for _, item := range root.ContextManagement {
+		if item.Type == "compaction" {
+			return int64(item.CompactThreshold), true
+		}
+	}
+	return 0, false
 }
 
 func normalizeInferencePayload(raw []byte, model, format string, stream, supportsAdaptiveThinking bool) ([]byte, error) {
-	return normalizeInferencePayloadForRoute(raw, model, modelRoute{Format: format, AdaptiveThinking: supportsAdaptiveThinking}, stream)
+	return normalizeInferencePayloadForRoute(raw, model, modelRoute{Format: format, AdaptiveThinking: supportsAdaptiveThinking}, stream, true)
 }
 
-func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRoute, stream bool) ([]byte, error) {
+func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRoute, stream bool, responsesContextManagementEnabled bool) ([]byte, error) {
 	var payload map[string]any
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil || payload == nil {
 		return nil, fmt.Errorf("GitHub Copilot request payload must be a JSON object")
@@ -228,7 +331,7 @@ func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRout
 	payload["model"] = model
 	payload["stream"] = stream
 	if route.Format == formatOpenAI {
-		normalizeOpenAICompatibility(payload)
+		normalizeOpenAICompatibility(payload, route)
 	}
 	if route.Format == formatClaude {
 		if _, exists := payload["max_tokens"]; !exists {
@@ -238,7 +341,7 @@ func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRout
 		normalizeAnthropicPayloadForRoute(payload, model, route)
 	}
 	if route.Format == formatOpenAIResponse {
-		normalizeOpenAIResponsesCompatibility(payload, model)
+		normalizeOpenAIResponsesCompatibility(payload, model, route, responsesContextManagementEnabled)
 	}
 	out, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
@@ -247,11 +350,52 @@ func normalizeInferencePayloadForRoute(raw []byte, model string, route modelRout
 	return out, nil
 }
 
-func normalizeOpenAICompatibility(payload map[string]any) bool {
+// responsesStatefulMarkersPresent 报告请求中是否携带客户端管理的 Responses 状态：
+// previous_response_id、context_management 或 input 中的 compaction/encrypted reasoning item。
+func responsesStatefulMarkersPresent(raw []byte) bool {
+	var root struct {
+		PreviousResponseID string            `json:"previous_response_id"`
+		ContextManagement  json.RawMessage   `json:"context_management"`
+		Input              []json.RawMessage `json:"input"`
+	}
+	if json.Unmarshal(raw, &root) != nil {
+		return false
+	}
+	if strings.TrimSpace(root.PreviousResponseID) != "" {
+		return true
+	}
+	if trimmed := strings.TrimSpace(string(root.ContextManagement)); trimmed != "" && trimmed != "null" {
+		return true
+	}
+	for _, rawItem := range root.Input {
+		var item struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+		}
+		if json.Unmarshal(rawItem, &item) != nil {
+			continue
+		}
+		if item.Type == "compaction" {
+			return true
+		}
+		if item.Type == "reasoning" && strings.TrimSpace(item.EncryptedContent) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeOpenAICompatibility(payload map[string]any, route modelRoute) bool {
 	changed := false
-	for _, field := range []string{"store", "reasoning_effort"} {
-		if _, exists := payload[field]; exists {
-			delete(payload, field)
+	if _, exists := payload["store"]; exists {
+		delete(payload, "store")
+		changed = true
+	}
+	// 只保留 route 声明过的 reasoning_effort 取值，不支持的值一律删除，避免未声明
+	// reasoning 能力的模型收到无法识别的字段。
+	if effort, exists := payload["reasoning_effort"]; exists {
+		if !declaresReasoningLevel(route.ReasoningLevels, stringValue(effort)) {
+			delete(payload, "reasoning_effort")
 			changed = true
 		}
 	}
@@ -267,7 +411,37 @@ func normalizeOpenAICompatibility(payload map[string]any) bool {
 	return changed
 }
 
-func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string) bool {
+func declaresReasoningLevel(levels []string, value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false
+	}
+	for _, level := range levels {
+		if strings.EqualFold(level, value) {
+			return true
+		}
+	}
+	return false
+}
+
+// responsesContextManagementExcludedFamilies 是 VS Code 1.132.0 源码证明的排除集合
+// （openai.ts modelsWithoutResponsesContextManagement）。
+var responsesContextManagementExcludedFamilies = map[string]bool{
+	"gpt-5":   true,
+	"gpt-5.1": true,
+	"gpt-5.2": true,
+}
+
+// responsesCompactionThreshold 计算 VS Code feature-on 行为使用的 compaction 阈值：
+// floor(0.9 * max prompt tokens)，没有有效 prompt window 时回退到 50000。
+func responsesCompactionThreshold(route modelRoute) int64 {
+	if route.MaxPromptTokens > 0 {
+		return route.MaxPromptTokens * 9 / 10
+	}
+	return 50000
+}
+
+func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string, route modelRoute, contextManagementEnabled bool) bool {
 	changed := payload["store"] != false
 	payload["store"] = false
 	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
@@ -279,6 +453,25 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, model string)
 			reasoning["effort"] = "low"
 			changed = true
 		}
+	}
+	// truncation/include 只在缺失时补齐 VS Code feature-on 默认值，保留有效 caller 值。
+	if _, exists := payload["truncation"]; !exists {
+		payload["truncation"] = "disabled"
+		changed = true
+	}
+	if _, exists := payload["include"]; !exists {
+		payload["include"] = []any{"reasoning.encrypted_content"}
+		changed = true
+	}
+	// context_management 只在缺失时按 90% max prompt tokens 补齐，已有 caller 值则逐字保留。
+	family := strings.ToLower(strings.TrimSpace(route.Family))
+	if _, exists := payload["context_management"]; !exists && contextManagementEnabled && family != "" &&
+		!responsesContextManagementExcludedFamilies[family] {
+		payload["context_management"] = []any{map[string]any{
+			"type":              "compaction",
+			"compact_threshold": responsesCompactionThreshold(route),
+		}}
+		changed = true
 	}
 	return changed
 }
@@ -623,10 +816,6 @@ func usesAnthropicBudgetThinking(model string) bool {
 	}
 }
 
-func usesAnthropicLegacyCompatibility(model string) bool {
-	return usesAnthropicBudgetThinking(model) || !supportsAnthropicEagerToolInputStreaming(model)
-}
-
 type anthropicCompatibility struct {
 	adaptiveThinking                bool
 	supportsTemperature             bool
@@ -672,21 +861,229 @@ func wrapResponsesNonStreamEvent(raw []byte) []byte {
 	if json.Unmarshal(raw, &response) != nil || response == nil {
 		return raw
 	}
-	if responseType, _ := response["type"].(string); responseType == "response.completed" || responseType == "response.incomplete" {
+	if responseType := stringValue(response["type"]); responseType != "" {
 		return raw
 	}
 	if object, _ := response["object"].(string); object != "response" {
 		return raw
 	}
-	eventType := "response.completed"
-	if status, _ := response["status"].(string); status == "incomplete" || status == "failed" {
-		eventType = "response.incomplete"
+	eventType, terminal := responsesNonStreamTerminalStatus(raw)
+	if !terminal || eventType == "response.failed" || eventType == "error" {
+		return raw
 	}
 	wrapper, errMarshal := json.Marshal(map[string]any{"type": eventType, "response": response})
 	if errMarshal != nil {
 		return raw
 	}
 	return wrapper
+}
+
+func wrapClaudeNonStreamResponse(raw []byte) []byte {
+	var message map[string]any
+	if json.Unmarshal(raw, &message) != nil || stringValue(message["type"]) != "message" {
+		return raw
+	}
+	events := []map[string]any{{"type": "message_start", "message": message}}
+	content, _ := message["content"].([]any)
+	for index, rawBlock := range content {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			continue
+		}
+		events = append(events, map[string]any{"type": "content_block_start", "index": index, "content_block": block})
+		switch stringValue(block["type"]) {
+		case "text":
+			events = append(events, map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": stringValue(block["text"])}})
+			citations, _ := block["citations"].([]any)
+			for _, citation := range citations {
+				events = append(events, map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "citations_delta", "citation": citation}})
+			}
+		case "tool_use":
+			input := []byte(`{}`)
+			if value, exists := block["input"]; exists && value != nil {
+				if encoded, errMarshal := json.Marshal(value); errMarshal == nil {
+					input = encoded
+				}
+			}
+			events = append(events, map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(input)}})
+		case "thinking":
+			events = append(events, map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "thinking_delta", "thinking": stringValue(block["thinking"])}})
+		}
+		events = append(events, map[string]any{"type": "content_block_stop", "index": index})
+	}
+	events = append(events,
+		map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": message["stop_reason"], "stop_sequence": message["stop_sequence"]}},
+		map[string]any{"type": "message_stop"},
+	)
+	var wrapped []byte
+	for _, event := range events {
+		encoded, errMarshal := json.Marshal(event)
+		if errMarshal != nil {
+			return raw
+		}
+		wrapped = append(wrapped, "data: "...)
+		wrapped = append(wrapped, encoded...)
+		wrapped = append(wrapped, '\n')
+	}
+	return wrapped
+}
+
+func rewriteResponsesNonStreamIncomplete(raw []byte, reason string) ([]byte, bool) {
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil || root == nil {
+		return nil, false
+	}
+	response := root
+	if nested, ok := root["response"].(map[string]any); ok {
+		response = nested
+	} else if stringValue(root["object"]) != "response" {
+		return nil, false
+	}
+	if _, exists := root["type"]; exists {
+		root["type"] = "response.incomplete"
+	}
+	response["status"] = "incomplete"
+	response["incomplete_details"] = map[string]any{"reason": reason}
+	encoded, errMarshal := json.Marshal(root)
+	return encoded, errMarshal == nil
+}
+
+func responsesNonStreamTerminalStatus(raw []byte) (string, bool) {
+	if !hasUniqueJSONFieldNames(raw) {
+		return "", false
+	}
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil || root == nil {
+		return "", false
+	}
+	if typeValue, hasType := root["type"]; hasType {
+		eventType, ok := typeValue.(string)
+		if !ok {
+			return "", false
+		}
+		if eventType == "error" {
+			if !hasAnyField(root, "response", "object", "status") && nonEmptyErrorObject(root["error"]) {
+				return "error", true
+			}
+			return "", false
+		}
+		if eventType == "response.completed" || eventType == "response.incomplete" || eventType == "response.failed" {
+			if hasAnyField(root, "object", "status", "error") {
+				return "", false
+			}
+			response, ok := root["response"].(map[string]any)
+			if !ok {
+				return "", false
+			}
+			status, terminal := responsesObjectTerminalStatus(response)
+			if terminal && status == eventType {
+				return eventType, true
+			}
+			return "", false
+		}
+		return "", false
+	}
+	if _, hasError := root["error"]; hasError {
+		if _, hasObject := root["object"]; !hasObject {
+			if !hasAnyField(root, "response", "status") && nonEmptyErrorObject(root["error"]) {
+				return "error", true
+			}
+			return "", false
+		}
+	}
+	return responsesObjectTerminalStatus(root)
+}
+
+func hasUniqueJSONFieldNames(raw []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if consumeUniqueJSONValue(decoder) != nil {
+		return false
+	}
+	_, errToken := decoder.Token()
+	return errToken == io.EOF
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder) error {
+	token, errToken := decoder.Token()
+	if errToken != nil {
+		return errToken
+	}
+	delimiter, compound := token.(json.Delim)
+	if !compound {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		fields := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, errKey := decoder.Token()
+			if errKey != nil {
+				return errKey
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("invalid JSON object key")
+			}
+			if _, duplicate := fields[key]; duplicate {
+				return fmt.Errorf("duplicate JSON object key")
+			}
+			fields[key] = struct{}{}
+			if errValue := consumeUniqueJSONValue(decoder); errValue != nil {
+				return errValue
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if errValue := consumeUniqueJSONValue(decoder); errValue != nil {
+				return errValue
+			}
+		}
+	default:
+		return fmt.Errorf("invalid JSON delimiter")
+	}
+	_, errToken = decoder.Token()
+	return errToken
+}
+
+func nonEmptyErrorObject(value any) bool {
+	errorObject, ok := value.(map[string]any)
+	return ok && len(errorObject) > 0
+}
+
+func hasAnyField(value map[string]any, fields ...string) bool {
+	for _, field := range fields {
+		if _, exists := value[field]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesObjectTerminalStatus(response map[string]any) (string, bool) {
+	object, objectOK := response["object"].(string)
+	status, statusOK := response["status"].(string)
+	if !objectOK || object != "response" || !statusOK || hasAnyField(response, "type") {
+		return "", false
+	}
+	errorValue, hasError := response["error"]
+	incompleteDetails, hasIncompleteDetails := response["incomplete_details"]
+	switch status {
+	case "completed":
+		if (!hasError || errorValue == nil) && (!hasIncompleteDetails || incompleteDetails == nil) {
+			return "response.completed", true
+		}
+	case "incomplete":
+		details, ok := incompleteDetails.(map[string]any)
+		reason, reasonOK := details["reason"].(string)
+		if ok && reasonOK && (reason == "max_output_tokens" || reason == "content_filter") && (!hasError || errorValue == nil) {
+			return "response.incomplete", true
+		}
+	case "failed":
+		if nonEmptyErrorObject(errorValue) && (!hasIncompleteDetails || incompleteDetails == nil) {
+			return "response.failed", true
+		}
+	}
+	return "", false
 }
 
 func normalizeModelID(raw string) string {
@@ -761,18 +1158,63 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "origin_validation"})
 		return nil, failure
 	}
+	endpointFormat, compactEndpoint, exactEndpoint := classifyInferenceEndpoint(req.URL)
+	if endpointFormat != "" && !exactEndpoint {
+		failure := &pluginFailure{code: "invalid_request", message: "GitHub Copilot inference HTTP request path must be canonical", httpStatus: http.StatusBadRequest}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return nil, failure
+	}
+	if compactEndpoint {
+		failure := &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot does not support a separate Responses compaction endpoint", httpStatus: http.StatusNotImplemented}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return nil, failure
+	}
+	if endpointFormat != "" && req.URL != baseURL+endpointPath(endpointFormat) {
+		failure := &pluginFailure{code: "invalid_request", message: "GitHub Copilot inference HTTP request must target the exact credential endpoint", httpStatus: http.StatusBadRequest}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return nil, failure
+	}
+	if endpointFormat != "" && req.Method != http.MethodPost {
+		failure := &pluginFailure{code: "invalid_request", message: "GitHub Copilot inference HTTP requests must use POST", httpStatus: http.StatusBadRequest}
+		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "method_validation"})
+		return nil, failure
+	}
 	model := modelFromPayload(req.Body)
-	route := s.resolveModelRoute("", model, storage)
+	route := s.resolveModelRoute(req.AuthID, model, storage)
 	format := route.Format
 	if format == "" {
 		format = inferModelFormat(model)
 		route.Format = format
 	}
 	body := append([]byte(nil), req.Body...)
-	if format == formatClaude {
-		body = normalizeAnthropicPayloadBytesForRoute(body, model, route)
+	requestedStream := false
+	if endpointFormat != "" {
+		if model == "" {
+			failure := &pluginFailure{code: "invalid_request", message: "GitHub Copilot request is missing model", httpStatus: http.StatusBadRequest}
+			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation"})
+			return nil, failure
+		}
+		if route.Path == "" || route.Format != endpointFormat || route.Path != endpointPath(endpointFormat) {
+			failure := &pluginFailure{code: "model_not_supported", message: "GitHub Copilot model does not support the requested endpoint", httpStatus: http.StatusBadRequest}
+			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "route_validation", "model": model})
+			return nil, failure
+		}
+		requestedStream = streamRequested(body)
+		if requestedStream && !compatibilityBool(route.Streaming, false) {
+			failure := &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
+			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "capability_validation", "model": model})
+			return nil, failure
+		}
+		var errNormalize error
+		body, errNormalize = normalizeInferencePayloadForRoute(body, model, route, requestedStream, s.loadedConfig().EnableResponsesContextManagement)
+		if errNormalize != nil {
+			failure := &pluginFailure{code: "invalid_request", message: errNormalize.Error(), httpStatus: http.StatusBadRequest}
+			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation", "model": model})
+			return nil, failure
+		}
+		format = endpointFormat
 	}
-	headers := inferenceHeadersForRoute(storage.CopilotSessionToken, route, body, req.Headers)
+	headers := inferenceHeadersForRoute(storage.CopilotSessionToken, route, body, req.Headers, format)
 	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(pluginapi.HTTPRequest{
 		Method:  valueOr(strings.TrimSpace(req.Method), http.MethodPost),
 		URL:     req.URL,
@@ -783,6 +1225,19 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 		failure := &pluginFailure{code: "upstream_network_error", message: "GitHub Copilot HTTP request failed", retryable: true, httpStatus: http.StatusBadGateway}
 		s.logFailure(req.HostCallbackID, "http_request.failed", failure, map[string]any{"model": model})
 		return nil, failure
+	}
+	if endpointFormat == formatOpenAIResponse && !requestedStream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		status, terminal := responsesNonStreamTerminalStatus(resp.Body)
+		if !terminal {
+			failure := &pluginFailure{code: "upstream_protocol_error", message: "GitHub Copilot Responses request ended without a terminal response", httpStatus: http.StatusBadGateway}
+			s.logFailure(req.HostCallbackID, "http_request.failed", failure, map[string]any{
+				"model":                     model,
+				"upstream_format":           format,
+				"upstream_status":           resp.StatusCode,
+				"responses_terminal_status": valueOr(status, "missing"),
+			})
+			return nil, failure
+		}
 	}
 	s.logEvent(req.HostCallbackID, "debug", "http_request.completed", map[string]any{
 		"model":           model,
@@ -795,4 +1250,11 @@ func (s *pluginService) executeHTTPRequest(raw []byte) ([]byte, error) {
 		Headers:    cloneResponseHeaders(resp.Headers, "application/json"),
 		Body:       append([]byte(nil), resp.Body...),
 	})
+}
+
+func streamRequested(raw []byte) bool {
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(raw, &payload) == nil && payload.Stream
 }

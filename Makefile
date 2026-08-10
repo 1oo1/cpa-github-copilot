@@ -98,7 +98,7 @@ vet:
 
 integration: clean
 	$(MAKE) _build-native
-	CPA_PLUGIN_INTEGRATION_BINARY=$(NATIVE_PLUGIN) CPA_PLUGIN_INTEGRATION_VERSION=$(VERSION) $(GO) test -run '^TestBuiltPluginLoadsInCLIProxyHost$$' ./src
+	CPA_PLUGIN_INTEGRATION_BINARY=$(NATIVE_PLUGIN) CPA_PLUGIN_INTEGRATION_VERSION=$(VERSION) $(GO) test -run '^TestBuiltPluginRunsInCLIProxyHost$$' ./src
 
 clean:
 	rm -rf $(BIN_DIR)

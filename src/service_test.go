@@ -31,7 +31,8 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 	}
 	config := service.loadedConfig()
 	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels ||
-		!config.EnableRemoteCompatibility || config.RemoteCompatibilityCacheTTL != 4*60*60 {
+		!config.EnableRemoteCompatibility || config.RemoteCompatibilityCacheTTL != 4*60*60 ||
+		!config.EnableResponsesContextManagement {
 		t.Fatalf("default config = %#v", config)
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {
