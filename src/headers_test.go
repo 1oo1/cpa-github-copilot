@@ -148,6 +148,28 @@ func TestInferenceHeadersRequestCorrelation(t *testing.T) {
 	}
 }
 
+func TestInferenceHeadersMapOpenAIClientRequestID(t *testing.T) {
+	clientRequestID := "3a23a4b5-6c7d-4e8f-9012-3456789abcde"
+	callerInteractionID := "6b1b6c8e-2e77-4a25-9f0f-8f6a6d1e2b3a"
+	headers := inferenceHeaders("session", formatOpenAI, []byte(`{}`), http.Header{
+		"X-Client-Request-Id": []string{clientRequestID},
+		"X-Interaction-Id":    []string{callerInteractionID},
+	})
+	if headers.Get("X-Request-Id") != clientRequestID || headers.Get("X-Agent-Task-Id") != clientRequestID {
+		t.Fatalf("OpenAI client request ID was not mapped to Copilot request headers: %#v", headers)
+	}
+	if headers.Get("X-Interaction-Id") != callerInteractionID {
+		t.Fatalf("X-Interaction-Id = %q, want explicit caller value %q", headers.Get("X-Interaction-Id"), callerInteractionID)
+	}
+
+	invalid := inferenceHeaders("session", formatOpenAI, []byte(`{}`), http.Header{
+		"X-Client-Request-Id": []string{"codex-trace-123"},
+	})
+	if !testUUIDPattern.MatchString(invalid.Get("X-Request-Id")) || invalid.Get("X-Agent-Task-Id") != invalid.Get("X-Request-Id") {
+		t.Fatalf("invalid OpenAI client request ID did not fall back to a generated Copilot UUID: %#v", invalid)
+	}
+}
+
 func TestInferenceHeadersRestrictInteractionTypeVocabulary(t *testing.T) {
 	for _, test := range []struct {
 		name         string

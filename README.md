@@ -39,6 +39,14 @@ GitHub Device Flow
 - Responses continuation 由客户端管理；插件不保存 history，只保证原生路径 opaque
   state 无损，并在跨格式可能丢失 state 时提前拒绝。
 
+### OpenAI 请求关联 header
+
+插件识别 OpenAI 的 `X-Client-Request-Id`。当其值为 UUID 时，插件将其转换为上游的
+`X-Request-Id` 和 `X-Agent-Task-Id`；调用方显式提供的合法 `X-Interaction-Id` 仍有更高
+优先级。非 UUID 值不会透传，以保持 GitHub Copilot/VS Code 请求关联字段的 UUID 契约，
+而是回退为插件生成的 UUID。`OpenAI-Organization`、`OpenAI-Project` 与调用方的
+`Authorization` 不会转发到 GitHub Copilot。
+
 ## 前置条件
 
 - 运行：兼容当前 ABI/translator 的 CLIProxyAPI v7，以及有效的 Copilot 订阅。

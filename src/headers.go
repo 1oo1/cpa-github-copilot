@@ -77,6 +77,9 @@ func inferenceHeadersForRoute(sessionToken string, route modelRoute, payload []b
 	headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
 
 	requestID := newRequestID()
+	if candidate := strings.TrimSpace(caller.Get("X-Client-Request-Id")); looksLikeUUID(candidate) {
+		requestID = candidate
+	}
 	headers.Set("X-Request-Id", requestID)
 	headers.Set("X-Agent-Task-Id", requestID)
 	interactionID := requestID
