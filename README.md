@@ -1,63 +1,31 @@
 # CLIProxyAPI GitHub Copilot Plugin
 
 Go `c-shared` 插件，将 GitHub Copilot 订阅作为 CLIProxyAPI v7 的账户级 OAuth
-provider `github-copilot` 接入；插件配置 ID 为 `github-copilot-go`。
+provider `github-copilot` 接入；配置 ID 为 `github-copilot-go`。
 
-| 客户端入口 | 路径 |
+| 客户端 API | 路径 |
 |---|---|
 | OpenAI Chat Completions | `/v1/chat/completions` |
 | OpenAI Responses | `/v1/responses` |
 | Anthropic Messages | `/v1/messages` |
 
-插件按账号 `/models.supported_endpoints` 选择真实上游协议；入口与上游不一致时，
-使用 CLIProxyAPI translator 转换请求、非流式响应和 SSE 流。
+插件根据当前账户的 Copilot 模型目录选择上游协议，必要时调用 CLIProxyAPI
+translator 转换请求与响应。HTTP wire 基线固定为 VS Code `1.132.0`、Copilot Chat
+`0.60.0`、`@vscode/copilot-api@0.4.3` 和 API version `2026-06-01`；`pi` 只用于
+旧凭据兼容。
 
-当前 HTTP wire 基线为 VS Code `1.132.0`、Copilot Chat `0.60.0`、
-`@vscode/copilot-api@0.4.3` 和最终 API version `2026-06-01`。`pi` 不再作为请求实现
-参考，只在读取旧凭据字段时保留兼容。
-
-> Copilot token broker 和模型接口不是面向通用第三方客户端的稳定公共 API，可能
-> 随 GitHub 服务变化。使用前请确认符合订阅条款和组织策略。
-
-## 工作方式
-
-```text
-GitHub Device Flow
-  -> GitHub access token（长期）
-  -> Copilot token broker
-  -> Copilot session token（短期，到期前 10 分钟刷新）
-  -> 账号 /models
-  -> /chat/completions | /responses | /v1/messages
-```
-
-- 同时提供 `auth_provider`、`model_provider` 和 OAuth `executor`。
-- 模型目录按 picker、policy、tool calls 和可路由 endpoint 过滤；Individual 账号同时
-  接受 picker 模型和 enabled policy 模型，Business 账号保持严格 picker 策略。
-- session 刷新成功但 `/models` 暂时失败时，保留新 session 和旧模型状态。
-- 所有 GitHub/Copilot HTTP 与流请求都经过 `host.http.*`；token 仅进入
-  provider-owned `StorageJSON` 和上游 Authorization。
-- Responses continuation 由客户端管理；插件不保存 history，只保证原生路径 opaque
-  state 无损，并在跨格式可能丢失 state 时提前拒绝。
-
-### OpenAI 请求关联 header
-
-插件识别 OpenAI 的 `X-Client-Request-Id`。当其值为 UUID 时，插件将其转换为上游的
-`X-Request-Id` 和 `X-Agent-Task-Id`；调用方显式提供的合法 `X-Interaction-Id` 仍有更高
-优先级。非 UUID 值不会透传，以保持 GitHub Copilot/VS Code 请求关联字段的 UUID 契约，
-而是回退为插件生成的 UUID。`OpenAI-Organization`、`OpenAI-Project` 与调用方的
-`Authorization` 不会转发到 GitHub Copilot。
+> Copilot token broker 和模型接口不是稳定的通用第三方 API。使用前请确认符合订阅
+> 条款和组织策略。
 
 ## 前置条件
 
-- 运行：兼容当前 ABI/translator 的 CLIProxyAPI v7，以及有效的 Copilot 订阅。
-- 源码构建：Go 1.26+、CGO 和 C 编译器；构建 Linux 双架构还需对应交叉编译器或 Docker。
-- 本仓库与 CLIProxyAPI 源码相邻；`go.mod` 通过 `replace` 引用 `../CLIProxyAPI`。
+- 兼容当前 ABI/translator 的 CLIProxyAPI v7；
+- 有效的 GitHub Copilot 订阅；
+- 源码构建需要 Go 1.26+、CGO、C 编译器及相邻的 `../CLIProxyAPI` checkout。
 
 ## 安装
 
-### Plugin Store（推荐）
-
-将本仓库的 [registry.json](registry.json) 加入 CLIProxyAPI Store source：
+推荐将本仓库的 [registry.json](registry.json) 加入 CLIProxyAPI Plugin Store：
 
 ```yaml
 plugins:
@@ -71,7 +39,7 @@ plugins:
       priority: 100
 ```
 
-重载后可在 Management Center 安装 `GitHub Copilot`，或调用 Management API：
+重载后在 Management Center 安装 `GitHub Copilot`，或调用：
 
 ```bash
 curl -X POST \
@@ -79,69 +47,42 @@ curl -X POST \
   "http://127.0.0.1:<PORT>/v0/management/plugin-store/github-copilot-go/install"
 ```
 
-追加 `?version=0.1.5` 可安装指定版本（版本号不带 `v`）。Store 会把产物写入
-`plugins.dir/<goos>/<goarch>/`、记录版本并接管后续更新；既有手工安装也应通过
-Store 安装一次，确认版本化文件生效后再删除旧的无版本动态库。
-
-### 源码构建与手工安装
-
-```bash
-make test          # 单元与契约测试
-make vet           # 静态检查
-make build         # Linux amd64 + arm64
-make integration   # 本机 c-shared 产物 + 真实 CPA loader
-```
-
-`make build` 每次先清空 `bin/`，生成 `bin/linux/{amd64,arm64}/github-copilot-go.so`；
-也可使用 `make build-linux-amd64`、`make build-linux-arm64` 或 `make build-native`。
-Linux 交叉编译器不可用时自动回退到 Docker；可通过 `LINUX_*_CC`、
-`DOCKER_GO_IMAGE` 和 `VERSION` 覆盖默认值。
-
-手工安装时，将动态库放入 `plugins.dir` 或对应平台子目录。文件名决定配置 ID，
-默认产物对应 `github-copilot-go`。
+追加 `?version=X.Y.Z` 可安装指定版本（不带 `v`）。手工安装时运行 `make build`，
+再把生成的动态库放入 `plugins.dir` 对应平台目录；准确产物路径和可覆盖变量以
+[Makefile](Makefile) 为准。
 
 ## 配置
 
-Store 与手工安装共用 `plugins.configs.github-copilot-go`。除 `enabled`、`priority`
-外，可配置：
+Store 与手工安装共用 `plugins.configs.github-copilot-go`：
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
 | `client_id` | `Iv1.b507a08c87ecfe98` | Device Flow public client ID，不是 secret |
-| `github_host` | `github.com` | GitHub.com 或管理员信任的 GitHub Enterprise 主机名 |
+| `github_host` | `github.com` | GitHub.com 或受信任的 GitHub Enterprise 主机名 |
 | `enable_models` | `true` | 登录后 best-effort 启用已知模型 policy |
-| `model_cache_ttl_seconds` | `300` | 非空账号模型目录的复用时间；`0` 表示每次发现都刷新 |
-| `max_stream_buffer_bytes` | `4194304` | 未完成 SSE 事件的缓存上限；允许 64 KiB 到 64 MiB |
-| `enable_responses_context_management` | `true` | 为 eligible 原生 Responses 模型缺省启用服务端 compaction |
+| `model_cache_ttl_seconds` | `300` | 非空账户模型目录缓存秒数；`0` 表示每次刷新 |
+| `max_stream_buffer_bytes` | `4194304` | 未完成 SSE event 的缓存上限，范围 64 KiB–64 MiB |
+| `enable_responses_context_management` | `true` | 为符合条件的原生 Responses 请求启用服务端 compaction |
 
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
-fragment 或 IP；同时需要该实例可用的 OAuth public client ID。
+fragment 或 IP，并需要该实例可用的 OAuth public client ID。
 
 ## 登录与调用
 
-启用插件并启动 CLIProxyAPI 后，使用现有 Management API 认证访问：
+启用插件并启动 CLIProxyAPI 后，通过 Management API 发起 Device Flow：
 
 ```http
 GET /v0/management/github-copilot-auth-url
 ```
 
-响应包含预填 `user_code` 的 `url` 和 `state`。完成 GitHub 授权后轮询：
+完成响应中 `url` 指向的 GitHub 授权，再轮询：
 
 ```http
 GET /v0/management/get-auth-status?state=<state>
 ```
 
-Device Flow 支持首次等待、`authorization_pending`、两种 `slow_down`、过期和拒绝；
-成功后宿主保存 `github-copilot-<login>.json`。随后使用 CLIProxyAPI 原有鉴权访问：
-
-```http
-GET /v1/models
-POST /v1/chat/completions
-POST /v1/responses
-POST /v1/messages
-```
-
-Chat Completions 请求示例；模型 ID 应来自当前账号的 `/v1/models`：
+成功后，使用 CLIProxyAPI 原有鉴权访问 `/v1/models` 和上表三个推理端点。模型 ID
+应来自当前账户的 `/v1/models`：
 
 ```json
 {
@@ -151,68 +92,45 @@ Chat Completions 请求示例；模型 ID 应来自当前账号的 `/v1/models`�
 }
 ```
 
-插件按模型能力选择上游并在必要时跨协议转换；客户端 header 不能覆盖 Copilot
-Authorization。
+## 客户端契约与限制
 
-### Responses 状态与终态
-
-原生 Responses 请求缺省发送 `store:false`、`truncation:disabled` 和
-`include:["reasoning.encrypted_content"]`。启用 context management 时，eligible 模型的
-compaction threshold 是 prompt window 的 90%，window 缺失时回退 `50000`；caller 已提供
-合法 `context_management` 时不会被覆盖。
-
-插件保持 stateless。`previous_response_id`、compaction item 和 encrypted reasoning 由客户端
-保存并在下一轮提交；插件原样运输这些值，但含 opaque state 的跨格式请求返回
-`format_mismatch`，不会尝试有损转换。独立 `/v1/responses/compact` 没有 pinned Copilot
-provider 证据，当前明确返回 `unsupported_feature`；应使用 `/v1/responses` 的 inline
-`context_management`。
-
-Responses 输出必须出现真实 `response.completed`、`response.incomplete`、
-`response.failed` 或 `error`。无终态 EOF、`in_progress`、矛盾 event wrapper、malformed JSON
-和重复 JSON member 都是协议错误；插件不会合成 completed 或可复用 response ID。Chat/Claude
-转 Responses 时，truncation 会保留为 authoritative incomplete reason，late error 优先于早先
-finish。
+- 插件不保存 conversation history。Responses 客户端负责保存并重交
+  `previous_response_id`、compaction item 和 encrypted reasoning；包含 opaque state
+  的跨协议转换会以 `format_mismatch` 拒绝。
+- 不支持独立 `/v1/responses/compact`；使用 `/v1/responses` 的 inline
+  `context_management`。
+- Responses 流必须包含真实的 completed、incomplete、failed 或 error 终态；普通 EOF
+  不会被合成为成功。
+- 合法 UUID 形式的 `X-Client-Request-Id` 会映射为上游 request/task ID；调用方不能
+  覆盖 Copilot Authorization、身份或 API version。
 
 ## 安全与诊断
 
-- GitHub access token 只访问 broker 和 GitHub account；Copilot session token 只访问
-  模型、policy 与推理端点。
-- token 仅持久化在 provider-owned `StorageJSON`；凭据文件是明文 JSON，应保护 CPA
-  auth 目录及备份。
-- 推理限制在凭据解析出的 API origin；调用方不能重定向 bearer token。
-- 插件不记录 `RawJSON`、`StorageJSON`、Authorization、token、device/user code、请求
-  或响应正文。
-- caller 只能使用 VS Code 1.132 的 interaction vocabulary、`user|agent` initiator 和合法
-  interaction UUID；Authorization、identity、API version 与任意 Anthropic beta 不会透传。
-- `debug: true` 时可查看 `auth.*`、`models.*`、`inference.*` 结构化事件及宿主附加的
-  `request_id`；默认日志仍保留关键 info/warn 状态。
+- 所有上游 HTTP 和 streaming 都经 CLIProxyAPI host callback；推理仅允许访问凭据
+  解析出的 HTTPS API origin。
+- GitHub access token 只用于 broker/GitHub account，Copilot session token 只用于模型、
+  policy 和推理。
+- token 仅持久化在 provider-owned `StorageJSON`；凭据文件是明文 JSON，应保护
+  CLIProxyAPI auth 目录及备份。
+- 插件不记录 token、Authorization、`RawJSON`、`StorageJSON`、device/user code 或
+  上下游正文。`debug: true` 仅增加结构化诊断字段。
 
-`auth.parse` 只认顶层 `type: github-copilot`，并兼容历史 pi 凭据字段：`refresh`、`access`、
-`expires`、`enterpriseUrl`、`availableModelIds` 会分别迁移到语义化 token、host 和
-模型字段；已识别但缺少长期 token 的凭据会被禁用，不会落入其他 parser。
-
-## 开发与文档
-
-Go 源码和测试统一位于 [src](src/)。它们属于同一个 `main` 包，因此按职责保留在同一目录：认证与端点（`auth.go`、`endpoints.go`）、模型发现与路由（`models.go`）、请求执行与流处理（`executor.go`、`stream.go`）、宿主与插件生命周期（`host.go`、`service.go`、`main.go`）。测试文件与对应实现相邻。
-
-涉及 auth、路由或流处理时，提交前运行：
+## 开发
 
 ```bash
 make test
-go test -race ./...
 make vet
+go test -race ./...
 make integration
 ```
 
-`make integration` 会构建本机 c-shared 产物，通过真实 CLIProxyAPI loader 和 host callback
-执行注册、`Execute`、`ExecuteStream` 与 `HttpRequest`，不只是检查动态库可加载。
+`make integration` 会构建本机动态库，并通过真实 CLIProxyAPI loader 和 host callback
+执行注册及请求路径。构建目标与参数以 [Makefile](Makefile) 为准，测试范围以
+[src](src/) 中的 colocated tests 为准。
 
-发布 tag 使用 `vX.Y.Z`；Release workflow 生成 Store 所需双架构资产和 checksum，
-[registry.json](registry.json) 无需随版本更新。
+兼容性文档：
 
-进一步文档：
-
-- [CURRENT_PLUGIN_ARCHITECTURE.md](CURRENT_PLUGIN_ARCHITECTURE.md)：当前插件架构、终态和安全边界；
-- [VSCODE_COPILOT_1_132_ARCHITECTURE.md](VSCODE_COPILOT_1_132_ARCHITECTURE.md)：pinned VS Code/Copilot Chat 上游实现；
-- [VSCODE_COPILOT_ALIGNMENT_PLAN.md](VSCODE_COPILOT_ALIGNMENT_PLAN.md)：已完成的对齐决策、测试与验收记录；
-- [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)：VS Code 基线与历史 pi 参考的优先级和维护手册。
+- [VSCODE_COPILOT_1_132_ARCHITECTURE.md](VSCODE_COPILOT_1_132_ARCHITECTURE.md)：
+  pinned 上游实现依据；
+- [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)：
+  事实优先级、产品边界、legacy 范围与升级流程。

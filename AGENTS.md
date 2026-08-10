@@ -1,51 +1,51 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Scope and Ownership
 
 This repository builds the `github-copilot-go` Go `c-shared` plugin for
-CLIProxyAPI v7. Production code and colocated `*_test.go` files live in `src/`:
-`main.go` exposes the C ABI, `service.go` registers capabilities, `auth.go`
-handles GitHub Device Flow, and `models.go` discovers and routes models.
-`executor.go`, `headers.go`, `endpoints.go`, and `stream.go` implement inference
-requests, validation, and SSE forwarding. Keep host callback wrappers in
-`host.go` and shared RPC types in `types.go`.
+CLIProxyAPI v7. Production code and colocated tests live in `src/`; generated
+libraries live in ignored `bin/`. `registry.json` is the Plugin Store entry.
 
-`registry.json` defines the Plugin Store entry. Generated libraries belong in
-`bin/` and must not be committed. Consult `README.md` for user-facing setup and
-`PI_GITHUB_COPILOT_COMPARISON.md` for compatibility rationale.
+Keep changes in the file that owns the behavior: C ABI/lifecycle, auth,
+model routing, endpoint/header validation, execution, streaming, host callbacks,
+or shared RPC types. All upstream HTTP and streaming must use `hostClient`;
+never add a direct `http.Client`.
 
-## Build, Test, and Development Commands
+## Validation
 
-- `make test` — run the complete Go test suite.
-- `make vet` — run `go vet ./...`.
-- `make build` — clean `bin/` and cross-build Linux amd64 and arm64 libraries.
-- `make build-native` — create a c-shared library for the current platform.
-- `make integration` — build native output and load it through CLIProxyAPI.
-- `go test -race ./...` — check concurrent auth, cache, and streaming paths.
+```bash
+make test
+make vet
+go test -race ./...
+make integration
+```
 
-Use Go 1.26+, CGO, and a C compiler. Linux builds require the matching cross
-compiler or Docker. Development depends on an adjacent `../CLIProxyAPI` checkout
-because `go.mod` uses a local `replace` directive.
+Run test and vet for every change. Also run race and integration when changing
+ABI, auth, routing, raw HTTP, or streaming. `make integration` builds the native
+library and loads it through CLIProxyAPI. Go 1.26+, CGO, a C compiler, and the
+adjacent `../CLIProxyAPI` checkout are required; cross-platform build details
+belong in `Makefile`.
 
-## Coding Style & Security Boundaries
+## Code and Security
 
-Run `gofmt -w src/*.go` before submitting. Use tabs, standard Go naming
-(`PascalCase` exported, `camelCase` internal), and descriptive tests such as
-`TestExecuteRejectsNoncanonicalInferencePath`. Keep behavior in its owning file
-and prefer small local helpers.
+Run `gofmt -w src/*.go`. Use standard Go naming, small local helpers, and
+descriptive tests such as `TestExecuteRejectsNoncanonicalInferencePath`.
+Use Go's `testing` package with fake host callbacks. Changed paths should cover
+success, malformed input, non-2xx responses, cancellation, and secret redaction
+where applicable.
 
-All upstream HTTP and streaming traffic must use `hostClient`; do not introduce
-direct `http.Client` calls. Never log or surface tokens, authorization headers,
-device codes, `RawJSON`, `StorageJSON`, or upstream response bodies.
+Never log or surface tokens, authorization headers, device codes, `RawJSON`,
+`StorageJSON`, or upstream response bodies. Preserve endpoint, same-origin,
+canonical-path, caller-header, and terminal-event validation.
 
-## Testing, Commits, and Pull Requests
+## Commits and Documentation
 
-Use Go's `testing` package and fake host callbacks. Cover success, malformed
-payloads, non-2xx responses, cancellation, and secret redaction for changed
-paths. Run `make test` and `make vet`; also run race and integration checks when
-touching ABI, authentication, routing, or streaming.
+Use concise imperative commit subjects. Pull requests should describe behavior,
+security/configuration impact, tests run, and linked issues; screenshots are only
+needed for host-facing UI changes.
 
-Use concise imperative commit subjects, for example `Fix device flow retry
-scheduling`. Pull requests should describe behavior and security/configuration
-impact, list tests run, and link relevant issues. Screenshots are only needed for
-host-facing UI changes.
+[README.md](README.md) owns setup and user-visible behavior.
+[PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md) owns the
+compatibility source hierarchy and upgrade procedure. Do not duplicate source
+inventories, test matrices, completed plans, or point-in-time pass snapshots in
+Markdown.
