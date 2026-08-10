@@ -137,15 +137,21 @@ type pluginService struct {
 	config   pluginConfig
 	sessions map[string]*loginSession
 	routes   map[routeKey]modelRoute
+
+	streamMu            sync.Mutex
+	streamWG            sync.WaitGroup
+	streamTasks         map[*streamForwardTask]struct{}
+	streamsShuttingDown bool
 }
 
 func newPluginService(bridge hostBridge) *pluginService {
 	return &pluginService{
-		bridge:   bridge,
-		now:      time.Now,
-		random:   rand.Reader,
-		config:   defaultPluginConfig(),
-		sessions: make(map[string]*loginSession),
-		routes:   make(map[routeKey]modelRoute),
+		bridge:      bridge,
+		now:         time.Now,
+		random:      rand.Reader,
+		config:      defaultPluginConfig(),
+		sessions:    make(map[string]*loginSession),
+		routes:      make(map[routeKey]modelRoute),
+		streamTasks: make(map[*streamForwardTask]struct{}),
 	}
 }

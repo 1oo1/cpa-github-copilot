@@ -176,6 +176,7 @@ func (s *pluginService) dispatch(method string, request []byte) (response []byte
 }
 
 func (s *pluginService) shutdown() {
+	s.stopStreamForwarding()
 	s.logEvent("", "info", "plugin.shutdown", nil)
 	s.mu.Lock()
 	sessions := s.sessions

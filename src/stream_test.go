@@ -29,6 +29,59 @@ type streamBridgeFake struct {
 	doneOnce       sync.Once
 }
 
+type shutdownStreamBridgeFake struct {
+	mu sync.Mutex
+
+	readCount      int
+	emitStarted    chan struct{}
+	emitRelease    chan struct{}
+	upstreamClosed chan struct{}
+	pluginClosed   chan struct{}
+	emitOnce       sync.Once
+	upstreamOnce   sync.Once
+	pluginOnce     sync.Once
+}
+
+func newShutdownStreamBridgeFake() *shutdownStreamBridgeFake {
+	return &shutdownStreamBridgeFake{
+		emitStarted:    make(chan struct{}),
+		emitRelease:    make(chan struct{}),
+		upstreamClosed: make(chan struct{}),
+		pluginClosed:   make(chan struct{}),
+	}
+}
+
+func (f *shutdownStreamBridgeFake) Call(method string, _ any) (json.RawMessage, error) {
+	var result any = map[string]any{}
+	switch method {
+	case pluginabi.MethodHostLog:
+	case pluginabi.MethodHostHTTPDoStream:
+		result = rpcHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-shutdown"}
+	case pluginabi.MethodHostHTTPStreamRead:
+		f.mu.Lock()
+		f.readCount++
+		readCount := f.readCount
+		f.mu.Unlock()
+		if readCount == 1 {
+			result = rpcHostHTTPStreamReadResponse{Payload: []byte("data: {\"id\":\"chatcmpl-shutdown\",\"choices\":[]}\n\n")}
+		} else {
+			<-f.upstreamClosed
+			result = rpcHostHTTPStreamReadResponse{Done: true}
+		}
+	case pluginabi.MethodHostHTTPStreamClose:
+		f.upstreamOnce.Do(func() { close(f.upstreamClosed) })
+	case pluginabi.MethodHostStreamEmit:
+		f.emitOnce.Do(func() { close(f.emitStarted) })
+		<-f.emitRelease
+	case pluginabi.MethodHostStreamClose:
+		f.pluginOnce.Do(func() { close(f.pluginClosed) })
+	default:
+		return nil, fmt.Errorf("unexpected method %s", method)
+	}
+	raw, errMarshal := json.Marshal(result)
+	return raw, errMarshal
+}
+
 func newStreamBridgeFake(chunks ...rpcHostHTTPStreamReadResponse) *streamBridgeFake {
 	return &streamBridgeFake{readChunks: chunks, done: make(chan struct{})}
 }
@@ -85,10 +138,11 @@ func (f *streamBridgeFake) snapshotLogs() []rpcHostLogRequest {
 	return append([]rpcHostLogRequest(nil), f.logs...)
 }
 
-func TestExecuteStreamPassThroughAndClosesBothStreams(t *testing.T) {
+func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.T) {
+	chatChunk := `{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
 	bridge := newStreamBridgeFake(
-		rpcHostHTTPStreamReadResponse{Payload: []byte("data: first\n\n")},
-		rpcHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n"), Done: true},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n\n")},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n")},
 	)
 	service := newPluginService(bridge)
 	now := time.Unix(100_000, 0).UTC()
@@ -115,7 +169,7 @@ func TestExecuteStreamPassThroughAndClosesBothStreams(t *testing.T) {
 	if !bridge.upstreamClosed || !bridge.pluginClosed || bridge.pluginError != "" {
 		t.Fatalf("close state: upstream=%v plugin=%v error=%q", bridge.upstreamClosed, bridge.pluginClosed, bridge.pluginError)
 	}
-	if got := string(bytesJoin(bridge.emitted)); got != "data: first\n\ndata: [DONE]\n\n" {
+	if got := string(bytesJoin(bridge.emitted)); got != chatChunk || !json.Valid([]byte(got)) {
 		t.Fatalf("emitted = %q", got)
 	}
 }
@@ -123,7 +177,7 @@ func TestExecuteStreamPassThroughAndClosesBothStreams(t *testing.T) {
 func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 	bridge := newStreamBridgeFake(
 		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
-		rpcHostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n"), Done: true},
+		rpcHostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")},
 	)
 	service := newPluginService(bridge)
 	now := time.Unix(105_000, 0).UTC()
@@ -166,13 +220,43 @@ func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamNativeClaudeClosesAtMessageStop(t *testing.T) {
+	bridge := newStreamBridgeFake(
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_start","message":{"id":"msg-1"}}` + "\n\n")},
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_stop"}` + "\n\n")},
+	)
+	service := newPluginService(bridge)
+	now := time.Unix(107_500, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"claude-sonnet-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "claude-sonnet-4.6", Format: formatClaude, SourceFormat: formatClaude,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "claude-sonnet-4.6", Format: formatClaude})),
+		},
+		StreamID: "plugin-native-claude", HostCallbackID: "callback-stream",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	emitted := string(bytesJoin(bridge.emitted))
+	pluginError := bridge.pluginError
+	bridge.mu.Unlock()
+	if pluginError != "" || !strings.Contains(emitted, `"type":"message_stop"`) {
+		t.Fatalf("native Claude terminal state: error=%q emitted=%q", pluginError, emitted)
+	}
+}
+
 func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 	first := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
 	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
 	bridge := newStreamBridgeFake(
 		rpcHostHTTPStreamReadResponse{Payload: []byte(first[:31])},
-		rpcHostHTTPStreamReadResponse{Payload: []byte(first[31:] + finish + done), Done: true},
+		rpcHostHTTPStreamReadResponse{Payload: []byte(first[31:] + finish + done)},
 	)
 	service := newPluginService(bridge)
 	now := time.Unix(110_000, 0).UTC()
@@ -212,8 +296,8 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 		`data: {"type":"response.completed","response":{"id":"resp-search","status":"completed","stop_reason":"stop","error":null,"usage":{"input_tokens":3,"output_tokens":2}}}` + "\n\n",
 	}
 	chunks := make([]rpcHostHTTPStreamReadResponse, 0, len(frames))
-	for index, frame := range frames {
-		chunks = append(chunks, rpcHostHTTPStreamReadResponse{Payload: []byte(frame), Done: index == len(frames)-1})
+	for _, frame := range frames {
+		chunks = append(chunks, rpcHostHTTPStreamReadResponse{Payload: []byte(frame)})
 	}
 	bridge := newStreamBridgeFake(chunks...)
 	service := newPluginService(bridge)
@@ -280,6 +364,65 @@ func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
 	defer bridge.mu.Unlock()
 	if !bridge.upstreamClosed || bridge.pluginError == "" || strings.Contains(bridge.pluginError, "chunk") {
 		t.Fatalf("close state: upstream=%v error=%q", bridge.upstreamClosed, bridge.pluginError)
+	}
+}
+
+func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
+	bridge := newShutdownStreamBridgeFake()
+	service := newPluginService(bridge)
+	now := time.Unix(122_500, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		},
+		StreamID: "plugin-shutdown-wait", HostCallbackID: "callback-stream",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	select {
+	case <-bridge.emitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not enter host emit")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		service.shutdown()
+		close(shutdownDone)
+	}()
+	select {
+	case <-bridge.upstreamClosed:
+	case <-time.After(5 * time.Second):
+		close(bridge.emitRelease)
+		t.Fatal("shutdown did not cancel the upstream stream")
+	}
+	select {
+	case <-shutdownDone:
+		close(bridge.emitRelease)
+		t.Fatal("shutdown returned while a forwarding task was still using host callbacks")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(bridge.emitRelease)
+	select {
+	case <-shutdownDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not join the forwarding task")
+	}
+	select {
+	case <-bridge.pluginClosed:
+	default:
+		t.Fatal("forwarder did not close the plugin stream before shutdown returned")
+	}
+	service.streamMu.Lock()
+	remaining := len(service.streamTasks)
+	service.streamMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("forwarding tasks remaining after shutdown = %d", remaining)
 	}
 }
 
@@ -489,6 +632,22 @@ func TestForwardStreamUpstreamCancelLogsDebug(t *testing.T) {
 	}
 }
 
+func TestForwardStreamRemoteHTTP2CancelLogsWarn(t *testing.T) {
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Error: "stream error: stream ID 3; CANCEL", Done: true})
+	executeOpenAIStream(t, bridge, "plugin-upstream-remote-cancel", time.Unix(133_500, 0).UTC())
+	logs := bridge.snapshotLogs()
+	if hasLogEvent(logs, "inference.stream.client_disconnected") {
+		t.Fatal("a remote HTTP/2 CANCEL must not be logged as a client disconnect")
+	}
+	entry := findLogEvent(t, logs, "inference.stream.forward_failed")
+	if entry.Level != "warn" || entry.Fields["reason"] != streamReasonUpstreamError {
+		t.Fatalf("remote cancel log = %#v", entry)
+	}
+	if entry.Fields["upstream_cause"] != upstreamCauseRemoteCanceled {
+		t.Fatalf("upstream_cause = %v, want %q", entry.Fields["upstream_cause"], upstreamCauseRemoteCanceled)
+	}
+}
+
 func TestForwardStreamNonUpstreamFailureOmitsUpstreamCause(t *testing.T) {
 	bridge := newStreamBridgeFake() // no chunks: the host stream read call fails
 	executeOpenAIStream(t, bridge, "plugin-no-cause", time.Unix(134_000, 0).UTC())
@@ -505,8 +664,9 @@ func TestClassifyUpstreamStreamError(t *testing.T) {
 	}{
 		{"", upstreamCauseOther},
 		{"context canceled", upstreamCauseCanceled},
-		{"stream error: stream ID 3; CANCEL", upstreamCauseCanceled},
+		{"stream error: stream ID 3; CANCEL", upstreamCauseRemoteCanceled},
 		{"net/http: request canceled", upstreamCauseCanceled},
+		{"request canceled by upstream peer", upstreamCauseRemoteCanceled},
 		{"context deadline exceeded", upstreamCauseTimeout},
 		{"read tcp 10.0.0.1:443: i/o timeout", upstreamCauseTimeout},
 		// net/http reports a client timeout as a cancellation; it must classify
@@ -521,6 +681,7 @@ func TestClassifyUpstreamStreamError(t *testing.T) {
 	}
 	allowed := map[string]bool{
 		upstreamCauseCanceled:        true,
+		upstreamCauseRemoteCanceled:  true,
 		upstreamCauseTimeout:         true,
 		upstreamCauseEOF:             true,
 		upstreamCauseConnectionReset: true,
@@ -666,7 +827,7 @@ func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
 	} {
 		t.Run(terminal, func(t *testing.T) {
 			bridge := newStreamBridgeFake(
-				rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n"), Done: true},
+				rpcHostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n")},
 			)
 			service := newPluginService(bridge)
 			now := time.Unix(191_000, 0).UTC()
@@ -696,7 +857,7 @@ func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
 
 func TestResponsesStreamLogsTerminalStatus(t *testing.T) {
 	bridge := newStreamBridgeFake(
-		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n"), Done: true},
+		rpcHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n")},
 	)
 	service := newPluginService(bridge)
 	now := time.Unix(196_000, 0).UTC()
@@ -810,7 +971,7 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 		{name: "finish then error then done", frames: chunk + finish + errorFrame + done},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames), Done: true})
+			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
 			service := newPluginService(bridge)
 			now := time.Unix(193_000, 0).UTC()
 			service.now = func() time.Time { return now }
@@ -849,7 +1010,7 @@ func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
 	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
 	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
-	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done), Done: true})
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done)})
 	service := newPluginService(bridge)
 	now := time.Unix(194_000, 0).UTC()
 	service.now = func() time.Time { return now }
@@ -910,7 +1071,7 @@ func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T
 		{name: "claude refusal", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("refusal"), wantStatus: "response.completed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames), Done: true})
+			bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
 			service := newPluginService(bridge)
 			now := time.Unix(194_250, 0).UTC()
 			service.now = func() time.Time { return now }

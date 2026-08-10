@@ -48,13 +48,64 @@ func (s *pluginService) executeStream(raw []byte) ([]byte, error) {
 	openedFields := preparedInferenceLogFields(prepared, true)
 	openedFields["upstream_status"] = upstream.StatusCode
 	s.logEvent(req.HostCallbackID, "debug", "inference.stream.opened", openedFields)
-	go s.forwardCopilotStream(client, streamID, upstream.StreamID, prepared)
+	if !s.startStreamForwarding(client, streamID, upstream.StreamID, prepared) {
+		client.closeStream(upstream.StreamID)
+		failure = &pluginFailure{code: "plugin_shutdown", message: "plugin is shutting down", retryable: true, httpStatus: http.StatusServiceUnavailable}
+		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		return nil, failure
+	}
 	headers := cloneResponseHeaders(http.Header(upstream.Headers), "text/event-stream")
 	headers.Set("Content-Type", "text/event-stream")
 	return okEnvelope(rpcExecutorStreamResponse{Headers: headers})
 }
 
-func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
+type streamForwardTask struct {
+	client           hostClient
+	upstreamStreamID string
+	cancel           context.CancelFunc
+}
+
+func (s *pluginService) startStreamForwarding(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	task := &streamForwardTask{client: client, upstreamStreamID: upstreamStreamID, cancel: cancel}
+	s.streamMu.Lock()
+	if s.streamsShuttingDown {
+		s.streamMu.Unlock()
+		cancel()
+		return false
+	}
+	s.streamTasks[task] = struct{}{}
+	s.streamWG.Add(1)
+	s.streamMu.Unlock()
+	go func() {
+		defer func() {
+			cancel()
+			s.streamMu.Lock()
+			delete(s.streamTasks, task)
+			s.streamMu.Unlock()
+			s.streamWG.Done()
+		}()
+		s.forwardCopilotStream(ctx, client, pluginStreamID, upstreamStreamID, prepared)
+	}()
+	return true
+}
+
+func (s *pluginService) stopStreamForwarding() {
+	s.streamMu.Lock()
+	s.streamsShuttingDown = true
+	tasks := make([]*streamForwardTask, 0, len(s.streamTasks))
+	for task := range s.streamTasks {
+		tasks = append(tasks, task)
+	}
+	s.streamMu.Unlock()
+	for _, task := range tasks {
+		task.cancel()
+		task.client.closeStream(task.upstreamStreamID)
+	}
+	s.streamWG.Wait()
+}
+
+func (s *pluginService) forwardCopilotStream(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
 	var forwardErr error
 	tracker := newResponsesTerminalTracker(prepared.outputFormat)
 	defer func() {
@@ -89,10 +140,10 @@ func (s *pluginService) forwardCopilotStream(client hostClient, pluginStreamID, 
 	}()
 	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		forwardErr = forwardStreamPassThrough(client, pluginStreamID, upstreamStreamID, maxBuffer, tracker)
+		forwardErr = forwardStreamPassThrough(ctx, client, pluginStreamID, upstreamStreamID, prepared.outputFormat, maxBuffer, tracker)
 		return
 	}
-	forwardErr = forwardTranslatedStream(client, pluginStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
+	forwardErr = forwardTranslatedStream(ctx, client, pluginStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
 }
 
 // streamForwardError classifies why stream forwarding stopped so the deferred
@@ -124,6 +175,7 @@ const (
 	streamReasonBufferExceeded   = "buffer_exceeded"
 	streamReasonPanic            = "panic"
 	streamReasonMissingTerminal  = "missing_terminal_event"
+	streamReasonPluginShutdown   = "plugin_shutdown"
 )
 
 // The host classifies an unexpected EOF as a connection-lifecycle failure, so
@@ -132,6 +184,7 @@ const responsesMissingTerminalError = "GitHub Copilot Responses stream ended wit
 
 const (
 	upstreamCauseCanceled        = "canceled"
+	upstreamCauseRemoteCanceled  = "remote_canceled"
 	upstreamCauseTimeout         = "timeout"
 	upstreamCauseEOF             = "eof"
 	upstreamCauseConnectionReset = "connection_reset"
@@ -412,10 +465,10 @@ func newStreamForwardError(reason, message string, benign bool) *streamForwardEr
 }
 
 // newUpstreamStreamError converts a host stream chunk error into a forward
-// error. The host derives the upstream stream context from the client request
-// context, so a cancelled read means the caller hung up rather than that GitHub
-// Copilot failed: that case is benign and must not warn, matching how a rejected
-// downstream emit is treated.
+// error. Only the host's recognized local cancellation strings map to
+// upstreamCauseCanceled; remote or ambiguous cancellation text remains an
+// upstream failure. A confirmed local cancellation is benign, matching how a
+// rejected downstream emit is treated.
 func newUpstreamStreamError(rawError string) *streamForwardError {
 	cause := classifyUpstreamStreamError(rawError)
 	if cause == upstreamCauseCanceled {
@@ -447,9 +500,15 @@ func classifyUpstreamStreamError(rawError string) string {
 	// "request canceled (Client.Timeout exceeded while reading body)".
 	case containsAny(lower, "deadline exceeded", "timed out", "timeout"):
 		return upstreamCauseTimeout
-	// "cancel" also covers the HTTP/2 "stream error: stream ID 3; CANCEL" form.
-	case containsAny(lower, "cancel"):
+	// HTTP/2 RST_STREAM CANCEL is sent by the upstream peer and is not evidence
+	// that our caller disconnected. Keep it separate from local context
+	// cancellation so it remains an operator-visible upstream failure.
+	case strings.Contains(lower, "stream error:") && strings.Contains(lower, "cancel"):
+		return upstreamCauseRemoteCanceled
+	case lower == context.Canceled.Error() || lower == "net/http: request canceled":
 		return upstreamCauseCanceled
+	case strings.Contains(lower, "cancel"):
+		return upstreamCauseRemoteCanceled
 	case containsAny(lower, "connection reset", "broken pipe", "use of closed network connection"):
 		return upstreamCauseConnectionReset
 	case containsAny(lower, "eof"):
@@ -503,23 +562,40 @@ func classifyStreamForwardError(err error) (reason, message string, benign bool)
 	return "unknown", err.Error(), false
 }
 
-func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamID string, maxBuffer int, tracker *responsesTerminalTracker) error {
+func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID, outputFormat string, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
-	emitFrame := func(frame []byte) error {
+	emitFrame := func(frame []byte) (bool, error) {
 		if len(frame) == 0 {
-			return nil
+			return false, nil
+		}
+		terminal := sourceProtocolTerminal(frame, outputFormat)
+		if outputFormat == formatOpenAI {
+			payload := openAIChatFrameData(frame)
+			if terminal {
+				return true, nil
+			}
+			if len(payload) == 0 {
+				return false, nil
+			}
+			if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
+				return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
+			}
+			return false, nil
 		}
 		tracker.observe(frame)
 		payload := make([]byte, 0, len(frame)+2)
 		payload = append(payload, frame...)
 		payload = append(payload, '\n', '\n')
 		if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
-			return newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
+			return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 		}
-		return nil
+		return terminal, nil
 	}
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
+		if ctx.Err() != nil {
+			return newStreamForwardError(streamReasonPluginShutdown, "GitHub Copilot stream forwarding stopped during plugin shutdown", true)
+		}
 		if errRead != nil {
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
@@ -531,14 +607,22 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 			return errFrame
 		}
 		for _, frame := range frames {
-			if errEmit := emitFrame(frame); errEmit != nil {
+			terminal, errEmit := emitFrame(frame)
+			if errEmit != nil {
 				return errEmit
+			}
+			if terminal {
+				return nil
 			}
 		}
 		if chunk.Done {
 			if tail := framer.Flush(); len(tail) > 0 {
-				if errEmit := emitFrame(tail); errEmit != nil {
+				terminal, errEmit := emitFrame(tail)
+				if errEmit != nil {
 					return errEmit
+				}
+				if terminal {
+					return nil
 				}
 			}
 			// Responses 输出协议下，没有真实终态事件就结束是协议错误，绝不能伪造成功。
@@ -550,7 +634,7 @@ func forwardStreamPassThrough(client hostClient, pluginStreamID, upstreamStreamI
 	}
 }
 
-func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
+func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
 	var state any
 	requireResponsesSourceTerminal := prepared.upstreamFormat == formatOpenAIResponse
@@ -559,26 +643,27 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 	if len(original) == 0 {
 		original = prepared.request.Payload
 	}
-	emitFrame := func(frame []byte) error {
+	emitFrame := func(frame []byte) (bool, error) {
 		normalized := normalizeSSEFrame(frame)
 		if len(normalized) == 0 {
-			return nil
+			return false, nil
 		}
+		protocolTerminal := sourceProtocolTerminal(normalized, prepared.translatorFormat)
 		sourceStatus, sourceReason, sourceTerminal := sourceFrameTerminalStatus(normalized, prepared.translatorFormat)
 		if sourceTerminal {
 			tracker.observeSource(sourceStatus, sourceReason)
 			if sourceStatus == "response.failed" || sourceStatus == "error" {
-				return newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
+				return false, newStreamForwardError(streamReasonUpstreamError, "GitHub Copilot upstream stream failed", false)
 			}
 			if requireResponsesSourceTerminal {
 				responsesSourceStatus = sourceStatus
 			}
 		}
 		if !tracker.allowsSourceTranslation(normalized) {
-			return nil
+			return protocolTerminal, nil
 		}
 		outputs := sdktranslator.TranslateStream(
-			context.Background(),
+			ctx,
 			sdktranslator.Format(prepared.translatorFormat),
 			sdktranslator.Format(prepared.outputFormat),
 			prepared.model,
@@ -597,13 +682,25 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 			}
 			tracker.observe(output)
 			if errEmit := client.emit(pluginStreamID, output); errEmit != nil {
-				return newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
+				return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 			}
+		}
+		return protocolTerminal, nil
+	}
+	validateTermination := func() error {
+		if requireResponsesSourceTerminal && responsesSourceStatus == "" {
+			return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
+		}
+		if tracker.missingTerminal() {
+			return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
 		}
 		return nil
 	}
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
+		if ctx.Err() != nil {
+			return newStreamForwardError(streamReasonPluginShutdown, "GitHub Copilot stream forwarding stopped during plugin shutdown", true)
+		}
 		if errRead != nil {
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
 		}
@@ -615,24 +712,58 @@ func forwardTranslatedStream(client hostClient, pluginStreamID, upstreamStreamID
 			return errFrame
 		}
 		for _, frame := range frames {
-			if errEmit := emitFrame(frame); errEmit != nil {
+			terminal, errEmit := emitFrame(frame)
+			if errEmit != nil {
 				return errEmit
+			}
+			if terminal {
+				return validateTermination()
 			}
 		}
 		if chunk.Done {
 			if tail := framer.Flush(); len(tail) > 0 {
-				if errEmit := emitFrame(tail); errEmit != nil {
+				terminal, errEmit := emitFrame(tail)
+				if errEmit != nil {
 					return errEmit
 				}
+				if terminal {
+					return validateTermination()
+				}
 			}
-			if requireResponsesSourceTerminal && responsesSourceStatus == "" {
-				return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
-			}
-			if tracker.missingTerminal() {
-				return newStreamForwardError(streamReasonMissingTerminal, responsesMissingTerminalError, false)
-			}
-			return nil
+			return validateTermination()
 		}
+	}
+}
+
+func openAIChatFrameData(frame []byte) []byte {
+	if data := sseFrameData(frame); len(data) > 0 {
+		return data
+	}
+	frame = bytes.TrimSpace(frame)
+	if json.Valid(frame) || bytes.Equal(frame, []byte("[DONE]")) {
+		return frame
+	}
+	return nil
+}
+
+func sourceProtocolTerminal(frame []byte, format string) bool {
+	data := streamFrameData(frame)
+	if len(data) == 0 {
+		return false
+	}
+	switch format {
+	case formatOpenAI:
+		return bytes.Equal(data, []byte("[DONE]"))
+	case formatOpenAIResponse, string(sdktranslator.FormatCodex):
+		_, terminal := responsesFrameTerminalStatus(frame)
+		return terminal
+	case formatClaude:
+		var event struct {
+			Type string `json:"type"`
+		}
+		return json.Unmarshal(data, &event) == nil && event.Type == "message_stop"
+	default:
+		return false
 	}
 }
 
