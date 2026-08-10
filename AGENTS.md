@@ -2,31 +2,51 @@
 
 ## Project Structure & Module Organization
 
-This repository is a single-package Go `c-shared` plugin for CLIProxyAPI. `main.go` implements the C ABI entry points, while `service.go` registers and dispatches plugin capabilities. Authentication and GitHub Device Flow live in `auth.go`; model discovery and routing are in `models.go`; request execution, headers, endpoint validation, and SSE handling are split across `executor.go`, `headers.go`, `endpoints.go`, and `stream.go`. Host callback wrappers are centralized in `host.go`, and shared RPC types are in `types.go`.
+This repository builds the `github-copilot-go` Go `c-shared` plugin for
+CLIProxyAPI v7. Production code and colocated `*_test.go` files live in `src/`:
+`main.go` exposes the C ABI, `service.go` registers capabilities, `auth.go`
+handles GitHub Device Flow, and `models.go` discovers and routes models.
+`executor.go`, `headers.go`, `endpoints.go`, and `stream.go` implement inference
+requests, validation, and SSE forwarding. Keep host callback wrappers in
+`host.go` and shared RPC types in `types.go`.
 
-Tests are colocated as `*_test.go`. `integration_test.go` loads the compiled library through CLIProxyAPI's real plugin loader. Generated libraries belong in `bin/`; usage documentation is in `README.md`, while architecture and pi synchronization guidance live in `PI_GITHUB_COPILOT_COMPARISON.md`.
+`registry.json` defines the Plugin Store entry; `src/compatibility.json` contains
+the built-in compatibility rules. Generated libraries belong in `bin/` and must
+not be committed. Consult `README.md` for user-facing setup and
+`PI_GITHUB_COPILOT_COMPARISON.md` for compatibility rationale.
 
 ## Build, Test, and Development Commands
 
-- `make test`: run all Go unit and contract tests.
-- `make vet`: run Go's static analyzer.
-- `make build`: build the platform-specific shared library in `bin/`.
-- `make integration`: build and load the library with the real CLIProxyAPI host.
-- `go test -race ./...`: check concurrent login, cache, and streaming paths.
-- `make clean`: remove generated binaries.
+- `make test` — run the complete Go test suite.
+- `make vet` — run `go vet ./...`.
+- `make build` — clean `bin/` and cross-build Linux amd64 and arm64 libraries.
+- `make build-native` — create a c-shared library for the current platform.
+- `make integration` — build native output and load it through CLIProxyAPI.
+- `go test -race ./...` — check concurrent auth, cache, and streaming paths.
 
-Use Go 1.26+, CGO, and a working C compiler. `go.mod` currently replaces CLIProxyAPI with the adjacent `../CLIProxyAPI` checkout.
+Use Go 1.26+, CGO, and a C compiler. Linux builds require the matching cross
+compiler or Docker. Development depends on an adjacent `../CLIProxyAPI` checkout
+because `go.mod` uses a local `replace` directive.
 
-## Coding Style & Naming Conventions
+## Coding Style & Security Boundaries
 
-Run `gofmt -w *.go` before submitting changes; Go formatting uses tabs. Follow standard Go naming: exported identifiers use `PascalCase`, internal identifiers use `camelCase`, and tests use `TestBehaviorName`. Keep capability logic in its owning file and prefer small helpers over cross-cutting abstractions.
+Run `gofmt -w src/*.go` before submitting. Use tabs, standard Go naming
+(`PascalCase` exported, `camelCase` internal), and descriptive tests such as
+`TestExecuteRejectsNoncanonicalInferencePath`. Keep behavior in its owning file
+and prefer small local helpers.
 
-All upstream HTTP and stream operations must use `hostClient`; do not introduce direct `http.Client` calls. Never log credentials, `RawJSON`, `StorageJSON`, authorization headers, device codes, or upstream response bodies.
+All upstream HTTP and streaming traffic must use `hostClient`; do not introduce
+direct `http.Client` calls. Never log or surface tokens, authorization headers,
+device codes, `RawJSON`, `StorageJSON`, or upstream response bodies.
 
-## Testing Guidelines
+## Testing, Commits, and Pull Requests
 
-Use Go's `testing` package and fake host callbacks for upstream behavior. Cover success, malformed responses, non-2xx statuses, cancellation, and secret-redaction paths. There is no enforced coverage floor; preserve or improve the current roughly 71% coverage for touched code. Run unit, race, vet, and integration checks for changes affecting ABI, auth, routing, or streaming.
+Use Go's `testing` package and fake host callbacks. Cover success, malformed
+payloads, non-2xx responses, cancellation, and secret redaction for changed
+paths. Run `make test` and `make vet`; also run race and integration checks when
+touching ABI, authentication, routing, or streaming.
 
-## Commit & Pull Request Guidelines
-
-This checkout has no Git metadata, so no repository-specific commit convention can be inferred. Use concise imperative subjects, such as `Fix device flow retry scheduling`. Pull requests should explain behavior changes, security implications, configuration changes, and tests run. Link relevant issues; screenshots are unnecessary unless a host-facing UI changes.
+Use concise imperative commit subjects, for example `Fix device flow retry
+scheduling`. Pull requests should describe behavior and security/configuration
+impact, list tests run, and link relevant issues. Screenshots are only needed for
+host-facing UI changes.
