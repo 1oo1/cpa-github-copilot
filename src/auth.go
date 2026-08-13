@@ -29,6 +29,7 @@ const (
 
 type copilotStorage struct {
 	Type                 string        `json:"type"`
+	Priority             int           `json:"priority"`
 	GitHubAccessToken    string        `json:"github_access_token"`
 	CopilotSessionToken  string        `json:"copilot_session_token,omitempty"`
 	RefreshAfter         int64         `json:"refresh_after,omitempty"`
@@ -239,6 +240,11 @@ func authDataFromStorage(storage copilotStorage, defaults authDataDefaults) plug
 		metadata["account"] = storage.Account
 	}
 	metadata["github_host"] = storage.GitHubHost
+	attributes := safeAuthAttributes(defaults.Attributes)
+	if attributes == nil {
+		attributes = make(map[string]string)
+	}
+	attributes["priority"] = strconv.Itoa(storage.Priority)
 	auth := pluginapi.AuthData{
 		Provider:    pluginIdentifier,
 		ID:          id,
@@ -247,7 +253,7 @@ func authDataFromStorage(storage copilotStorage, defaults authDataDefaults) plug
 		Disabled:    defaults.Disabled,
 		StorageJSON: storageJSON,
 		Metadata:    metadata,
-		Attributes:  safeAuthAttributes(defaults.Attributes),
+		Attributes:  attributes,
 	}
 	if storage.RefreshAfter > 0 {
 		auth.NextRefreshAfter = time.UnixMilli(storage.RefreshAfter).UTC()
@@ -755,6 +761,7 @@ func (s *pluginService) refreshAuth(raw []byte) ([]byte, error) {
 		next.ModelsFetchedAt = s.now().UTC().UnixMilli()
 	}
 	next.Account = previous.Account
+	next.Priority = previous.Priority
 	auth := authDataFromStorage(next, authDataDefaults{
 		ID:         req.AuthID,
 		FileName:   fileNameFromAttributes(req.Attributes, req.AuthID),

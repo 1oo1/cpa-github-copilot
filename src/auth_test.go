@@ -88,6 +88,35 @@ func TestParseAuthKeepsSecretsOnlyInStorageJSON(t *testing.T) {
 	}
 }
 
+func TestParseAuthExposesPersistedPriorityToScheduler(t *testing.T) {
+	service := newPluginService(nil)
+	raw, errParse := service.parseAuth(mustJSON(t, pluginapi.AuthParseRequest{
+		FileName: "copilot.json",
+		RawJSON: mustJSON(t, map[string]any{
+			"type":                pluginIdentifier,
+			"priority":            7,
+			"github_access_token": "ghu_test",
+			"github_host":         "github.com",
+		}),
+	}))
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	result := decodePluginResult[pluginapi.AuthParseResponse](t, raw)
+	if result.Auth.Attributes["priority"] != "7" {
+		t.Fatalf("priority attribute = %q, want 7", result.Auth.Attributes["priority"])
+	}
+	var persisted struct {
+		Priority int `json:"priority"`
+	}
+	if errUnmarshal := json.Unmarshal(result.Auth.StorageJSON, &persisted); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if persisted.Priority != 7 {
+		t.Fatalf("persisted priority = %d, want 7", persisted.Priority)
+	}
+}
+
 func TestDecodeLegacyPiCredential(t *testing.T) {
 	storage, errDecode := decodeCopilotStorage([]byte(`{
 		"type":"github-copilot",
@@ -376,7 +405,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	service := newPluginService(bridge)
 	service.now = func() time.Time { return now }
 	previous := copilotStorage{
-		Type: pluginIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "old", GitHubHost: "github.com", Account: "octocat",
+		Type: pluginIdentifier, Priority: 7, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "old", GitHubHost: "github.com", Account: "octocat",
 	}
 	raw, errRefresh := service.refreshAuth(mustJSON(t, rpcAuthRefreshRequest{
 		AuthRefreshRequest: pluginapi.AuthRefreshRequest{
@@ -400,6 +429,9 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	}
 	if _, leaked := result.Auth.Metadata["access_token"]; leaked || result.Auth.Metadata["note"] != "keep" {
 		t.Fatalf("refreshed metadata = %#v", result.Auth.Metadata)
+	}
+	if result.Auth.Attributes["priority"] != "7" || next.Priority != 7 {
+		t.Fatalf("refreshed priority = attributes=%q storage=%d, want 7", result.Auth.Attributes["priority"], next.Priority)
 	}
 }
 

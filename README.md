@@ -68,6 +68,18 @@ Store 与手工安装共用 `plugins.configs.github-copilot-go`：
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
 fragment 或 IP，并需要该实例可用的 OAuth public client ID。
 
+每个 GitHub Copilot 认证文件可在顶层设置整数 `priority`；值越高越优先，未设置时为
+`0`。同一 priority 的可用账号由 CPA 的 `routing.strategy` 调度。启用
+`routing.session-affinity` 后，已绑定会话会继续使用原账号，priority 只影响新会话、
+无会话请求和绑定账号不可用后的重选。插件会在登录与刷新时保留该字段，例如：
+
+```json
+{
+  "type": "github-copilot",
+  "priority": 10
+}
+```
+
 Claude Code 的 `web_search_20250305`/`web_search_20260209` 是提供方执行的服务端工具，
 Copilot Claude Messages 路由不执行它。插件只在工具列表全部为原生 Web Search 时使用
 `web_search_model`，再将 Responses 结果转换回 Anthropic 事件；普通请求不切换，混合工具请求在本地拒绝。
