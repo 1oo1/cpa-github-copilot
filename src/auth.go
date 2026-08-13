@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	defaultPollInterval = 5 * time.Second
-	minPollInterval     = time.Second
+	defaultPollInterval        = 5 * time.Second
+	minPollInterval            = time.Second
+	refreshCapabilityAttribute = "refresh_capable"
 	// CPA 刷新失败后退避 5 分钟，因此在 broker 到期前 10 分钟调度，为 session exchange
 	// 失败保留重试窗口。exchange 成功但 /models 失败时仍采用新 session，并保留旧模型状态。
 	refreshSafetyMargin = 10 * time.Minute
@@ -245,6 +246,7 @@ func authDataFromStorage(storage copilotStorage, defaults authDataDefaults) plug
 		attributes = make(map[string]string)
 	}
 	attributes["priority"] = strconv.Itoa(storage.Priority)
+	attributes[refreshCapabilityAttribute] = "true"
 	auth := pluginapi.AuthData{
 		Provider:    pluginIdentifier,
 		ID:          id,

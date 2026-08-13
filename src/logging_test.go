@@ -66,6 +66,9 @@ func TestAuthDataExposesSafeOAuthRefreshSchedulingMetadata(t *testing.T) {
 	if auth.Metadata["refresh_interval_seconds"] != int64(hostRefreshInterval/time.Second) {
 		t.Fatalf("refresh_interval_seconds = %#v", auth.Metadata["refresh_interval_seconds"])
 	}
+	if auth.Attributes[refreshCapabilityAttribute] != "true" {
+		t.Fatalf("refresh capability = %q, want true", auth.Attributes[refreshCapabilityAttribute])
+	}
 	core := &coreauth.Auth{Metadata: auth.Metadata, Attributes: auth.Attributes}
 	if core.AuthKind() != coreauth.AuthKindOAuth {
 		t.Fatalf("host auth kind = %q", core.AuthKind())
