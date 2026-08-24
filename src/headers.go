@@ -10,13 +10,14 @@ import (
 )
 
 const (
-	copilotUserAgent     = "GitHubCopilotChat/0.60.0"
-	copilotEditorVersion = "vscode/1.132.0"
-	copilotPluginVersion = "copilot-chat/0.60.0"
-	copilotIntegrationID = "vscode-chat"
-	copilotAPIVersion    = "2026-06-01"
+	copilotUserAgent       = "GitHubCopilotChat/0.62.0"
+	copilotEditorVersion   = "vscode/1.134.0"
+	copilotPluginVersion   = "copilot-chat/0.62.0"
+	copilotIntegrationID   = "vscode-chat"
+	copilotAPIVersion      = "2026-08-01"
+	copilotTokenAPIVersion = "2025-04-01"
 
-	// 以下四个 beta 都是 VS Code 1.132.0 源码（chatEndpoint.ts getAnthropicBetaHeader）可证明的值。
+	// 以下四个 beta 都是 VS Code 1.134.0 源码（chatEndpoint.ts getAnthropicBetaHeader）可证明的值。
 	interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 	advancedToolUseBeta     = "advanced-tool-use-2025-11-20"
 	contextManagementBeta   = "context-management-2025-06-27"
@@ -26,7 +27,7 @@ const (
 	toolSearchToolName     = "tool_search"
 )
 
-// vsCodeInteractionTypes 是 VS Code 1.132.0 中 locationToIntent 与
+// vsCodeInteractionTypes 是 VS Code 1.134.0 中 locationToIntent 与
 // InteractionTypeOverride 支持的完整词表；X-Interaction-Type 只接受这些值，
 // 其余调用方取值一律回退到 resolveInteractionType 的默认值。
 var vsCodeInteractionTypes = map[string]bool{
@@ -49,7 +50,8 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 func brokerHeaders(githubToken string) http.Header {
 	headers := copilotIdentityHeaders()
 	headers.Set("Accept", "application/json")
-	headers.Set("Authorization", "Bearer "+githubToken)
+	headers.Set("Authorization", "token "+githubToken)
+	headers.Set("X-GitHub-Api-Version", copilotTokenAPIVersion)
 	return headers
 }
 
@@ -104,7 +106,7 @@ func inferenceHeadersForRoute(sessionToken string, route modelRoute, payload []b
 	return headers
 }
 
-// anthropicBetaHeader 只计算 VS Code 1.132.0 源码证明存在的四个 beta，不透传调用方任意值。
+// anthropicBetaHeader 只计算 VS Code 1.134.0 源码证明存在的四个 beta，不透传调用方任意值。
 func anthropicBetaHeader(route modelRoute, payload []byte) string {
 	var betas []string
 	if !route.AdaptiveThinking {

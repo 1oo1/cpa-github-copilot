@@ -17,7 +17,7 @@ func defaultPluginConfig() pluginConfig {
 		ModelCacheTTL:                    300,
 		MaxStreamBytes:                   4 << 20,
 		WebSearchModel:                   "gpt-5.6-terra",
-		EnableResponsesContextManagement: true,
+		EnableResponsesContextManagement: false,
 	}
 }
 
@@ -97,7 +97,7 @@ func (s *pluginService) registration() registration {
 				{Name: "model_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Lifetime of a non-empty account model catalog before rediscovery."},
 				{Name: "max_stream_buffer_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "Maximum buffered partial SSE event size."},
 				{Name: "web_search_model", Type: pluginapi.ConfigFieldTypeString, Description: "Responses model used only for standalone Anthropic server web search requests; empty disables routing."},
-				{Name: "enable_responses_context_management", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Default-enable native Responses server-side context compaction (VS Code feature-on behavior)."},
+				{Name: "enable_responses_context_management", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt in to native Responses server-side context compaction; disabled by default to match VS Code."},
 			},
 		},
 		Capabilities: registrationCapabilities{

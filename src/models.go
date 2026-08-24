@@ -97,7 +97,7 @@ var knownCopilotModels = []string{
 	"claude-sonnet-4.6", "claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
 	"gemini-3.6-flash", "gpt-4.1", "gpt-5-mini", "gpt-5.2",
 	"gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "kimi-k2.7-code",
+	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
 	"mai-code-1-flash-picker",
 }
 
@@ -315,7 +315,7 @@ func inferModelFormat(modelID string) string {
 	if isCopilotClaude(id) {
 		return formatClaude
 	}
-	if id == "grok-4.5" || strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
+	if strings.HasPrefix(id, "grok-") || strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
 		return formatOpenAIResponse
 	}
 	return formatOpenAI
@@ -491,6 +491,7 @@ func (s *pluginService) enableKnownModels(client hostClient, storage copilotStor
 				headers := copilotIdentityHeaders()
 				headers.Set("Content-Type", "application/json")
 				headers.Set("Authorization", "Bearer "+storage.CopilotSessionToken)
+				headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
 				headers.Set("Openai-Intent", "chat-policy")
 				headers.Set("X-Interaction-Type", "chat-policy")
 				resp, errHTTP := client.do(pluginapi.HTTPRequest{

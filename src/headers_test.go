@@ -92,12 +92,19 @@ func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
 	}
 }
 
-func TestInferenceHeadersUseVSCode1132Identity(t *testing.T) {
+func TestInferenceHeadersUseVSCode1134Identity(t *testing.T) {
 	headers := inferenceHeaders("session", formatOpenAI, []byte(`{}`), nil)
-	if headers.Get("User-Agent") != "GitHubCopilotChat/0.60.0" || headers.Get("Editor-Version") != "vscode/1.132.0" ||
-		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.60.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
-		headers.Get("X-GitHub-Api-Version") != "2026-06-01" {
+	if headers.Get("User-Agent") != "GitHubCopilotChat/0.62.0" || headers.Get("Editor-Version") != "vscode/1.134.0" ||
+		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.62.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
+		headers.Get("X-GitHub-Api-Version") != "2026-08-01" {
 		t.Fatalf("identity headers = %#v", headers)
+	}
+}
+
+func TestBrokerHeadersUseVSCodeTokenAPI(t *testing.T) {
+	headers := brokerHeaders("github-token")
+	if headers.Get("Authorization") != "token github-token" || headers.Get("X-GitHub-Api-Version") != "2025-04-01" {
+		t.Fatalf("broker headers = %#v", headers)
 	}
 }
 

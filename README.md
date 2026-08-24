@@ -10,8 +10,8 @@ provider `github-copilot` 接入；配置 ID 为 `github-copilot-go`。
 | Anthropic Messages | `/v1/messages` |
 
 插件根据当前账户的 Copilot 模型目录选择上游协议，必要时调用 CLIProxyAPI
-translator 转换请求与响应。HTTP wire 基线固定为 VS Code `1.132.0`、Copilot Chat
-`0.60.0`、`@vscode/copilot-api@0.4.3` 和 API version `2026-06-01`；`pi` 只用于
+translator 转换请求与响应。HTTP wire 基线固定为 VS Code `1.134.0`、Copilot Chat
+`0.62.0`、`@vscode/copilot-api@0.5.2` 和 API version `2026-08-01`；`pi` 只用于
 旧凭据兼容。
 
 > Copilot token broker 和模型接口不是稳定的通用第三方 API。使用前请确认符合订阅
@@ -63,7 +63,7 @@ Store 与手工安装共用 `plugins.configs.github-copilot-go`：
 | `model_cache_ttl_seconds` | `300` | 非空账户模型目录缓存秒数；`0` 表示每次刷新 |
 | `max_stream_buffer_bytes` | `4194304` | 未完成 SSE event 的缓存上限，范围 64 KiB–64 MiB |
 | `web_search_model` | `gpt-5.6-terra` | 仅将 Anthropic 原生 Web Search 独占请求分流到该 Responses 模型；空值禁用 |
-| `enable_responses_context_management` | `true` | 为符合条件的原生 Responses 请求启用服务端 compaction |
+| `enable_responses_context_management` | `false` | 选择性为符合条件的原生 Responses 请求启用服务端 compaction |
 
 Enterprise 主机必须是 HTTPS DNS 主机名，不能含用户信息、端口、路径、查询、
 fragment 或 IP，并需要该实例可用的 OAuth public client ID。
@@ -116,6 +116,8 @@ GET /v0/management/get-auth-status?state=<state>
   的跨协议转换会以 `format_mismatch` 拒绝。
 - 不支持独立 `/v1/responses/compact`；使用 `/v1/responses` 的 inline
   `context_management`。
+- Grok Responses 不会被自动注入 `context_management`，并会移除 Copilot 端不接受的
+  `reasoning.summary` 和 `text.verbosity`；其他 `text` 控制和 caller tool 声明保持不变。
 - Responses 流必须包含真实的 completed、incomplete、failed 或 error 终态；普通 EOF
   不会被合成为成功。
 - 合法 UUID 形式的 `X-Client-Request-Id` 会映射为上游 request/task ID；调用方不能
@@ -147,7 +149,7 @@ make integration
 
 兼容性文档：
 
-- [VSCODE_COPILOT_1_132_ARCHITECTURE.md](VSCODE_COPILOT_1_132_ARCHITECTURE.md)：
+- [VSCODE_COPILOT_1_134_ARCHITECTURE.md](VSCODE_COPILOT_1_134_ARCHITECTURE.md)：
   pinned 上游实现依据；
 - [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)：
   事实优先级、产品边界、legacy 范围与升级流程。

@@ -65,7 +65,7 @@ type pluginConfig struct {
 	// 空值表示禁用该分流并在本地拒绝请求。
 	WebSearchModel string `yaml:"web_search_model"`
 	// EnableResponsesContextManagement 控制是否在原生 Responses 路由上默认启用
-	// VS Code feature-on 的 server-side context compaction（context_management 阈值）。
+	// VS Code 可选的 server-side context compaction（context_management 阈值）。
 	EnableResponsesContextManagement bool `yaml:"enable_responses_context_management"`
 }
 

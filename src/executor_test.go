@@ -1138,6 +1138,7 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 
 func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 	service := newPluginService(nil)
+	service.config.EnableResponsesContextManagement = true
 	now := time.Unix(92_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{
@@ -1677,6 +1678,24 @@ func TestNormalizeOpenAIResponsesSkipsExcludedFamilies(t *testing.T) {
 	}
 }
 
+func TestNormalizeOpenAIResponsesNeverAutoCompactsGrok(t *testing.T) {
+	route := modelRoute{Format: formatOpenAIResponse, Family: "grok-4.6", MaxPromptTokens: 200_000}
+	out, errNormalize := normalizeInferencePayloadForRoute(
+		[]byte(`{"model":"grok-4.6","input":[{"role":"user","content":"hi"}]}`),
+		"grok-4.6", route, false, true,
+	)
+	if errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	var body map[string]any
+	if json.Unmarshal(out, &body) != nil {
+		t.Fatalf("decode: %s", out)
+	}
+	if _, exists := body["context_management"]; exists {
+		t.Fatalf("Grok unexpectedly got automatic context_management: %#v", body["context_management"])
+	}
+}
+
 func TestPrepareInferenceLegacyResponsesWithoutFamilyDoesNotEnableCompaction(t *testing.T) {
 	service := newPluginService(nil)
 	now := time.Unix(154_000, 0).UTC()
@@ -1728,6 +1747,80 @@ func TestNormalizeOpenAIResponsesRespectsConfigSwitch(t *testing.T) {
 	}
 	if _, exists := body["context_management"]; exists {
 		t.Fatalf("context_management was added while the config switch is disabled: %#v", body["context_management"])
+	}
+}
+
+func TestNormalizeOpenAIResponsesRemovesUnsupportedGrokHints(t *testing.T) {
+	route := modelRoute{
+		Format: formatOpenAIResponse, Family: "grok-4.6", ReasoningLevels: []string{"high"},
+	}
+	raw := []byte(`{
+		"model":"grok-4.6",
+		"reasoning":{"effort":"high","summary":"auto"},
+		"text":{"verbosity":"medium","format":{"type":"json_schema","name":"result","schema":{"type":"object"}}},
+		"tools":[
+			{"type":"function","name":"lookup","parameters":{"type":"object"}},
+			{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}
+		],
+		"input":[{"role":"user","content":"hi"}]
+	}`)
+	out, errNormalize := normalizeInferencePayloadForRoute(raw, "grok-4.6", route, false, false)
+	if errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	var body map[string]any
+	if json.Unmarshal(out, &body) != nil {
+		t.Fatalf("decode: %s", out)
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" {
+		t.Fatalf("reasoning effort = %#v", reasoning)
+	}
+	if _, exists := reasoning["summary"]; exists {
+		t.Fatalf("Grok reasoning summary was retained: %#v", reasoning)
+	}
+	text, _ := body["text"].(map[string]any)
+	if _, exists := text["verbosity"]; exists || text["format"] == nil {
+		t.Fatalf("Grok text controls = %#v", text)
+	}
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 2 || tools[1].(map[string]any)["type"] != "custom" {
+		t.Fatalf("caller tools were silently changed: %#v", tools)
+	}
+}
+
+func TestNormalizeOpenAIResponsesPreservesHintsOutsideGrok(t *testing.T) {
+	route := modelRoute{Format: formatOpenAIResponse, Family: "gpt-6", ReasoningLevels: []string{"high"}}
+	raw := []byte(`{"model":"gpt-6","reasoning":{"effort":"high","summary":"auto"},"text":{"verbosity":"medium"},"input":[]}`)
+	out, errNormalize := normalizeInferencePayloadForRoute(raw, "gpt-6", route, false, false)
+	if errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	var body map[string]any
+	if json.Unmarshal(out, &body) != nil {
+		t.Fatalf("decode: %s", out)
+	}
+	if body["reasoning"].(map[string]any)["summary"] != "auto" || body["text"].(map[string]any)["verbosity"] != "medium" {
+		t.Fatalf("non-Grok hints were changed: %#v", body)
+	}
+}
+
+func TestNormalizeOpenAIResponsesRecognizesLegacyGrokModelFallback(t *testing.T) {
+	route := modelRoute{Format: formatOpenAIResponse}
+	raw := []byte(`{"model":"grok-4.6","reasoning":{"summary":"auto"},"text":{"verbosity":"medium"},"input":[]}`)
+	out, errNormalize := normalizeInferencePayloadForRoute(raw, "grok-4.6", route, false, false)
+	if errNormalize != nil {
+		t.Fatal(errNormalize)
+	}
+	var body map[string]any
+	if json.Unmarshal(out, &body) != nil {
+		t.Fatalf("decode: %s", out)
+	}
+	if _, exists := body["reasoning"]; exists {
+		t.Fatalf("legacy Grok reasoning summary was retained: %#v", body["reasoning"])
+	}
+	if _, exists := body["text"]; exists {
+		t.Fatalf("legacy Grok verbosity was retained: %#v", body["text"])
 	}
 }
 
@@ -1813,6 +1906,7 @@ func TestNormalizeOpenAIChatRemovesReasoningEffortWithoutDeclaredLevels(t *testi
 
 func TestPreparedInferenceLogFieldsIncludeResponsesDiagnostics(t *testing.T) {
 	service := newPluginService(nil)
+	service.config.EnableResponsesContextManagement = true
 	now := time.Unix(200_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4", MaxPromptTokens: 200_000})

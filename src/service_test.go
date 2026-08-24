@@ -31,7 +31,7 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 	}
 	config := service.loadedConfig()
 	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels ||
-		config.WebSearchModel != "gpt-5.6-terra" || !config.EnableResponsesContextManagement {
+		config.WebSearchModel != "gpt-5.6-terra" || config.EnableResponsesContextManagement {
 		t.Fatalf("default config = %#v", config)
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {

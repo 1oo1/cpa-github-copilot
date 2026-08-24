@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,11 +41,36 @@ func TestKnownCopilotModelsMatchPolicyEnableCatalog(t *testing.T) {
 		"claude-opus-4.8", "claude-opus-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-sonnet-4.6",
 		"claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.6-flash", "gpt-4.1",
 		"gpt-5-mini", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini",
-		"gpt-5.4-nano", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5",
+		"gpt-5.4-nano", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6",
 		"kimi-k2.7-code", "mai-code-1-flash-picker",
 	}
 	if strings.Join(knownCopilotModels, ",") != strings.Join(want, ",") {
 		t.Fatalf("known models = %v, want %v", knownCopilotModels, want)
+	}
+}
+
+func TestEnableKnownModelsUsesCurrentAPIIdentity(t *testing.T) {
+	var calls atomic.Int64
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Errorf("method = %s", method)
+		}
+		req := payload.(rpcHostHTTPRequest)
+		headers := http.Header(req.Headers)
+		if !strings.HasSuffix(req.URL, "/policy") || headers.Get("Authorization") != "Bearer session" ||
+			headers.Get("X-GitHub-Api-Version") != copilotAPIVersion {
+			t.Errorf("policy request = %#v", req)
+		}
+		calls.Add(1)
+		return pluginapi.HTTPResponse{StatusCode: http.StatusOK}, nil
+	}}
+	service := newPluginService(bridge)
+	service.enableKnownModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "session",
+		GitHubHost:          "github.com",
+	})
+	if got := calls.Load(); got != int64(len(knownCopilotModels)) {
+		t.Fatalf("policy calls = %d, want %d", got, len(knownCopilotModels))
 	}
 }
 
@@ -106,6 +132,7 @@ func TestSelectModelFormatUsesSupportedEndpointAndInference(t *testing.T) {
 	}{
 		{id: "gpt-5.4", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
 		{id: "grok-4.5", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
+		{id: "grok-4.6", endpoints: nil, want: formatOpenAIResponse},
 		{id: "claude-opus-5", endpoints: []string{"/responses", "/v1/messages"}, want: formatOpenAIResponse},
 		{id: "claude-fable-5", endpoints: []string{"/v1/messages", "/chat/completions"}, want: formatClaude},
 		{id: "claude-sonnet-4.6", endpoints: []string{"/v1/messages"}, want: formatClaude},

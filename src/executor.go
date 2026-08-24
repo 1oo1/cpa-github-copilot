@@ -160,7 +160,7 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 }
 
 func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream bool) (preparedInference, *pluginFailure) {
-	// VS Code 1.132.0 没有独立 /responses/compact endpoint 的源码证据，GitHub Copilot 提供该
+	// VS Code 1.134.0 没有独立 /responses/compact endpoint 的源码证据，GitHub Copilot 提供该
 	// endpoint 也无从证实；在发出 HTTP 请求前拒绝，不误发普通 /responses 也不臆造新 endpoint。
 	if strings.TrimSpace(req.Alt) == "responses/compact" {
 		return preparedInference{}, &pluginFailure{code: "unsupported_feature", message: "GitHub Copilot does not support a separate Responses compaction endpoint", httpStatus: http.StatusNotImplemented}
@@ -500,7 +500,7 @@ func preserveAnthropicReasoningEffort(raw []byte, effort string) []byte {
 	return out
 }
 
-// responsesContextManagementExcludedFamilies 是 VS Code 1.132.0 源码证明的排除集合
+// responsesContextManagementExcludedFamilies 是 VS Code 1.134.0 源码证明的排除集合
 // （openai.ts modelsWithoutResponsesContextManagement）。
 var responsesContextManagementExcludedFamilies = map[string]bool{
 	"gpt-5":   true,
@@ -520,6 +520,7 @@ func responsesCompactionThreshold(route modelRoute) int64 {
 func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRoute, contextManagementEnabled bool) bool {
 	changed := payload["store"] != false
 	payload["store"] = false
+	isGrok := isGrokResponsesRoute(payload, route)
 	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
 		effort := strings.ToLower(stringValue(reasoning["effort"]))
 		if len(reasoning) == 0 || effort == "none" || effort == "off" {
@@ -532,8 +533,34 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRo
 			}
 			changed = true
 		}
+		// Copilot Chat 0.62 never sends reasoning.summary on its Grok Responses
+		// route. Codex commonly requests "auto", which the Copilot Grok endpoint
+		// rejects even though it is valid on the public OpenAI Responses API.
+		if isGrok {
+			if _, exists := reasoning["summary"]; exists {
+				delete(reasoning, "summary")
+				changed = true
+			}
+			if len(reasoning) == 0 {
+				delete(payload, "reasoning")
+			}
+		}
 	}
-	// truncation/include 只在缺失时补齐 VS Code feature-on 默认值，保留有效 caller 值。
+	if isGrok {
+		// VS Code only emits text.verbosity for selected GPT families. Preserve
+		// other text controls such as structured output format while removing the
+		// Grok-incompatible Codex verbosity hint.
+		if text, ok := payload["text"].(map[string]any); ok {
+			if _, exists := text["verbosity"]; exists {
+				delete(text, "verbosity")
+				changed = true
+			}
+			if len(text) == 0 {
+				delete(payload, "text")
+			}
+		}
+	}
+	// truncation/include 只在缺失时补齐 VS Code 默认值，保留有效 caller 值。
 	if _, exists := payload["truncation"]; !exists {
 		payload["truncation"] = "disabled"
 		changed = true
@@ -544,7 +571,7 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRo
 	}
 	// context_management 只在缺失时按 90% max prompt tokens 补齐，已有 caller 值则逐字保留。
 	family := strings.ToLower(strings.TrimSpace(route.Family))
-	if _, exists := payload["context_management"]; !exists && contextManagementEnabled && family != "" &&
+	if _, exists := payload["context_management"]; !exists && contextManagementEnabled && !isGrok && family != "" &&
 		!responsesContextManagementExcludedFamilies[family] {
 		payload["context_management"] = []any{map[string]any{
 			"type":              "compaction",
@@ -553,6 +580,14 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRo
 		changed = true
 	}
 	return changed
+}
+
+func isGrokResponsesRoute(payload map[string]any, route modelRoute) bool {
+	family := strings.ToLower(strings.TrimSpace(route.Family))
+	if family != "" {
+		return strings.HasPrefix(family, "grok")
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(stringValue(payload["model"]))), "grok-")
 }
 
 func normalizeAnthropicPayloadForRoute(payload map[string]any, route modelRoute) bool {

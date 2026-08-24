@@ -1,13 +1,13 @@
-# VS Code 1.132.0 GitHub Copilot HTTP 基线
+# VS Code 1.134.0 GitHub Copilot HTTP 基线
 
 <!-- upstream-baseline
-verified_at: 2026-08-07T10:34:19Z
+verified_at: 2026-08-24T10:18:30Z
 repository: https://github.com/microsoft/vscode
-tag: 1.132.0
-revision: df53daabb18cd157bdb08c7f01c34df936cf12f4
+tag: 1.134.0
+revision: 110a328ea54b42367b803ec53ee0bf52ef26b419
 extension: extensions/copilot
-package_version: 0.60.0
-copilot_api_package: 0.4.3
+package_version: 0.62.0
+copilot_api_package: 0.5.2
 -->
 
 本文只记录本仓库无法直接给出的 pinned 上游依据：模型 API 选择、最终 HTTP identity、
@@ -15,11 +15,11 @@ copilot_api_package: 0.4.3
 
 ## 源码锚点
 
-| 关注点 | VS Code 1.132.0 源码 |
+| 关注点 | VS Code 1.134.0 源码 |
 |---|---|
 | 模型 metadata 与 endpoint | [modelMetadataFetcher.ts]、[chatEndpoint.ts] |
 | 公共请求与 transport | [chatMLFetcher.ts]、[networking.ts] |
-| CAPI header/endpoint mixin | [capiClient.ts]、lockfile 中的 `@vscode/copilot-api@0.4.3` |
+| CAPI header/endpoint mixin | [capiClient.ts]、lockfile 中的 `@vscode/copilot-api@0.5.2` |
 | Responses body、state、compaction、events | [responsesApi.ts]、[responsesApi.spec.ts] |
 | Messages body、thinking、cache、events | [messagesApi.ts]、[anthropic.ts]、[messagesApi.spec.ts] |
 
@@ -41,15 +41,19 @@ vision、streaming、reasoning、thinking、context editing 和 `supported_endpo
 追加或覆盖 editor identity 与最终 API version。HTTP 出口可固定证明的值是：
 
 ```http
-User-Agent: GitHubCopilotChat/0.60.0
-Editor-Version: vscode/1.132.0
-Editor-Plugin-Version: copilot-chat/0.60.0
-X-GitHub-Api-Version: 2026-06-01
+User-Agent: GitHubCopilotChat/0.62.0
+Editor-Version: vscode/1.134.0
+Editor-Plugin-Version: copilot-chat/0.62.0
+X-GitHub-Api-Version: 2026-08-01
 ```
 
 `Copilot-Integration-Id` 的 production 值通常为 `vscode-chat`。session/machine/device
 ID、fetcher library version 和部分 build identity 依赖正式构建或运行环境，代理不能伪造。
 Responses WebSocket 使用另一 API version；本项目只对齐 HTTP。
+
+Copilot token broker 是独立版本面：GitHub token 请求使用
+`Authorization: token ...` 和 `X-GitHub-Api-Version: 2025-04-01`。`/models` 与
+`/models/{id}/policy` 则经 CAPI header mixin 使用上述 `2026-08-01`。
 
 动态字段包括 `X-Request-Id`、`X-Agent-Task-Id`、`X-Interaction-Id`、
 `X-Interaction-Type`、`OpenAI-Intent` 和 `X-Initiator`。其中 initiator 来自 VS Code
@@ -71,11 +75,16 @@ Responses WebSocket 使用另一 API version；本项目只对齐 HTTP。
 reasoning include；truncation、tools、reasoning、verbosity、cache 与 context management
 由配置和 capability 决定。
 
+0.62.0 中 Responses context management 的配置默认为关闭；显式启用后，compaction
+阈值仍为 prompt window 的 90%，window 无效时回退 50000。Grok route 不生成
+`reasoning.summary` 或 `text.verbosity`，常规工具被构造为 function tool，仅
+tool-search 能力走专用 `tool_search` 形状。
+
 完成响应的 `response.id` 可成为下一轮 `previous_response_id`，此时 input 只包含
 marker 之后的增量历史。mode、summary 或连接状态变化可能使 marker 失效并触发完整重放。
 
-服务端 compaction 的阈值为 prompt window 的 90%，window 无效时回退 50000；已知排除
-family 不注入。客户端负责从 output item 或 terminal output 选择最新 compaction item、
+已知排除 family 即使在开关启用时也不注入 compaction。客户端负责从 output item
+或 terminal output 选择最新 compaction item、
 切分 history、去重并在下一轮重放。provider endpoint 只运输 opaque state。
 
 processor 将 `response.completed`、`response.incomplete`、`response.failed` 和顶层
@@ -112,13 +121,13 @@ pinned 源码可生成四个 beta：
 [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)；当前可执行行为始终以
 [src](src/) 及其测试为准。
 
-[modelMetadataFetcher.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/node/modelMetadataFetcher.ts
-[chatEndpoint.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/node/chatEndpoint.ts
-[chatMLFetcher.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts
-[networking.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/networking/common/networking.ts
-[capiClient.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/common/capiClient.ts
-[responsesApi.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/node/responsesApi.ts
-[responsesApi.spec.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/node/test/responsesApi.spec.ts
-[messagesApi.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/node/messagesApi.ts
-[anthropic.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/networking/common/anthropic.ts
-[messagesApi.spec.ts]: https://github.com/microsoft/vscode/blob/df53daabb18cd157bdb08c7f01c34df936cf12f4/extensions/copilot/src/platform/endpoint/test/node/messagesApi.spec.ts
+[modelMetadataFetcher.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/node/modelMetadataFetcher.ts
+[chatEndpoint.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/node/chatEndpoint.ts
+[chatMLFetcher.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/extension/prompt/node/chatMLFetcher.ts
+[networking.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/networking/common/networking.ts
+[capiClient.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/common/capiClient.ts
+[responsesApi.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/node/responsesApi.ts
+[responsesApi.spec.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/node/test/responsesApi.spec.ts
+[messagesApi.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/node/messagesApi.ts
+[anthropic.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/networking/common/anthropic.ts
+[messagesApi.spec.ts]: https://github.com/microsoft/vscode/blob/110a328ea54b42367b803ec53ee0bf52ef26b419/extensions/copilot/src/platform/endpoint/test/node/messagesApi.spec.ts
