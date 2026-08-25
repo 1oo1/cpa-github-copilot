@@ -116,8 +116,10 @@ GET /v0/management/get-auth-status?state=<state>
   的跨协议转换会以 `format_mismatch` 拒绝。
 - 不支持独立 `/v1/responses/compact`；使用 `/v1/responses` 的 inline
   `context_management`。
-- Grok Responses 不会被自动注入 `context_management`，并会移除 Copilot 端不接受的
-  `reasoning.summary` 和 `text.verbosity`；其他 `text` 控制和 caller tool 声明保持不变。
+- Grok Responses 会移除 Copilot 端不接受的 `context_management`、`background`、
+  `reasoning.summary`、`text.verbosity` 和 `service_tier`。Codex 的 custom tool 会转为
+  Grok 可接受的 function tool（`apply_patch` 除外），namespace tool 会在上行时展开，
+  相应的历史与响应调用会同步转换并在下行时还原。
 - Responses 流必须包含真实的 completed、incomplete、failed 或 error 终态；普通 EOF
   不会被合成为成功。
 - 合法 UUID 形式的 `X-Client-Request-Id` 会映射为上游 request/task ID；调用方不能

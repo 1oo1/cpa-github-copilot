@@ -27,6 +27,7 @@ type preparedInference struct {
 	upstreamPath     string
 	upstreamPayload  []byte
 	headers          http.Header
+	grokToolRefs     map[string]grokResponsesToolRef
 }
 
 type anthropicWebSearchRequestClass uint8
@@ -65,6 +66,9 @@ func (s *pluginService) execute(raw []byte) ([]byte, error) {
 		return nil, failure
 	}
 	payload := append([]byte(nil), resp.Body...)
+	if normalizer := newGrokResponsesResponseNormalizer(prepared.grokToolRefs); normalizer != nil {
+		payload = normalizer.normalizeJSON(payload)
+	}
 	responsesSourceStatus := ""
 	if prepared.upstreamFormat == formatOpenAIResponse {
 		status, terminal := responsesNonStreamTerminalStatus(payload)
@@ -250,6 +254,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 	if route.Format == formatClaude && declaresReasoningLevel(route.ReasoningLevels, requestedReasoningEffort) {
 		payload = preserveAnthropicReasoningEffort(payload, requestedReasoningEffort)
 	}
+	grokToolRefs := collectGrokResponsesToolRefs(payload, route)
 	payload, errPrepare := normalizeInferencePayloadForRoute(payload, model, route, stream, cfg.EnableResponsesContextManagement)
 	if errPrepare != nil {
 		return preparedInference{}, &pluginFailure{code: "invalid_request", message: errPrepare.Error(), httpStatus: http.StatusBadRequest}
@@ -275,6 +280,7 @@ func (s *pluginService) prepareInference(req pluginapi.ExecutorRequest, stream b
 		upstreamPath:     route.Path,
 		upstreamPayload:  payload,
 		headers:          inferenceHeadersForRoute(storage.CopilotSessionToken, route, payload, req.Headers, outputFormat),
+		grokToolRefs:     grokToolRefs,
 	}, nil
 }
 
@@ -558,6 +564,9 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRo
 			if len(text) == 0 {
 				delete(payload, "text")
 			}
+		}
+		if normalizeGrokResponsesRequest(payload) {
+			changed = true
 		}
 	}
 	// truncation/include 只在缺失时补齐 VS Code 默认值，保留有效 caller 值。

@@ -19,6 +19,7 @@ type streamBridgeFake struct {
 	mu sync.Mutex
 
 	readChunks     []rpcHostHTTPStreamReadResponse
+	upstream       []rpcHostHTTPRequest
 	emitted        [][]byte
 	upstreamClosed bool
 	pluginClosed   bool
@@ -96,6 +97,7 @@ func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, er
 			f.logs = append(f.logs, request)
 		}
 	case pluginabi.MethodHostHTTPDoStream:
+		f.upstream = append(f.upstream, payload.(rpcHostHTTPRequest))
 		result = rpcHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-1"}
 	case pluginabi.MethodHostHTTPStreamRead:
 		if len(f.readChunks) == 0 {
@@ -248,6 +250,63 @@ func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 		if !json.Valid([]byte(data)) {
 			t.Fatalf("emitted[%d] has invalid SSE JSON: %q", index, data)
 		}
+	}
+}
+
+func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.T) {
+	stream := "" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":""}}` + "\n\n" +
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_shell","delta":"pwd"}` + "\n\n" +
+		`data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_shell","arguments":"{\"input\":\"pwd\"}"}` + "\n\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}","status":"completed"}}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}"}]}}` + "\n\n"
+	bridge := newStreamBridgeFake(rpcHostHTTPStreamReadResponse{Payload: []byte(stream)})
+	service := newPluginService(bridge)
+	now := time.Unix(106_000, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{
+		"model":"grok-4.6","stream":true,"service_tier":"priority","input":"run pwd",
+		"tools":[
+			{"type":"custom","name":"apply_patch","format":{"type":"grammar"}},
+			{"type":"custom","name":"shell","format":{"type":"grammar"}}
+		]
+	}`)
+	_, errStream := service.executeStream(mustJSON(t, rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			AuthID: "auth", Model: "grok-4.6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+			Payload: payload, OriginalRequest: payload,
+			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "grok-4.6", Family: "grok-4.6", Format: formatOpenAIResponse})),
+		},
+		StreamID: "plugin-grok-custom-tools",
+	}))
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	bridge.wait(t)
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if bridge.pluginError != "" || len(bridge.upstream) != 1 {
+		t.Fatalf("stream state: error=%q upstream=%d", bridge.pluginError, len(bridge.upstream))
+	}
+	var upstream map[string]any
+	if errDecode := json.Unmarshal(bridge.upstream[0].Body, &upstream); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if _, exists := upstream["service_tier"]; exists {
+		t.Fatal("service_tier was sent upstream")
+	}
+	tools := upstream["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "function" || tools[0].(map[string]any)["name"] != "shell" {
+		t.Fatalf("upstream tools = %#v", tools)
+	}
+	emitted := string(bytesJoin(bridge.emitted))
+	for _, want := range []string{"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", `"type":"custom_tool_call"`, `"input":"pwd"`} {
+		if !strings.Contains(emitted, want) {
+			t.Fatalf("restored stream missing %q: %s", want, emitted)
+		}
+	}
+	if strings.Contains(emitted, "response.function_call_arguments") {
+		t.Fatalf("function call events leaked to Codex: %s", emitted)
 	}
 }
 

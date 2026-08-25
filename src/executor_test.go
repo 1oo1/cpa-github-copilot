@@ -1784,8 +1784,8 @@ func TestNormalizeOpenAIResponsesRemovesUnsupportedGrokHints(t *testing.T) {
 		t.Fatalf("Grok text controls = %#v", text)
 	}
 	tools, _ := body["tools"].([]any)
-	if len(tools) != 2 || tools[1].(map[string]any)["type"] != "custom" {
-		t.Fatalf("caller tools were silently changed: %#v", tools)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "lookup" {
+		t.Fatalf("Grok-incompatible tools were not normalized: %#v", tools)
 	}
 }
 

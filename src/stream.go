@@ -140,7 +140,7 @@ func (s *pluginService) forwardCopilotStream(ctx context.Context, client hostCli
 	}()
 	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		forwardErr = forwardStreamPassThrough(ctx, client, pluginStreamID, upstreamStreamID, prepared.outputFormat, maxBuffer, tracker)
+		forwardErr = forwardStreamPassThrough(ctx, client, pluginStreamID, upstreamStreamID, prepared.outputFormat, maxBuffer, tracker, newGrokResponsesResponseNormalizer(prepared.grokToolRefs))
 		return
 	}
 	forwardErr = forwardTranslatedStream(ctx, client, pluginStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
@@ -562,12 +562,13 @@ func classifyStreamForwardError(err error) (reason, message string, benign bool)
 	return "unknown", err.Error(), false
 }
 
-func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID, outputFormat string, maxBuffer int, tracker *responsesTerminalTracker) error {
+func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID, outputFormat string, maxBuffer int, tracker *responsesTerminalTracker, grokNormalizer *grokResponsesResponseNormalizer) error {
 	framer := newSSEFramer(maxBuffer)
 	emitFrame := func(frame []byte) (bool, error) {
 		if len(frame) == 0 {
 			return false, nil
 		}
+		frame = grokNormalizer.normalizeSSEFrame(frame)
 		terminal := sourceProtocolTerminal(frame, outputFormat)
 		if outputFormat == formatOpenAI {
 			payload := openAIChatFrameData(frame)
@@ -637,6 +638,7 @@ func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStre
 func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
 	var state any
+	grokNormalizer := newGrokResponsesResponseNormalizer(prepared.grokToolRefs)
 	requireResponsesSourceTerminal := prepared.upstreamFormat == formatOpenAIResponse
 	responsesSourceStatus := ""
 	original := prepared.request.OriginalRequest
@@ -645,6 +647,7 @@ func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStrea
 	}
 	emitFrame := func(frame []byte) (bool, error) {
 		normalized := normalizeSSEFrame(frame)
+		normalized = grokNormalizer.normalizeSSEFrame(normalized)
 		if len(normalized) == 0 {
 			return false, nil
 		}
