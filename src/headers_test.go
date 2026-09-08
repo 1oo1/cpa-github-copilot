@@ -92,10 +92,10 @@ func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
 	}
 }
 
-func TestInferenceHeadersUseVSCode1134Identity(t *testing.T) {
+func TestInferenceHeadersUseVSCode1136Identity(t *testing.T) {
 	headers := inferenceHeaders("session", formatOpenAI, []byte(`{}`), nil)
-	if headers.Get("User-Agent") != "GitHubCopilotChat/0.62.0" || headers.Get("Editor-Version") != "vscode/1.134.0" ||
-		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.62.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
+	if headers.Get("User-Agent") != "GitHubCopilotChat/0.64.1" || headers.Get("Editor-Version") != "vscode/1.136.1" ||
+		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.64.1" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
 		headers.Get("X-GitHub-Api-Version") != "2026-08-01" {
 		t.Fatalf("identity headers = %#v", headers)
 	}
@@ -220,7 +220,8 @@ func TestAnthropicBetaHeaderIsSourceProven(t *testing.T) {
 	}{
 		{name: "non-adaptive route always sends interleaved thinking", route: modelRoute{Format: formatClaude}, payload: plainPayload, want: interleavedThinkingBeta},
 		{name: "adaptive route never sends interleaved thinking", route: modelRoute{Format: formatClaude, AdaptiveThinking: true}, payload: plainPayload, want: ""},
-		{name: "tool search beta requires capability and body evidence", route: modelRoute{Format: formatClaude, AdaptiveThinking: true, SupportsToolSearch: &trueValue}, payload: toolSearchPayload, want: advancedToolUseBeta},
+		{name: "tool search beta follows capability with body evidence", route: modelRoute{Format: formatClaude, AdaptiveThinking: true, SupportsToolSearch: &trueValue}, payload: toolSearchPayload, want: advancedToolUseBeta},
+		{name: "tool search beta follows capability without body evidence", route: modelRoute{Format: formatClaude, AdaptiveThinking: true, SupportsToolSearch: &trueValue}, payload: plainPayload, want: advancedToolUseBeta},
 		{name: "tool search beta absent without capability", route: modelRoute{Format: formatClaude, AdaptiveThinking: true}, payload: toolSearchPayload, want: ""},
 		{name: "context management beta requires capability and body evidence", route: modelRoute{Format: formatClaude, AdaptiveThinking: true, SupportsContextEditing: &trueValue}, payload: contextManagementPayload, want: contextManagementBeta},
 		{name: "context management beta absent without body evidence", route: modelRoute{Format: formatClaude, AdaptiveThinking: true, SupportsContextEditing: &trueValue}, payload: plainPayload, want: ""},

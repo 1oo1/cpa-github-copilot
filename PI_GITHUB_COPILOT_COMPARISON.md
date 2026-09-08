@@ -1,12 +1,12 @@
 # VS Code 对齐基线与 pi 历史边界
 
 <!-- compatibility-baseline
-verified_at: 2026-08-24T10:18:30Z
-vscode_tag: 1.134.0
-vscode_revision: 110a328ea54b42367b803ec53ee0bf52ef26b419
-copilot_chat_version: 0.62.0
+verified_at: 2026-09-08T03:14:08Z
+vscode_tag: 1.136.1
+vscode_revision: a44adf7f53e00964ab890f9f8758a334f1fc15bc
+copilot_chat_version: 0.64.1
 copilot_api_package: 0.5.2
-cliproxyapi_revision: f4da6b9e5c684f20c1dd1727a9a6bcc6ef5f9bcd
+cliproxyapi_revision: d0c0f8913f7af2e82e3786ed902cb919b449aac7
 -->
 
 > 文件名为兼容旧链接而保留。`pi` 不再是实现或同步基线。
@@ -24,7 +24,7 @@ cliproxyapi_revision: f4da6b9e5c684f20c1dd1727a9a6bcc6ef5f9bcd
 
 不能用低优先级静态目录覆盖账户 `/models`，也不能用 caller header 覆盖
 Authorization、API origin 或 pinned identity。上游依据与源码锚点见
-[VSCODE_COPILOT_1_134_ARCHITECTURE.md](VSCODE_COPILOT_1_134_ARCHITECTURE.md)。
+[VSCODE_COPILOT_1_136_ARCHITECTURE.md](VSCODE_COPILOT_1_136_ARCHITECTURE.md)。
 
 ## 产品边界
 

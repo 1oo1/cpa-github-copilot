@@ -10,8 +10,8 @@ provider `github-copilot` 接入；配置 ID 为 `github-copilot-go`。
 | Anthropic Messages | `/v1/messages` |
 
 插件根据当前账户的 Copilot 模型目录选择上游协议，必要时调用 CLIProxyAPI
-translator 转换请求与响应。HTTP wire 基线固定为 VS Code `1.134.0`、Copilot Chat
-`0.62.0`、`@vscode/copilot-api@0.5.2` 和 API version `2026-08-01`；`pi` 只用于
+translator 转换请求与响应。HTTP wire 基线固定为 VS Code `1.136.1`、Copilot Chat
+`0.64.1`、`@vscode/copilot-api@0.5.2` 和 API version `2026-08-01`；`pi` 只用于
 旧凭据兼容。
 
 > Copilot token broker 和模型接口不是稳定的通用第三方 API。使用前请确认符合订阅
@@ -151,7 +151,7 @@ make integration
 
 兼容性文档：
 
-- [VSCODE_COPILOT_1_134_ARCHITECTURE.md](VSCODE_COPILOT_1_134_ARCHITECTURE.md)：
+- [VSCODE_COPILOT_1_136_ARCHITECTURE.md](VSCODE_COPILOT_1_136_ARCHITECTURE.md)：
   pinned 上游实现依据；
 - [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)：
   事实优先级、产品边界、legacy 范围与升级流程。

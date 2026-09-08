@@ -10,24 +10,23 @@ import (
 )
 
 const (
-	copilotUserAgent       = "GitHubCopilotChat/0.62.0"
-	copilotEditorVersion   = "vscode/1.134.0"
-	copilotPluginVersion   = "copilot-chat/0.62.0"
+	copilotUserAgent       = "GitHubCopilotChat/0.64.1"
+	copilotEditorVersion   = "vscode/1.136.1"
+	copilotPluginVersion   = "copilot-chat/0.64.1"
 	copilotIntegrationID   = "vscode-chat"
 	copilotAPIVersion      = "2026-08-01"
 	copilotTokenAPIVersion = "2025-04-01"
 
-	// 以下四个 beta 都是 VS Code 1.134.0 源码（chatEndpoint.ts getAnthropicBetaHeader）可证明的值。
+	// 以下四个 beta 都是 VS Code 1.136.1 源码（chatEndpoint.ts getAnthropicBetaHeader）可证明的值。
 	interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
 	advancedToolUseBeta     = "advanced-tool-use-2025-11-20"
 	contextManagementBeta   = "context-management-2025-06-27"
 	extendedCacheTTLBeta    = "extended-cache-ttl-2025-04-11"
 
 	defaultInteractionType = "conversation-other"
-	toolSearchToolName     = "tool_search"
 )
 
-// vsCodeInteractionTypes 是 VS Code 1.134.0 中 locationToIntent 与
+// vsCodeInteractionTypes 是 VS Code 1.136.1 中 locationToIntent 与
 // InteractionTypeOverride 支持的完整词表；X-Interaction-Type 只接受这些值，
 // 其余调用方取值一律回退到 resolveInteractionType 的默认值。
 var vsCodeInteractionTypes = map[string]bool{
@@ -106,7 +105,7 @@ func inferenceHeadersForRoute(sessionToken string, route modelRoute, payload []b
 	return headers
 }
 
-// anthropicBetaHeader 只计算 VS Code 1.134.0 源码证明存在的四个 beta，不透传调用方任意值。
+// anthropicBetaHeader 只计算 VS Code 1.136.1 源码证明存在的四个 beta，不透传调用方任意值。
 func anthropicBetaHeader(route modelRoute, payload []byte) string {
 	var betas []string
 	if !route.AdaptiveThinking {
@@ -114,7 +113,9 @@ func anthropicBetaHeader(route modelRoute, payload []byte) string {
 		// 不判断本次请求是否真正开启 thinking（VS Code 源码 TODO 记录的差异）。
 		betas = append(betas, interleavedThinkingBeta)
 	}
-	if optionalBool(route.SupportsToolSearch) && payloadUsesToolSearch(payload) {
+	// 与 ChatEndpoint 一致：该 beta 由模型 capability 决定，不依赖本次 body
+	// 是否已包含 tool_search；VS Code 可在后续构造请求时动态注入该工具。
+	if optionalBool(route.SupportsToolSearch) {
 		betas = append(betas, advancedToolUseBeta)
 	}
 	if optionalBool(route.SupportsContextEditing) && payloadHasContextManagement(payload) {
@@ -162,23 +163,6 @@ func newRequestID() string {
 	buf[6] = (buf[6] & 0x0f) | 0x40
 	buf[8] = (buf[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
-}
-
-func payloadUsesToolSearch(payload []byte) bool {
-	var root struct {
-		Tools []struct {
-			Name string `json:"name"`
-		} `json:"tools"`
-	}
-	if json.Unmarshal(payload, &root) != nil {
-		return false
-	}
-	for _, tool := range root.Tools {
-		if strings.EqualFold(strings.TrimSpace(tool.Name), toolSearchToolName) {
-			return true
-		}
-	}
-	return false
 }
 
 func payloadHasContextManagement(payload []byte) bool {
