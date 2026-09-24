@@ -1,78 +1,28 @@
-# VS Code 对齐基线与 pi 历史边界
+# VS Code / Copilot Chat 兼容基线
 
-<!-- compatibility-baseline
-verified_at: 2026-09-08T03:14:08Z
-vscode_tag: 1.136.1
-vscode_revision: a44adf7f53e00964ab890f9f8758a334f1fc15bc
-copilot_chat_version: 0.64.1
-copilot_api_package: 0.5.2
-cliproxyapi_revision: d0c0f8913f7af2e82e3786ed902cb919b449aac7
--->
+文件名为保留历史链接而沿用。`pi` 不是实现或同步基线，仅保留旧凭据字段迁移。
 
-> 文件名为兼容旧链接而保留。`pi` 不再是实现或同步基线。
+## 当前依据
 
-## 事实来源
+- 推理 HTTP wire：VS Code `1.136.1`，Copilot Chat `0.64.1`，`@vscode/copilot-api@0.5.2`，API version `2026-08-01`。
+- 套餐及额度：VS Code `1.139.0`，Copilot Chat `0.67.0`，固定 revision `2242ebbb54efeeb0129e08e919e7e8d43033cd83`。
+- 模型列表及能力：当前账户的 Copilot `/models`。不能用其他厂商的静态模型目录覆盖。
+- 原 CPA 协议转换源码迁自 `c404af96ebacedf8168b3c2bdbf4449a21cd1c1e`；管理面板中的额度格式化语义迁自 `4530da271ba2e89810d4dccebc57f3091afa590a`。不依赖这些仓库参与构建，也不自动同步它们的完整功能。
 
-发生冲突时按以下顺序判断：
+额度入口：[账户请求](https://github.com/microsoft/vscode/blob/2242ebbb54efeeb0129e08e919e7e8d43033cd83/src/vs/workbench/services/accounts/browser/defaultAccount.ts)、[套餐与额度解析](https://github.com/microsoft/vscode/blob/2242ebbb54efeeb0129e08e919e7e8d43033cd83/src/vs/workbench/services/chat/common/chatEntitlementService.ts)、[官方展示](https://github.com/microsoft/vscode/blob/2242ebbb54efeeb0129e08e919e7e8d43033cd83/src/vs/workbench/contrib/chat/browser/chatStatus/chatStatusDashboard.ts)。推理依据另见 [HTTP wire 架构基线](VSCODE_COPILOT_1_136_ARCHITECTURE.md)。
 
-1. 本仓库源码与测试：插件实际发送、接受、拒绝和记录的内容；
-2. pinned VS Code/Copilot Chat：官方客户端的 HTTP wire、能力和状态语义；
-3. pinned `@vscode/copilot-api`：endpoint 映射及最终 identity/API version；
-4. 相邻 CLIProxyAPI：ABI、host callback 和 translator contract；
-5. 当前账户的 Copilot `/models`：运行时模型、endpoint 与 capability；
-6. `pi`：仅作 legacy 凭据迁移和非权威交叉检查。
+## 所有权
 
-不能用低优先级静态目录覆盖账户 `/models`，也不能用 caller header 覆盖
-Authorization、API origin 或 pinned identity。上游依据与源码锚点见
-[VSCODE_COPILOT_1_136_ARCHITECTURE.md](VSCODE_COPILOT_1_136_ARCHITECTURE.md)。
+本服务负责 GitHub Device Flow、Copilot session、账户模型、provider wire、调度、额度和预算保护；客户端负责 conversation history、continuation、compaction 的选择与下一轮重放。VS Code 的 UI、telemetry、agent loop、WebSocket 和 runtime identity 不移植。
 
-## 产品边界
+所有外发 HTTP 由共享 transport 提供，Copilot 模块仍通过 hostClient 使用它。不能伪造 session/machine/device ID，不能放宽 token、origin、路径、header、终态和 opaque state 校验。
 
-VS Code 是持有会话状态的完整客户端；本项目是 stateless provider plugin：
+## 升级流程
 
-| 责任 | 所有者 |
-|---|---|
-| GitHub Device Flow、Copilot token exchange、账户模型与 provider wire | 本插件 |
-| 公共 API、凭据文件、刷新调度、transport、translator | CLIProxyAPI |
-| conversation history、Responses marker/compaction 选择与下一轮重放 | 调用客户端 |
-| VS Code UI、telemetry、agent loop、WebSocket 和 runtime identity | 不移植 |
+1. 固定 VS Code 稳定 tag/commit、内置 Copilot Chat 版本及 CAPI lockfile，不直接依赖浮动 main。
+2. 对比账户 entitlement、token exchange、模型 metadata、endpoint、networking、Messages 和 Responses 实现及相邻测试。
+3. 先增加区分旧/新行为的 fixture，再修改行为所属模块；额度基线升级不等于推理请求头自动升级。
+4. 跑 test、vet、race、HTTP/SSE 集成及前端测试；检查私密数据脱敏、取消、EOF、流式错误和凭据替换。
+5. 更新实际变更涉及的基线和 README。只发布新的独立二进制，保留用户数据目录。
 
-插件只保证原生 Responses opaque state 无损；无法证明可逆的跨格式 continuation 必须
-fail closed。所有上游流量必须经过 `hostClient`，且不能向日志或错误暴露 token、
-header、请求/响应正文或 encrypted continuation。
-
-## pi legacy 范围
-
-`auth.parse` 仍识别旧凭据字段 `refresh`、`access`、`expires`、
-`enterpriseUrl` 和 `availableModelIds`。迁移后的值仍须通过当前 host、expiry、
-token 和 endpoint 校验。
-
-不再从 `pi` 同步模型目录、identity、payload builder、SSE parser、UI、文件锁或
-provider composition。若 `pi` 暴露新的 Copilot 行为，必须先在当前 VS Code/CAPI
-源码或 GitHub provider 响应中找到独立证据。
-
-## 更新基线
-
-升级 VS Code/Copilot Chat 时：
-
-1. 固定 VS Code tag/commit、Copilot Chat version、CAPI lockfile version、
-   CLIProxyAPI revision 和插件 revision；不要以浮动分支或 dirty upstream 下结论。
-2. 优先检查 model metadata/endpoint、公共 networking、Responses、Messages、CAPI
-   header mixin 及相邻 upstream tests。
-3. 先增加能区分旧/新行为的 contract test，再修改行为所属的 route、header、
-   normalizer 或 terminal validator。
-4. 对 opaque state、terminal、Authorization、endpoint 或 streaming 变更补充
-   adversarial 与 integration coverage。
-5. 更新本文的 baseline block 和上游架构文档；本插件的当前行为以源码与测试为准，
-   不维护完成清单或验收快照。
-
-最低验证 gate：
-
-```bash
-make test
-make vet
-go test -race ./...
-make integration
-test -z "$(gofmt -d src/*.go)"
-git diff --check
-```
+即使只使用 Copilot，也必须继续处理依赖安全更新和客户端公共 API 的兼容问题。

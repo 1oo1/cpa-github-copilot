@@ -1,0 +1,504 @@
+package copilot
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
+	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
+)
+
+func TestParseDiscoveredModelsFiltersAndMapsCapabilities(t *testing.T) {
+	toolFalse := false
+	_ = toolFalse
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-5.4", true, "", true, []string{"/responses"}),
+		remoteModelFixture("claude-sonnet-4.6", true, "", true, []string{"/v1/messages"}),
+		remoteModelFixture("disabled", true, "disabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("hidden", false, "", true, []string{"/chat/completions"}),
+		remoteModelFixture("no-tools", true, "", false, []string{"/chat/completions"}),
+	}})
+	models, errParse := parseDiscoveredModels(raw, false)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(models) != 2 || models[0].ID != "claude-sonnet-4.6" || models[0].Format != formatClaude || models[1].Format != formatOpenAIResponse {
+		t.Fatalf("models = %#v", models)
+	}
+	infos := modelInfos(models)
+	if len(infos) != 2 || infos[0].ContextLength != 100_000 || infos[0].MaxCompletionTokens != 10000 || infos[0].Thinking == nil {
+		t.Fatalf("model infos = %#v", infos)
+	}
+}
+
+func TestKnownCopilotModelsMatchPolicyEnableCatalog(t *testing.T) {
+	want := []string{
+		"claude-fable-5", "claude-haiku-4.5", "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7",
+		"claude-opus-4.8", "claude-opus-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-sonnet-4.6",
+		"claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.6-flash", "gpt-4.1",
+		"gpt-5-mini", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini",
+		"gpt-5.4-nano", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6",
+		"kimi-k2.7-code", "mai-code-1-flash-picker",
+	}
+	if strings.Join(knownCopilotModels, ",") != strings.Join(want, ",") {
+		t.Fatalf("known models = %v, want %v", knownCopilotModels, want)
+	}
+}
+
+func TestEnableKnownModelsUsesCurrentAPIIdentity(t *testing.T) {
+	var calls atomic.Int64
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != operation.MethodHostHTTPDo {
+			t.Errorf("method = %s", method)
+		}
+		req := payload.(localHostHTTPRequest)
+		headers := http.Header(req.Headers)
+		if !strings.HasSuffix(req.URL, "/policy") || headers.Get("Authorization") != "Bearer session" ||
+			headers.Get("X-GitHub-Api-Version") != copilotAPIVersion {
+			t.Errorf("policy request = %#v", req)
+		}
+		calls.Add(1)
+		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
+	}}
+	service := newService(bridge)
+	service.enableKnownModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "session",
+		GitHubHost:          "github.com",
+	})
+	if got := calls.Load(); got != int64(len(knownCopilotModels)) {
+		t.Fatalf("policy calls = %d, want %d", got, len(knownCopilotModels))
+	}
+}
+
+func TestParseDiscoveredModelsUsesCatalogThinkingCapabilities(t *testing.T) {
+	model := remoteModelFixture("claude-opus-4.8", true, "", true, []string{"/v1/messages"})
+	capabilities := model["capabilities"].(map[string]any)
+	supports := capabilities["supports"].(map[string]any)
+	supports["adaptive_thinking"] = false
+	supports["reasoning_effort"] = []string{"low", "ultra"}
+	raw := mustJSON(t, map[string]any{"data": []any{model}})
+	models, errParse := parseDiscoveredModels(raw, false)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(models) != 1 || models[0].AdaptiveThinking || strings.Join(models[0].ReasoningLevels, ",") != "low,ultra" {
+		t.Fatalf("models = %#v", models)
+	}
+	infos := modelInfos(models)
+	if len(infos) != 1 || infos[0].Thinking == nil || infos[0].Thinking.DynamicAllowed ||
+		strings.Join(infos[0].Thinking.Levels, ",") != "low,ultra" ||
+		strings.Contains(strings.Join(infos[0].SupportedParameters, ","), "temperature") {
+		t.Fatalf("model infos = %#v", infos)
+	}
+
+	for _, modelID := range []string{"gemini-3.6-flash", "gpt-4.1", "kimi-k2.7-code"} {
+		infos := modelInfos([]storedModel{{
+			ID: modelID, Format: formatOpenAI, ReasoningLevels: []string{"high"}, ReasoningLevelsDeclared: true,
+		}})
+		if len(infos) != 1 || infos[0].Thinking == nil || strings.Join(infos[0].Thinking.Levels, ",") != "high" ||
+			!strings.Contains(strings.Join(infos[0].SupportedParameters, ","), "reasoning_effort") {
+			t.Fatalf("%s model info = %#v", modelID, infos)
+		}
+	}
+}
+
+func TestReasoningLevelsAndContextComeOnlyFromCopilotCatalog(t *testing.T) {
+	model := remoteModelFixture("gpt-5.6-terra", true, "", true, []string{"/responses"})
+	supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
+	supports["reasoning_effort"] = []string{"minimal", "low", "ultra"}
+	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+	if errParse != nil || len(models) != 1 {
+		t.Fatalf("models = %#v, error = %v", models, errParse)
+	}
+	if got := models[0]; strings.Join(got.ReasoningLevels, ",") != "low,ultra" || !got.ReasoningLevelsDeclared || got.ContextWindow != 100_000 {
+		t.Fatalf("catalog metadata was not preserved exactly: %#v", got)
+	}
+	infos := modelInfos(models)
+	if len(infos) != 1 || infos[0].Thinking == nil || strings.Join(infos[0].Thinking.Levels, ",") != "low,ultra" ||
+		infos[0].ContextLength != 100_000 || strings.Contains(strings.Join(infos[0].Thinking.Levels, ","), "minimal") {
+		t.Fatalf("model infos = %#v", infos)
+	}
+}
+
+func TestSelectModelFormatUsesSupportedEndpointAndInference(t *testing.T) {
+	for _, test := range []struct {
+		id        string
+		endpoints []string
+		want      string
+	}{
+		{id: "gpt-5.4", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
+		{id: "grok-4.5", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
+		{id: "grok-4.6", endpoints: nil, want: formatOpenAIResponse},
+		{id: "claude-opus-5", endpoints: []string{"/responses", "/v1/messages"}, want: formatOpenAIResponse},
+		{id: "claude-fable-5", endpoints: []string{"/v1/messages", "/chat/completions"}, want: formatClaude},
+		{id: "claude-sonnet-4.6", endpoints: []string{"/v1/messages"}, want: formatClaude},
+		{id: "claude-fable-5", endpoints: nil, want: formatClaude},
+		{id: "claude-custom-5", endpoints: nil, want: formatOpenAI},
+		{id: "claude-fable-6", endpoints: nil, want: formatOpenAI},
+		{id: "gpt-4.1", endpoints: []string{"/responses"}, want: formatOpenAIResponse},
+		{id: "gpt-4.1", endpoints: nil, want: formatOpenAI},
+		{id: "gpt-4.1", endpoints: []string{"/embeddings"}, want: ""},
+	} {
+		if got := selectModelFormat(test.id, test.endpoints); got != test.want {
+			t.Fatalf("selectModelFormat(%q, %#v) = %q, want %q", test.id, test.endpoints, got, test.want)
+		}
+	}
+}
+
+func TestResolveModelRouteRejectsModelOutsideDiscoveredCatalog(t *testing.T) {
+	service := newService(nil)
+	storage := copilotStorage{Models: []storedModel{{ID: "gpt-4.1", Format: formatOpenAI}}}
+	if route := service.resolveModelRoute("auth", "gpt-5.4", storage); route.Path != "" {
+		t.Fatalf("unexpected inferred route outside account catalog: %#v", route)
+	}
+}
+
+func TestResolveModelRouteRejectsInferenceAfterEmptyDiscovery(t *testing.T) {
+	service := newService(nil)
+	storage := copilotStorage{ModelsFetchedAt: time.Now().UnixMilli()}
+	if route := service.resolveModelRoute("auth", "gpt-5.4", storage); route.Path != "" {
+		t.Fatalf("unexpected inferred route after empty discovery: %#v", route)
+	}
+}
+
+func TestCachedRouteUsesStoredMetadataWithoutModelNameOverrides(t *testing.T) {
+	service := newService(nil)
+	legacy := storedModel{ID: "claude-fable-5", Format: formatOpenAI}
+	storage := copilotStorage{Models: []storedModel{legacy}}
+
+	route := service.resolveModelRoute("auth", legacy.ID, storage)
+	if route.Format != formatOpenAI || route.Path != "/chat/completions" || route.AdaptiveThinking {
+		t.Fatalf("legacy cached route = %#v", route)
+	}
+
+	infos := modelInfos(storage.Models)
+	if len(infos) != 1 || infos[0].Thinking != nil {
+		t.Fatalf("legacy cached model info = %#v", infos)
+	}
+}
+
+func TestModelsForAuthUsesFreshCredentialCache(t *testing.T) {
+	bridge := &fakeBridge{handler: func(method string, _ any) (any, error) {
+		t.Fatalf("unexpected host call %s", method)
+		return nil, nil
+	}}
+	service := newService(bridge)
+	service.now = func() time.Time { return time.Unix(30_000, 0).UTC() }
+	storage := copilotStorage{
+		Type:                providerIdentifier,
+		GitHubAccessToken:   "ghu_secret",
+		CopilotSessionToken: "tid=session;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+		ModelsFetchedAt:     service.now().UnixMilli(),
+		Models:              []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
+	}
+	raw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)}}))
+	if errModels != nil {
+		t.Fatal(errModels)
+	}
+	result := decodePluginResult[contract.ModelResponse](t, raw)
+	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" || len(result.AuthUpdate.StorageJSON) != 0 {
+		t.Fatalf("model response = %#v", result)
+	}
+	if route := service.resolveModelRoute("auth-1", "gpt-4.1", copilotStorage{}); route.Format != formatOpenAI {
+		t.Fatalf("cached route = %#v", route)
+	}
+}
+
+func TestModelsForAuthFallsBackToStaleNonEmptyCache(t *testing.T) {
+	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
+		if method != operation.MethodHostHTTPDo {
+			t.Fatalf("method = %s", method)
+		}
+		req := payload.(localHostHTTPRequest)
+		if !strings.HasSuffix(req.URL, "/models") {
+			t.Fatalf("URL = %s", req.URL)
+		}
+		return contract.HTTPResponse{StatusCode: http.StatusServiceUnavailable}, nil
+	}}
+	service := newService(bridge)
+	service.now = func() time.Time { return time.Unix(40_000, 0).UTC() }
+	storage := copilotStorage{
+		Type: providerIdentifier, GitHubAccessToken: "ghu", CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost: "github.com", ModelsFetchedAt: service.now().Add(-time.Hour).UnixMilli(),
+		Models: []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
+	}
+	raw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)}, HostCallbackID: "models"}))
+	if errModels != nil {
+		t.Fatal(errModels)
+	}
+	result := decodePluginResult[contract.ModelResponse](t, raw)
+	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" {
+		t.Fatalf("fallback response = %#v", result)
+	}
+	logEntry := findLogEvent(t, bridge.snapshotLogs(), "models.discovery.fallback")
+	if logEntry.Fields["failure_code"] != "model_discovery_http_error" || logEntry.Fields["cached_model_count"] != 1 {
+		t.Fatalf("fallback log fields = %#v", logEntry.Fields)
+	}
+	assertLogsExclude(t, bridge.snapshotLogs(), storage.GitHubAccessToken, storage.CopilotSessionToken)
+}
+
+func TestDiscoverModelsAcceptsValidEmptyCatalog(t *testing.T) {
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[]}`)}, nil
+	}}
+	service := newService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || models == nil || len(models) != 0 {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsFallsBackToEnabledPoliciesForIndividualAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("disabled", false, "disabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("no-tools", false, "enabled", false, []string{"/chat/completions"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 1 || models[0].ID != "gpt-4.1" {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsIncludesEnabledPoliciesAlongsidePickerCatalogForIndividualAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"}),
+		remoteModelFixture("gpt-5.6-terra", false, "enabled", true, []string{"/responses"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 2 || models[0].ID != "gpt-4.1" || models[1].ID != "gpt-5.6-terra" {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func TestDiscoverModelsKeepsStrictPickerSemanticsForBusinessAccounts(t *testing.T) {
+	raw := mustJSON(t, map[string]any{"data": []any{
+		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+	}})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newService(bridge)
+	models, failure := service.discoverModels(hostClient{bridge: bridge}, copilotStorage{
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.business.githubcopilot.com",
+		GitHubHost:          "github.com",
+	})
+	if failure != nil || len(models) != 0 {
+		t.Fatalf("models = %#v, failure = %#v", models, failure)
+	}
+}
+
+func remoteModelFixture(id string, picker bool, policy string, tools bool, endpoints []string) map[string]any {
+	return map[string]any{
+		"id": id, "name": id, "version": id + "-2026-01-01", "model_picker_enabled": picker,
+		"supported_endpoints": endpoints, "policy": map[string]any{"state": policy},
+		"capabilities": map[string]any{
+			"family": "test-family",
+			"limits": map[string]any{
+				"max_context_window_tokens": 100000, "max_prompt_tokens": 90000, "max_output_tokens": 10000,
+				"vision": map[string]any{"supported_media_types": []string{"image/png"}},
+			},
+			"supports": map[string]any{
+				"tool_calls": tools, "vision": true, "adaptive_thinking": true,
+				"reasoning_effort": []string{"low", "high"},
+			},
+		},
+	}
+}
+
+func TestStoredModelsJSONContainsNoSessionOutsideStorageBoundary(t *testing.T) {
+	model := storedModel{ID: "gpt-4.1", Name: "GPT", Format: formatOpenAI}
+	raw, _ := json.Marshal(model)
+	if strings.Contains(string(raw), "token") {
+		t.Fatalf("model route unexpectedly has credential field: %s", raw)
+	}
+}
+
+func TestParseDiscoveredModelsCapturesStreamingToolSearchAndContextEditing(t *testing.T) {
+	model := remoteModelFixture("gpt-5.4", true, "", true, []string{"/responses"})
+	supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
+	supports["streaming"] = true
+	supports["tool_search"] = true
+	supports["context_editing"] = true
+	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+	if errParse != nil || len(models) != 1 {
+		t.Fatalf("models = %#v, error = %v", models, errParse)
+	}
+	got := models[0]
+	if got.Streaming == nil || !*got.Streaming || got.SupportsToolSearch == nil || !*got.SupportsToolSearch ||
+		got.SupportsContextEditing == nil || !*got.SupportsContextEditing {
+		t.Fatalf("stored model = %#v", got)
+	}
+}
+
+func TestParseDiscoveredModelsDefaultsMissingOptionalCapabilitiesToDisabled(t *testing.T) {
+	model := remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"})
+	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+	if errParse != nil || len(models) != 1 {
+		t.Fatalf("models = %#v, error = %v", models, errParse)
+	}
+	got := models[0]
+	if got.SupportsToolSearch != nil || got.SupportsContextEditing != nil {
+		t.Fatalf("undeclared optional capabilities were not left disabled: %#v", got)
+	}
+}
+
+func TestModelInfosAdvertiseStreamOnlyWhenExplicitlySupported(t *testing.T) {
+	trueValue := true
+	falseValue := false
+	for _, test := range []struct {
+		name      string
+		streaming *bool
+		want      bool
+	}{
+		{name: "true", streaming: &trueValue, want: true},
+		{name: "false", streaming: &falseValue},
+		{name: "omitted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			infos := modelInfos([]storedModel{{ID: "gpt-4.1", Format: formatOpenAI, Streaming: test.streaming}})
+			if len(infos) != 1 {
+				t.Fatalf("model infos = %#v", infos)
+			}
+			got := false
+			for _, parameter := range infos[0].SupportedParameters {
+				got = got || parameter == "stream"
+			}
+			if got != test.want {
+				t.Fatalf("stream advertised = %v, want %v; parameters=%v", got, test.want, infos[0].SupportedParameters)
+			}
+		})
+	}
+}
+
+func TestRouteForStoredModelCarriesRequestConstructionCapabilities(t *testing.T) {
+	toolSearch := true
+	contextEditing := false
+	streaming := true
+	model := storedModel{
+		ID: "custom-model-x", Format: formatOpenAI, Family: "custom-family",
+		MaxPromptTokens: 200_000, MaxOutputTokens: 32_000,
+		Streaming: &streaming, InputModalities: []string{"text", "image"},
+		ReasoningLevels:         []string{"low", "high"},
+		ReasoningLevelsDeclared: true,
+		MinThinking:             1024,
+		MaxThinking:             32000,
+		SupportsToolSearch:      &toolSearch,
+		SupportsContextEditing:  &contextEditing,
+	}
+	route := routeForStoredModel(model)
+	if route.Family != "custom-family" || route.MaxPromptTokens != 200_000 || route.MaxOutputTokens != 32_000 ||
+		route.Streaming == nil || !*route.Streaming || !route.Vision ||
+		strings.Join(route.ReasoningLevels, ",") != "low,high" || !route.ReasoningLevelsDeclared ||
+		route.MinThinking != 1024 || route.MaxThinking != 32000 ||
+		route.SupportsToolSearch == nil || !*route.SupportsToolSearch ||
+		route.SupportsContextEditing == nil || *route.SupportsContextEditing {
+		t.Fatalf("route = %#v", route)
+	}
+}
+
+func TestStoredModelBackwardCompatibleWithoutNewCapabilityFields(t *testing.T) {
+	legacy := []byte(`{"id":"gpt-5.4","format":"openai-response","reasoning_levels":["minimal","low","medium","high"]}`)
+	var model storedModel
+	if errUnmarshal := json.Unmarshal(legacy, &model); errUnmarshal != nil {
+		t.Fatalf("decode legacy stored model: %v", errUnmarshal)
+	}
+	if model.Streaming != nil || model.SupportsToolSearch != nil || model.SupportsContextEditing != nil {
+		t.Fatalf("legacy model unexpectedly populated new fields: %#v", model)
+	}
+	if infos := modelInfos([]storedModel{model}); len(infos) != 1 || infos[0].Thinking != nil {
+		t.Fatalf("legacy static reasoning levels were trusted: %#v", infos)
+	}
+}
+
+func TestModelsForAuthPropagatesCapabilitiesFromDiscoveryToRoute(t *testing.T) {
+	models := make([]any, 0, 3)
+	for _, test := range []struct {
+		id       string
+		declared bool
+		value    bool
+	}{
+		{id: "test-capability-true", declared: true, value: true},
+		{id: "test-capability-false", declared: true},
+		{id: "test-capability-omitted"},
+	} {
+		model := remoteModelFixture(test.id, true, "", true, []string{"/responses"})
+		supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
+		if test.declared {
+			supports["streaming"] = test.value
+			supports["tool_search"] = test.value
+			supports["context_editing"] = test.value
+		}
+		models = append(models, model)
+	}
+	raw := mustJSON(t, map[string]any{"data": models})
+	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
+	}}
+	service := newService(bridge)
+	service.now = func() time.Time { return time.Unix(120_000, 0).UTC() }
+	storage := copilotStorage{
+		Type:                providerIdentifier,
+		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
+		GitHubHost:          "github.com",
+	}
+	responseRaw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-caps", StorageJSON: mustJSON(t, storage)}}))
+	if errModels != nil {
+		t.Fatal(errModels)
+	}
+	result := decodePluginResult[contract.ModelResponse](t, responseRaw)
+	if len(result.AuthUpdate.StorageJSON) == 0 {
+		t.Fatal("model discovery did not return persisted storage")
+	}
+	persisted, errStorage := decodeCopilotStorage(result.AuthUpdate.StorageJSON)
+	if errStorage != nil {
+		t.Fatal(errStorage)
+	}
+	freshService := newService(nil)
+	for _, test := range []struct {
+		id       string
+		declared bool
+		value    bool
+	}{
+		{id: "test-capability-true", declared: true, value: true},
+		{id: "test-capability-false", declared: true},
+		{id: "test-capability-omitted"},
+	} {
+		route := freshService.resolveModelRoute("auth-caps", test.id, persisted)
+		if route.Family != "test-family" || route.MaxPromptTokens != 90000 || route.MaxOutputTokens != 10000 {
+			t.Fatalf("persisted route %s = %#v", test.id, route)
+		}
+		for name, capability := range map[string]*bool{
+			"streaming": route.Streaming, "tool_search": route.SupportsToolSearch, "context_editing": route.SupportsContextEditing,
+		} {
+			if !test.declared && capability != nil {
+				t.Fatalf("%s %s = %#v, want omitted", test.id, name, capability)
+			}
+			if test.declared && (capability == nil || *capability != test.value) {
+				t.Fatalf("%s %s = %#v, want %v", test.id, name, capability, test.value)
+			}
+		}
+	}
+}

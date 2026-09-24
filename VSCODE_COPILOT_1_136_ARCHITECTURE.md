@@ -121,9 +121,9 @@ pinned 源码可生成四个 beta：
 - WebSocket connection lifecycle；
 - runtime machine/session/device identity。
 
-本插件的采用范围、安全收紧和 legacy 边界见
+Copilot 模块的采用范围、安全收紧和 legacy 边界见
 [PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md)；当前可执行行为始终以
-[src](src/) 及其测试为准。
+[internal/copilot](internal/copilot/) 及其测试为准。
 
 [modelMetadataFetcher.ts]: https://github.com/microsoft/vscode/blob/a44adf7f53e00964ab890f9f8758a334f1fc15bc/extensions/copilot/src/platform/endpoint/node/modelMetadataFetcher.ts
 [chatEndpoint.ts]: https://github.com/microsoft/vscode/blob/a44adf7f53e00964ab890f9f8758a334f1fc15bc/extensions/copilot/src/platform/endpoint/node/chatEndpoint.ts

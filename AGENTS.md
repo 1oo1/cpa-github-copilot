@@ -1,51 +1,34 @@
 # Repository Guidelines
 
-## Scope and Ownership
+## Scope
 
-This repository builds the `github-copilot-go` Go `c-shared` plugin for
-CLIProxyAPI v7. Production code and colocated tests live in `src/`; generated
-libraries live in ignored `bin/`. `registry.json` is the Plugin Store entry.
+This repository builds a standalone, Copilot-only Go HTTP service with an embedded React management UI. There is no native plugin ABI, plugin loader/store, external CPA checkout dependency, or unrelated OAuth provider.
 
-Keep changes in the file that owns the behavior: C ABI/lifecycle, auth,
-model routing, endpoint/header validation, execution, streaming, host callbacks,
-or shared RPC types. All upstream HTTP and streaming must use `hostClient`;
-never add a direct `http.Client`.
+- `internal/copilot/`: tested Copilot auth, catalogue, inference, normalization, and streaming. All upstream operations go through `hostClient`.
+- `internal/transport/`: the single owner of outbound HTTP/proxy/redirect policy. Do not add direct HTTP clients elsewhere.
+- `internal/app/`: credential persistence, budget admission, scheduling, management/API handlers, and usage.
+- `internal/conversion/`, `internal/protocol/`, and supporting packages: client wire conversion only. Claude/OpenAI/Codex names here are protocol/model identifiers, not enabled upstream providers.
+- `web/`: focused React management UI, compiled to one HTML file and embedded with `go:embed`.
+- `cmd/copilot-proxy/`: executable entrypoint. Build artifacts belong in ignored `bin/`.
 
 ## Validation
 
 ```bash
 make test
 make vet
-go test -race ./...
+make race
 make integration
+cd web && bun run verify
 ```
 
-Run test and vet for every change. Also run race and integration when changing
-ABI, auth, routing, raw HTTP, or streaming. `make integration` builds the native
-library and loads it through CLIProxyAPI. Go 1.26+, CGO, a C compiler, and the
-adjacent `../CLIProxyAPI` checkout are required; cross-platform build details
-belong in `Makefile`.
+Use `make build` to produce the single binary, or `make release` for supported platforms. Go 1.26+ and Bun 1.3.14 are build requirements; CGO and a C compiler are not. Run gofmt on changed Go files. Tests must use synthetic credentials and injected transports, never paid live inference.
 
-## Code and Security
+## Safety and compatibility
 
-Run `gofmt -w src/*.go`. Use standard Go naming, small local helpers, and
-descriptive tests such as `TestExecuteRejectsNoncanonicalInferencePath`.
-Use Go's `testing` package with fake host callbacks. Changed paths should cover
-success, malformed input, non-2xx responses, cancellation, and secret redaction
-where applicable.
+Never log tokens, Authorization headers, device codes, raw credential JSON, request bodies, or upstream response bodies. Preserve same-origin, canonical-path, caller-header, terminal-event, and opaque-state validation. Protect credentials, configuration and budget state with atomic private-file writes.
 
-Never log or surface tokens, authorization headers, device codes, `RawJSON`,
-`StorageJSON`, or upstream response bodies. Preserve endpoint, same-origin,
-canonical-path, caller-header, and terminal-event validation.
+Budget protection is independent of manual disablement. A confirmed over-99% Additional Budget observation remains latched across errors and restarts until a verified new period allows recovery. Missing or stale data must never release a latch. Reject late observations after credential replacement.
 
-## Commits and Documentation
+Preserve the three client API formats, Copilot credential migration fields, priority and account proxy settings. Do not reintroduce other OAuth providers, external executors, dynamic plugins, or Home distributed dispatch.
 
-Use concise imperative commit subjects. Pull requests should describe behavior,
-security/configuration impact, tests run, and linked issues; screenshots are only
-needed for host-facing UI changes.
-
-[README.md](README.md) owns setup and user-visible behavior.
-[PI_GITHUB_COPILOT_COMPARISON.md](PI_GITHUB_COPILOT_COMPARISON.md) owns the
-compatibility source hierarchy and upgrade procedure. Do not duplicate source
-inventories, test matrices, completed plans, or point-in-time pass snapshots in
-Markdown.
+README.md owns setup and user-visible behavior. PI_GITHUB_COPILOT_COMPARISON.md owns upstream evidence and upgrade procedure. Do not commit completed plans or point-in-time pass snapshots; local plans and migration backups stay in ignored `.local/`. Retain third-party MIT notices in LICENSES/.
