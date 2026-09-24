@@ -1,0 +1,122 @@
+# Copilot Proxy — 完整应用配置示例（涵盖当前所有可写 YAML 配置项）。
+# 用于独立二进制，也适用于仓库中的 compose.yaml。
+#
+# 使用前复制到 ./data/config.yaml，权限设为 0600；不要把真实密钥提交到 Git。
+# 必须分别替换下面两个短占位符。占位符故意不足 16 字符，原样启动会报错，
+# 避免发布示例密钥被误当作生产密钥。推荐各使用一次 openssl rand -hex 32。
+# 当前程序不对 YAML 做 ${ENV_VAR} 环境变量展开；这里必须填写实际值。
+#
+# 管理面板保存配置时会重新序列化 YAML，注释可能丢失；本示例文件不会被改写。
+# 除面板支持的运行时配置外，手工修改此文件后请重启服务。
+
+# HTTP 监听地址：二进制内置默认值是 127.0.0.1:8317。
+# 容器必须用 0.0.0.0，否则 Docker 端口映射无法访问；compose.yaml 在宿主机
+# 侧默认仅绑定 127.0.0.1。裸机不经反向代理时建议改回 127.0.0.1:8317。
+# 服务不自带 TLS；公网访问必须在前方配置 HTTPS 反向代理及防火墙。
+# 若改容器内端口，必须同步修改 Compose 的 ports.target 与 healthcheck。
+listen: "0.0.0.0:8317"
+
+# 认证文件目录。空字符串默认使用配置文件所在目录下的 auths/。
+# 相对路径也以配置文件所在目录为基准，不是以进程工作目录为基准。
+# Compose 将配置放在 /data/config.yaml，因此这里解析为 /data/auths。
+# 预算 state/ 和 usage.json 总是在配置文件旁；不要只备份 auths/。
+# 建议保持此路径位于同一个持久化数据目录内，不要指向旧 CPA 原始目录。
+auth-dir: "auths"
+
+# 管理接口 /v0/management/* 的独立 Bearer 密钥，至少 16 字符。
+# 它不是 GitHub token，也不能和任何客户端 API Key 相同。
+# 修改后重启，并在面板重新登录；不要通过 URL 查询参数传递此密钥。
+management-key: "REPLACE_ADMIN"
+
+# 客户端 /v1/* 接口的 API Key 列表：至少一项，每项至少 16 字符。
+# 接受 Authorization: Bearer <key>；也接受 x-api-key。
+# 可填写多项，面板可生成/撤销 API Key；撤销最后一项会被拒绝。
+# 下列值不是 GitHub OAuth token。与 management-key 使用不同的随机密钥。
+api-keys:
+  - "REPLACE_CLIENT"
+  # - "在此填写另一个独立生成的随机客户端密钥"
+
+# 全局上游代理，默认空字符串。支持 http://、https://、socks5://、socks5h://。
+# 账号认证文件顶层的 proxy_url 优先于此设置。
+# 空值不强制直连：底层 HTTP transport 仍可能使用 HTTP_PROXY/HTTPS_PROXY/
+# NO_PROXY 环境变量；Compose 示例没有默认注入这些变量。
+# 容器中的 127.0.0.1 是容器自己，不是宿主机。访问宿主机代理可使用：
+#   proxy-url: "http://host.docker.internal:7890"
+# 并启用 compose.yaml 注释中的 extra_hosts（Docker Desktop 通常内置该名称）。
+# 宿主机代理还必须允许来自 Docker 网络的连接。
+# 代理可含用户名/密码，属于敏感信息；面板不会回显含凭据的代理 URL。
+# 此项也可在面板修改并立即生效。
+proxy-url: ""
+
+# 账号调度：round-robin（默认）或 fill-first。
+# 先比较账号认证文件顶层的 priority（越大越优先，缺省为 0）；
+# round-robin 在同优先级账号间轮询，fill-first 优先选首个可用账号。
+# 手动禁用、预算暂停和冷却中的账号不会用于新请求。
+routing-strategy: "round-robin"
+
+# 会话亲和，默认 false。开启后按客户端 API Key + X-Session-Id 绑定账号。
+# 绑定最长保留 30 分钟；没有该请求头则普通调度。已绑定账号仍必须通过
+# 预算/禁用检查。高优先级账号不会强行抢走仍可用的已绑定会话。
+# 绑定仅驻留内存，重启不保留；此项可在面板修改。
+session-affinity: false
+
+# 公开模型别名，格式为「客户端模型名: 当前账户的 Copilot 原始模型 ID」。
+# 默认空映射。别名目标必须真实存在于该账号模型目录中，不会虚构模型能力。
+# 要配置时用下面的缩进写法替换 {}，不要重复声明 model-aliases 键：
+# model-aliases:
+#   my-coding-model: "从 /v1/models 返回中选择的真实模型 ID"
+model-aliases: {}
+
+# 隐藏并拒绝调用的 Copilot 模型，默认空列表。
+# 使用 Go filepath.Match 的 glob 语法（如 *、?、[abc]），不是正则表达式。
+# 按别名解析后的原始模型 ID 检查；列表为空时不额外排除任何模型。
+# 配置示例（替换 []）：
+# excluded-models:
+#   - "*-preview"
+excluded-models: []
+
+# Copilot 专属协议及模型选项。不是旧 CPA 的 plugins.configs 配置层级。
+copilot:
+  # GitHub Device Flow OAuth public client ID，不是 client secret。
+  # 默认使用已对齐的 Copilot public client；通常不要修改。
+  # Enterprise 必须使用该实例可用且获授权的 public client ID。
+  client_id: "Iv1.b507a08c87ecfe98"
+
+  # 默认 github.com。Enterprise 填纯 DNS 主机名（例如 github.example.com）。
+  # 不得包含 http://、端口、路径、查询参数、用户信息或 IP 地址。
+  # 认证文件中的 GitHub 主机必须匹配此设置，不允许混用不同主机的凭据。
+  github_host: "github.com"
+
+  # 默认 true：登录成功后，尽力启用已知模型的账户 policy。
+  # 失败不会阻止登录完成；模型可用性仍以该账户 /models 返回为准。
+  # false 禁止本服务在登录阶段尝试启用模型 policy。
+  enable_models: true
+
+  # 账户模型目录缓存时间（秒），默认 300，必须 >= 0。
+  # 0 表示推理前不复用模型 TTL 缓存；会增加目录查询次数。
+  # 这不是 Credits/预算缓存时长；预算查询缓存独立固定为 60 秒。
+  model_cache_ttl_seconds: 300
+
+  # 单个尚未完成的 SSE event 最大缓存字节数，不是整条流/对话大小。
+  # 默认 4194304（4 MiB），有效范围 65536（64 KiB）到 67108864（64 MiB）。
+  # 超限会中断异常上游流，防止无限制占用内存。
+  max_stream_buffer_bytes: 4194304
+
+  # Anthropic 原生 web_search 工具独占请求所使用的同账号 Responses 模型。
+  # 默认 gpt-5.6-terra；目标必须出现在账户目录中并支持所需 endpoint。
+  # 空字符串禁用该分流；普通对话不受影响。
+  # 普通工具与原生 Web Search 混用的请求不会被静默改写成别的模型。
+  web_search_model: "gpt-5.6-terra"
+
+  # 默认 false。对符合条件的原生 Responses 请求，选择性注入服务端
+  # context_management（inline compaction）。不是独立 /responses/compact API。
+  # 开启也不会替客户端保存/重放 conversation history 或 opaque state。
+  enable_responses_context_management: false
+
+# 以下不是可配置项，不要添加未知 YAML 键（解析器会拒绝未知键）：
+# - 预算触发条件：Additional Budget 原始比例严格 > 99%，恰好 99% 不触发。
+# - 预算查询最多复用 60 秒；限流时遵循退避，失败不解除已经触发的预算锁。
+# - 只有到期后核实新周期有效额度才恢复；手动禁用状态独立保留。
+# - /healthz 只表示 HTTP 服务活着，不代表有可用账号或 GitHub 可达。
+# - token、disabled、priority、proxy_url 等账号字段属于各认证 JSON，
+#   不是应用全局 YAML 参数；请通过面板管理账号。

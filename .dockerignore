@@ -1,0 +1,23 @@
+# Allowlist: never send auth files, private configuration, .env, Git history,
+# local migration backups, prebuilt binaries or host node_modules to the builder.
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!internal/
+!internal/**
+!cmd/
+!cmd/**
+!web/
+!web/embed.go
+!web/package.json
+!web/bun.lock
+!web/index.html
+!web/tsconfig.json
+!web/vite.config.ts
+!web/src/
+!web/src/**
+!LICENSE
+!LICENSES/
+!LICENSES/**

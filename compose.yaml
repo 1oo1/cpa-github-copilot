@@ -1,0 +1,108 @@
+# Copilot Proxy — Docker Compose 部署示例（Docker Compose v2+，无需 version 字段）。
+#
+# 准备：复制 config.example.yaml 到 ./data/config.yaml，生成两个不同随机密钥，
+# 并确保运行 UID/GID 可读写整个 data 目录。详细命令见 README 的 Docker Compose 章节。
+# 启动：docker compose up -d
+# 更新：docker compose pull && docker compose up -d
+# 停止：docker compose down（绑定挂载的 ./data 仍保留，请勿删除）。
+#
+# 下列 ${...} 都是 Compose 变量，可在 shell 或未提交的 .env 中设置。
+# 它们不是程序自动识别的环境变量；应用参数由 /data/config.yaml 控制。
+services:
+  copilot-proxy:
+    # 默认拉取本仓库的 GHCR 镜像。生产建议固定已发布版本或 digest，
+    # 如 COPILOT_IMAGE=ghcr.io/1oo1/cpa-github-copilot:1.2.3 或 @sha256:...。
+    # fork 后请将地址改为自己的小写 owner/repository。
+    # latest 仅由稳定语义版本 vX.Y.Z 更新；预发布不会覆盖 latest。
+    image: "${COPILOT_IMAGE:-ghcr.io/1oo1/cpa-github-copilot:latest}"
+
+    # 不默认指定 platform：Docker 自动选取主机对应的 linux/amd64 或 linux/arm64。
+    # 若确实需要模拟另一架构，可取消下一行注释（模拟性能较差）：
+    # platform: linux/amd64
+
+    # 默认拉取不存在的镜像。需要检查新版本时显式运行 docker compose pull。
+    # 也允许本机 docker build -t copilot-proxy:local . 后设置 COPILOT_IMAGE 使用。
+    pull_policy: missing
+
+    # 使用非 root UID/GID。默认镜像用户为 10001:10001；此处允许按宿主机修改。
+    # 推荐先 export COPILOT_UID=$(id -u) COPILOT_GID=$(id -g)，然后再准备 data/。
+    # 可把这两个值写入 .env，确保以后 pull/up 使用一致的用户。
+    # 注意：宿主用户若是 root（UID=0）则会覆盖为容器 root，建议改用非 root UID。
+    user: "${COPILOT_UID:-10001}:${COPILOT_GID:-10001}"
+
+    # 镜像 ENTRYPOINT 为 /usr/local/bin/copilot-proxy；以下是其命令行参数。
+    # 数据目录挂载位置与应用配置位置应保持配套。不要把密钥写进 command/env。
+    command: ["--config", "/data/config.yaml"]
+    working_dir: /data
+
+    # 宿主默认仅绑定回环地址。面板和 API 共用同一端口。
+    # COPILOT_BIND_ADDRESS=0.0.0.0 可允许外部连接，但务必配 HTTPS/防火墙。
+    # COPILOT_PORT 仅改变宿主映射端口；容器内仍为 8317。
+    # 同一 Compose 网络中的反向代理应连接 http://copilot-proxy:8317。
+    ports:
+      - target: 8317
+        published: "${COPILOT_PORT:-8317}"
+        host_ip: "${COPILOT_BIND_ADDRESS:-127.0.0.1}"
+        protocol: tcp
+
+    # 必须挂载整个可写目录：程序通过临时文件 + rename 原子更新 config.yaml、
+    # auths/、state/ 和 usage.json。单文件挂载 config.yaml 或只读数据卷会导致
+    # API Key/设置/凭据刷新/预算持久化失败。
+    # create_host_path=false 防止目录不存在时 Docker 隐式创建 root 所有的目录。
+    # 更改 COPILOT_DATA_DIR 后需自行创建该路径并赋予上述 UID/GID 写权限。
+    volumes:
+      - type: bind
+        source: "${COPILOT_DATA_DIR:-./data}"
+        target: /data
+        read_only: false
+        bind:
+          create_host_path: false
+
+    # 进程时区（日志），默认 UTC；镜像包含 tzdata。
+    # 额度重置时间在面板中按浏览器本地时区显示，不由此项强制指定。
+    environment:
+      TZ: "${TZ:-UTC}"
+
+    # 访问 Linux 宿主机代理时可取消注释，并在 config.yaml 配 proxy-url。
+    # Docker Desktop 通常已提供 host.docker.internal；这不是启用 host 网络模式。
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    # 容器退出时自动重启，除非用户显式停止。不因健康检查 unhealthy 自动重启。
+    restart: unless-stopped
+    # 给程序足够时间结束请求并取消后台刷新；程序的 HTTP 优雅停止窗口为 15 秒。
+    stop_grace_period: 30s
+    # 转发信号并回收子进程；不需要 privileged 或 Docker socket。
+    init: true
+
+    # 镜像根文件系统只读；仅 /data 和内存临时目录可写。
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # 资源上限示例，可按账户数、并发量和 SSE event 上限调整。
+    # 过小的内存可能导致 OOM；stop/restart 不能撤销已发往 GitHub 的请求。
+    mem_limit: "${COPILOT_MEMORY_LIMIT:-512m}"
+    cpus: "${COPILOT_CPUS:-1.0}"
+    pids_limit: 128
+
+    # 健康检查无需密钥，只访问容器本机的 /healthz，不产生 GitHub 请求。
+    # 若改 config.yaml 的监听端口，需同步修改本 URL 和 ports.target。
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--timeout=3", "--output-document=/dev/null", "http://127.0.0.1:8317/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Docker stdout/stderr 日志轮转；面板的最近 500 条结构化事件另存于进程内存。
+    # 此配置不会开启 HTTP 正文或 token 日志。备份时仍应保护日志和整个数据目录。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

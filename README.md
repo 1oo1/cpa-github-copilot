@@ -42,6 +42,98 @@ curl http://127.0.0.1:8317/v1/models \
 
 Messages 入口也支持 `x-api-key`。管理 API 仅接受独立的管理 Bearer key，不使用 Cookie。管理密钥不会持久化在浏览器；新建的 API Key 只在当前页面显示，列表只显示掩码。
 
+## Docker Compose 部署
+
+仓库提供以下可直接使用的部署文件：
+
+- `compose.yaml`：详细注释的服务、端口、持久化、非 root 用户、健康检查及资源限制。
+- `config.example.yaml`：**全部应用 YAML 参数**、默认值/取值范围及行为说明。
+- `.env.example`：全部 Compose 插值变量，不包含密钥。
+- `Dockerfile`：多阶段构建，运行镜像只包含独立程序、CA 证书、时区及健康检查所需工具，不包含 Go/Bun 或凭据。
+
+### 首次部署
+
+需要 Docker Engine/Desktop 和 Docker Compose v2+。在放置上述三个示例文件的目录操作；推荐使用普通宿主用户，避免 root 运行容器：
+
+```bash
+cp .env.example .env
+# 编辑 .env：把 COPILOT_UID / COPILOT_GID 改为以下命令的结果，并按需固定镜像版本。
+id -u
+id -g
+
+# 默认 ./data 由当前用户创建。若使用不同 UID/GID 或数据目录，需相应调整所有权。
+mkdir -p data
+chmod 700 data
+cp config.example.yaml data/config.yaml
+chmod 600 data/config.yaml
+
+# 执行两次，各生成一个独立随机密钥；分别填入 config.yaml 的
+# management-key 和 api-keys，不要把终端输出发到日志、截图或版本库中。
+openssl rand -hex 32
+openssl rand -hex 32
+
+# 确认两个 REPLACE_* 占位符已替换，并保留容器内 listen: "0.0.0.0:8317"。
+docker compose config --quiet
+docker compose pull
+docker compose up -d --wait
+docker compose ps
+```
+
+示例占位符故意不足 16 字符，**原样启动会拒绝运行**。程序不会展开应用 YAML 中的 `${ENV_VAR}`；只有 Compose 会读取 `.env`。如需固定使用镜像的默认 UID/GID `10001:10001`，管理员应将整个数据目录移交给它，例如 `sudo chown -R 10001:10001 data`，并在 `.env` 保持相同值。已有部署切换 UID 时也需调整配置、认证及状态文件所有权；不要使用 `chmod 777`。
+
+默认访问 `http://127.0.0.1:8317/`，使用私有配置文件中的管理密钥登录。宿主端口可用 `.env` 的 `COPILOT_PORT` 调整；容器内端口仍为 8317。生产外部访问应经 HTTPS 反向代理，代理需关闭 SSE 响应缓冲并允许长时间连接。`/healthz` 仅检查本地 HTTP 服务，不代表 GitHub 可用或有可用账号；Compose 不会仅因 `unhealthy` 自动重启。
+
+**必须挂载整个可写的 `/data`，不要单独挂载 `config.yaml`。** 面板操作会原子替换配置文件，凭据刷新及预算锁也需要写权限。`read_only: true` 仅限制镜像根文件系统，`/data` 绑定挂载仍可写。请备份整个数据目录，包括 `config.yaml`、`auths/`、`state/` 和 `usage.json`；配置经面板重写后注释可能丢失，原始示例不会改变。
+
+容器中的 `127.0.0.1` 不是宿主机。使用宿主机代理时，按 `compose.yaml` 注释启用 `host.docker.internal:host-gateway`，并在应用配置中填写对应 `proxy-url`。应用默认监听只有在 `--init` 自动生成配置时才是回环地址；**容器不能直接沿用未修改监听地址的自动生成配置**。
+
+### 更新、日志、回滚与本地构建
+
+```bash
+docker compose logs --tail=100 -f
+docker compose pull
+docker compose up -d --wait       # 替换容器，保留 ./data
+docker compose down             # 停止服务，不删除绑定挂载的数据目录
+
+# 尚未发布镜像，或者希望本地构建当前源码时：
+docker build --build-arg VERSION=dev -t copilot-proxy:local .
+COPILOT_IMAGE=copilot-proxy:local docker compose up -d --wait
+```
+
+本地有可用 Docker 守护进程时，可运行 `bash scripts/smoke-docker.sh copilot-proxy:local`，验证镜像内 ELF 架构，以及实际 Compose 配置的健康检查、内嵌面板、鉴权隔离、配置原子写入及容器重启后持久化。可选第二个参数 `linux/amd64` 或 `linux/arm64` 显式选择运行平台（非本机架构需要 Docker 支持模拟运行）。该脚本使用临时数据和合成密钥，结束后清理测试容器，不访问 GitHub。
+
+生产建议将 `COPILOT_IMAGE` 固定为版本或 digest；回滚时改为之前的兼容版本后重新 `up -d`，**不要删除预算状态来恢复可用性**。镜像代码回滚不代表任意版本间的数据格式兼容，升级前先备份。
+
+导入旧 CPA 目录时先停止新服务，然后把源目录额外挂载为只读；不要覆盖 `/data`：
+
+```bash
+docker compose stop copilot-proxy
+docker compose run --rm --no-deps \
+  -v /absolute/path/to/old-auths:/import:ro \
+  copilot-proxy --config /data/config.yaml --import-auth-dir /import
+docker compose up -d --wait
+```
+
+导入进程仍以配置的 UID/GID 运行，需要对源文件有读取权限。源目录保持不变；只迁移 Copilot 凭据及匹配的预算锁，详见下一节。
+
+### GitHub Actions / GHCR 发布
+
+镜像地址默认是 `ghcr.io/1oo1/cpa-github-copilot`；fork 会自动使用小写的 `ghcr.io/<owner>/<repository>`。工作流会先跑 Go/前端测试、构建原生二进制，再构建 Docker 镜像并运行真实 Compose 冒烟测试（合成密钥、空账号、无 GitHub 推理）。通过后构建 `linux/amd64` 与 `linux/arm64` 镜像。
+
+| 触发方式 | 镜像行为 |
+|---|---|
+| PR | 构建、Compose 冒烟测试、多架构构建；不登录、不推送 GHCR |
+| 推送 `vX.Y.Z` 稳定标签 | 发布 `X.Y.Z`、`X.Y`、`latest` 和 `sha-<完整提交 SHA>` |
+| 推送 `vX.Y.Z-rc.1` 等预发布标签 | 发布完整预发布版本及 SHA；不覆盖稳定 `latest`/`X.Y` |
+| 默认分支手动运行 | 发布 `edge` 和 SHA；不更新 `latest` |
+| 其他分支手动运行 | 仅构建和测试，不推送 |
+
+标签必须符合工作流接受的 `vX.Y.Z[-prerelease]` 格式，不使用 `+build` 元数据。手动选择已有版本标签运行时按版本发布规则执行。工作流使用内置 `GITHUB_TOKEN` 的 `packages: write` 权限，不需要在仓库配置个人 PAT；仓库/组织策略仍须允许写入包。
+
+首次成功推送后，在 GitHub 的 **Packages → 对应容器包 → Package settings** 检查可见性和 Actions 访问权限。希望匿名 `docker compose pull` 时需将包设为 public；容器包可能默认 private，源码公开不等于镜像自动公开。私有包的部署机器需要用具有 `read:packages` 的凭据通过 `docker login ghcr.io --password-stdin` 登录；凭据不要写进 Compose 或提交到仓库。工作流不会自动修改包可见性。
+
+OCI source/version/revision 标签、SBOM 和最小构建 provenance 随发布生成。成功发布后的工作流摘要给出实际镜像标签与 digest。修改工作流本身不会立即创建镜像；首次部署前需要先成功运行一次发布，或使用本地构建。
+
 ## 从旧 CPA 迁移
 
 先初始化一个**新的数据目录**，再复制导入原认证文件：

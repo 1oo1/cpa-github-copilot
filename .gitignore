@@ -8,3 +8,11 @@
 *.dll
 *.h
 .DS_Store
+
+# Compose overrides and local secrets; committed examples use .example names.
+.env
+.env.*
+!.env.example
+/compose.override.yaml
+/compose.override.yml
+/config.yaml
