@@ -166,13 +166,36 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 | `auth-dir` | 可选，默认配置文件旁的 `auths/`；相对路径以配置文件目录为基准 |
 | `proxy-url` | 全局 HTTP/HTTPS/SOCKS5 代理；账号的 `proxy_url` 优先 |
 | `routing-strategy` | `round-robin` 或 `fill-first`；先按账号 `priority` 排序 |
-| `session-affinity` | 开启后按客户端 API Key + `X-Session-Id` 绑定账号，30 分钟过期 |
+| `session-affinity` | 开启后按 API Key + 会话标识绑定账号；优先 `X-Session-Id`，Messages 也识别 Claude Code 的 `metadata.user_id` 中的会话 ID。成功请求续期 30 分钟 |
 | `model-aliases` | `{公开别名: Copilot 模型 ID}` |
 | `excluded-models` | 排除模型的 glob 列表 |
 | `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流。部署场景的详细填法见 [TRUSTED_PROXIES.md](TRUSTED_PROXIES.md) |
 | `copilot` | 下列 Copilot 专用选项 |
 
 `copilot` 保留 `client_id`、`github_host`、`enable_models`、`model_cache_ttl_seconds`、`max_stream_buffer_bytes`、`web_search_model` 和 `enable_responses_context_management`。配置改动除面板明确支持的代理和调度设置外均需重启。GitHub Enterprise 主机必须通过 HTTPS DNS 主机校验，并配置适用的 OAuth public client ID。
+
+### Claude Code 多账号缓存与会话亲和
+
+多账号轮询搭配 Claude Code 时，建议在管理面板开启会话亲和，或配置：
+
+```yaml
+routing-strategy: round-robin
+session-affinity: true
+```
+
+Claude Code 通常不发送 `X-Session-Id`，而是在 `metadata.user_id` 的 JSON 字符串中携带
+`session_id`；服务会读取该会话 UUID，也兼容旧式 `user_…_account_…_session_<UUID>`。
+显式 `X-Session-Id` 优先。缺少或无效的会话标识仍正常轮询，不会按设备或用户 ID 把不同
+会话合并。不同 API Key 的绑定相互隔离，仅存内存中的哈希，不记录原始会话 metadata。
+
+同一会话的并发首次请求会优先选择同一账号；成功请求续期 30 分钟，服务重启后绑定重建。
+绑定数量上限为 4096，达到上限时先回收过期项，再淘汰最早到期项，不清空其他活跃会话。
+预算保护、手动禁用、删除、冷却和模型可用性优先于亲和；需要换号时仍正常重试，成功后
+绑定到新账号。亲和关闭时保持逐请求轮询，不会因为识别到 Claude Code 而自动开启。
+
+亲和减少账号切换造成的缓存损失，但不保证固定命中率。Claude Code 的缓存计数仍原样来自
+上游；本服务不会改写命中率、强制设置 1 小时 TTL 或发送付费保活请求。启用后可在同一
+会话连续请求，并通过本地请求日志的账号字段确认是否稳定使用同一账号；首轮仍可能冷缓存。
 
 ## 额度与预算保护
 

@@ -172,10 +172,7 @@ func bearer(r *http.Request) string {
 }
 func (s *Server) apiAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		given := bearer(r)
-		if given == "" {
-			given = r.Header.Get("X-Api-Key")
-		}
+		given := apiRequestKey(r)
 		s.mu.Lock()
 		valid := false
 		for _, key := range s.cfg.APIKeys {
@@ -263,31 +260,25 @@ func (s *Server) candidates(session string) []*account {
 		return pi > pj
 	})
 	if s.cfg.SessionAffinity && session != "" {
+		matched := false
 		if bound, ok := s.affinity[session]; ok && bound.expires.After(now) {
 			for i, a := range out {
 				if a.id == bound.id {
 					copy(out[1:i+1], out[:i])
 					out[0] = a
+					matched = true
 					break
 				}
 			}
 		}
+		if !matched && len(out) > 0 {
+			// Reserve under the selection lock so concurrent first requests in one
+			// conversation do not fan out across accounts. Admission/model checks
+			// still run below; a successful fallback rebinds the conversation.
+			s.bindSessionLocked(session, out[0].id, now)
+		}
 	}
 	return out
-}
-func (s *Server) bindSession(session, id string) {
-	if session == "" {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.cfg.SessionAffinity {
-		return
-	}
-	if len(s.affinity) >= 4096 {
-		clear(s.affinity)
-	}
-	s.affinity[session] = binding{id, time.Now().Add(30 * time.Minute)}
 }
 func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
@@ -368,13 +359,7 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	session := r.Header.Get("X-Session-Id")
-	if len(session) > 128 {
-		session = ""
-	}
-	if session != "" {
-		session = identity(map[string]any{"github_access_token": bearer(r) + r.Header.Get("X-Api-Key") + "\x00" + session})
-	}
+	session := requestSessionKey(r, body, format)
 	started := time.Now()
 	stream := gjson.GetBytes(body, "stream").Bool()
 	var lastErr error
