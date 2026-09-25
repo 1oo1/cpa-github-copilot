@@ -169,7 +169,7 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 | `session-affinity` | 开启后按客户端 API Key + `X-Session-Id` 绑定账号，30 分钟过期 |
 | `model-aliases` | `{公开别名: Copilot 模型 ID}` |
 | `excluded-models` | 排除模型的 glob 列表 |
-| `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流 |
+| `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流。部署场景的详细填法见 [TRUSTED_PROXIES.md](TRUSTED_PROXIES.md) |
 | `copilot` | 下列 Copilot 专用选项 |
 
 `copilot` 保留 `client_id`、`github_host`、`enable_models`、`model_cache_ttl_seconds`、`max_stream_buffer_bytes`、`web_search_model` 和 `enable_responses_context_management`。配置改动除面板明确支持的代理和调度设置外均需重启。GitHub Enterprise 主机必须通过 HTTPS DNS 主机校验，并配置适用的 OAuth public client ID。
