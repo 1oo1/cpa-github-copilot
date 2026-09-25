@@ -75,6 +75,17 @@ model-aliases: {}
 #   - "*-preview"
 excluded-models: []
 
+# 可信反向代理的 IP 或 CIDR 列表，默认空列表。
+# 管理/客户端密钥连续错误 10 次（10 分钟内）后，该来源被暂停认证 15 分钟（返回 429）；
+# 已成功认证过的密钥不受影响，完全不带密钥的请求不计数。
+# 默认按 TCP 对端地址计数；经反向代理访问时对端都是代理，需在此列出代理地址，
+# 才会改用其追加的 X-Forwarded-For 最右侧非可信地址。不要列出客户端可直连的网段，
+# 否则攻击者可伪造 X-Forwarded-For 绕过限制。
+# 同一 Compose 网络中的反向代理示例（替换 []）：
+# trusted-proxies:
+#   - "172.16.0.0/12"
+trusted-proxies: []
+
 # Copilot 专属协议及模型选项。不是旧 CPA 的 plugins.configs 配置层级。
 copilot:
   # GitHub Device Flow OAuth public client ID，不是 client secret。
@@ -118,5 +129,7 @@ copilot:
 # - 预算查询最多复用 60 秒；限流时遵循退避，失败不解除已经触发的预算锁。
 # - 只有到期后核实新周期有效额度才恢复；手动禁用状态独立保留。
 # - /healthz 只表示 HTTP 服务活着，不代表有可用账号或 GitHub 可达。
+# - 推理请求体上限 16 MiB（超出返回 413）；同时处理的请求体总量按进程内存上限
+#   （容器 cgroup 限制或 GOMEMLIMIT）自动限制，排队超过 30 秒返回 503。
 # - token、disabled、priority、proxy_url 等账号字段属于各认证 JSON，
 #   不是应用全局 YAML 参数；请通过面板管理账号。

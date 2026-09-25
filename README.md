@@ -33,6 +33,13 @@
 
 部署到服务器时，可以把 `listen` 改为 `0.0.0.0:8317`，但必须通过 HTTPS 反向代理和防火墙保护访问。不要在公共明文 HTTP 上发送管理密钥、API Key 或凭据。升级时替换二进制并保留整个数据目录。
 
+面向公网的内置防护：
+
+- 同一来源 10 分钟内连续 10 次错误的管理密钥或 API Key，会被暂停该类认证 15 分钟（`429` + `Retry-After`），期间即使猜中也拒绝；此前已成功认证的密钥不受影响，不带密钥的请求不计数。经反向代理访问时，须在 `trusted-proxies` 中填写代理地址，否则所有客户端共享代理的地址。
+- 推理请求体上限 16 MiB（`413`）；并发处理的请求体总量按进程内存上限自动限制，排队超过 30 秒返回 `503`。容器内自动读取 cgroup 内存限制并将 Go 堆软上限设为其 80%，显式设置 `GOMEMLIMIT` 时以其为准。
+- 请求头 10 秒、完整请求 5 分钟、空闲连接 2 分钟超时；下游停止读取响应超过 2 分钟即断开，释放上游流。
+- 管理面板带严格的 Content-Security-Policy，只允许内嵌脚本运行，禁止被嵌入框架。
+
 客户端用配置中的 API Key：
 
 ```bash
@@ -162,6 +169,7 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 | `session-affinity` | 开启后按客户端 API Key + `X-Session-Id` 绑定账号，30 分钟过期 |
 | `model-aliases` | `{公开别名: Copilot 模型 ID}` |
 | `excluded-models` | 排除模型的 glob 列表 |
+| `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流 |
 | `copilot` | 下列 Copilot 专用选项 |
 
 `copilot` 保留 `client_id`、`github_host`、`enable_models`、`model_cache_ttl_seconds`、`max_stream_buffer_bytes`、`web_search_model` 和 `enable_responses_context_management`。配置改动除面板明确支持的代理和调度设置外均需重启。GitHub Enterprise 主机必须通过 HTTPS DNS 主机校验，并配置适用的 OAuth public client ID。
@@ -186,7 +194,7 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 - 不提供独立 `/v1/responses/compact` 或 token counting。
 - Copilot 原生 Web Search 的专用分流和原有请求头、同源、规范路径及 token 校验继续保留。
 - 所有外发 HTTP 经共享 transport 和 Copilot `hostClient`；只接受 HTTPS 上游，拒绝自动重定向。不会记录请求正文、授权头或 Copilot token。
-- 用量统计是本机观察到的 tokens，不用于推算 GitHub Credits。累计统计持久化，最近 500 条结构化日志仅保留在内存中。
+- 用量统计是本机观察到的 tokens，不用于推算 GitHub Credits。累计统计每秒最多落盘一次并在停止时写入，最近 500 条结构化日志仅保留在内存中。
 
 ## 构建与验证
 

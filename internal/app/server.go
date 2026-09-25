@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -41,6 +42,7 @@ type Log struct {
 	Duration int64     `json:"duration_ms,omitempty"`
 	Input    int64     `json:"input_tokens,omitempty"`
 	Output   int64     `json:"output_tokens,omitempty"`
+	Client   string    `json:"client,omitempty"`
 }
 type Server struct {
 	modelTTL                     time.Duration
@@ -57,7 +59,11 @@ type Server struct {
 	monitorDone                  chan struct{}
 	usageMu                      sync.Mutex
 	usage                        Usage
+	usageDirty                   bool
 	logs                         []Log
+	limiter                      authLimiter
+	trustedProxies               []netip.Prefix
+	gate                         *memoryGate
 }
 
 func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server, error) {
@@ -72,11 +78,15 @@ func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server
 			return nil, fmt.Errorf("API keys must have at least 16 characters")
 		}
 	}
-	path, err := filepath.Abs(path)
+	trusted, err := parseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{modelTTL: time.Duration(cfg.Copilot.ModelCacheTTL) * time.Second, cfg: cfg, configPath: path, dataDir: filepath.Dir(path), authDir: cfg.AuthDir, accounts: map[string]*account{}, affinity: map[string]binding{}, monitorDone: make(chan struct{})}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{modelTTL: time.Duration(cfg.Copilot.ModelCacheTTL) * time.Second, cfg: cfg, configPath: path, dataDir: filepath.Dir(path), authDir: cfg.AuthDir, accounts: map[string]*account{}, affinity: map[string]binding{}, monitorDone: make(chan struct{}), limiter: authLimiter{clients: map[authClient]*authFailure{}, known: map[[32]byte]struct{}{}}, trustedProxies: trusted, gate: newMemoryGate(requestMemoryBudget())}
 	if s.authDir == "" {
 		s.authDir = filepath.Join(s.dataDir, "auths")
 	} else if !filepath.IsAbs(s.authDir) {
@@ -101,6 +111,7 @@ func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server
 			return nil, fmt.Errorf("invalid usage state")
 		}
 	}
+	csp := uiContentSecurityPolicy(ui)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { respond(w, 200, map[string]string{"status": "ok"}) })
 	mux.Handle("/v1/", s.apiAuth(http.HandlerFunc(s.inference)))
@@ -116,7 +127,7 @@ func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", csp)
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")
 		_, _ = w.Write(ui)
@@ -124,7 +135,11 @@ func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server
 	s.handler = mux
 	return s, nil
 }
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(downstreamWriteTimeout))
+	s.handler.ServeHTTP(w, r)
+}
 func (s *Server) Start(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,6 +157,7 @@ func (s *Server) Close() {
 		stop()
 		<-s.monitorDone
 	}
+	s.flushUsage()
 	s.engine.Close()
 	if s.httpClient != nil {
 		s.httpClient.Close()
@@ -168,8 +184,7 @@ func (s *Server) apiAuth(next http.Handler) http.Handler {
 			}
 		}
 		s.mu.Unlock()
-		if !valid {
-			apiError(w, 401, "invalid_api_key", "invalid API key")
+		if !s.admitCredential(w, r, "api", given, valid, func() { apiError(w, 401, "invalid_api_key", "invalid API key") }) {
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -180,8 +195,8 @@ func (s *Server) managementAuth(next http.Handler) http.Handler {
 		s.mu.Lock()
 		key := s.cfg.ManagementKey
 		s.mu.Unlock()
-		if !keyMatches(bearer(r), key) {
-			apiError(w, 401, "unauthorized", "management authentication required")
+		given := bearer(r)
+		if !s.admitCredential(w, r, "management", given, keyMatches(given, key), func() { apiError(w, 401, "unauthorized", "management authentication required") }) {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -197,7 +212,7 @@ func apiError(w http.ResponseWriter, status int, code, message string) {
 	respond(w, status, map[string]any{"type": "error", "error": map[string]string{"type": code, "code": code, "message": message}})
 }
 func readJSON(w http.ResponseWriter, r *http.Request, out any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, maxManagementBody)
 	defer r.Body.Close()
 	dec := json.NewDecoder(r.Body)
 	if dec.Decode(out) != nil {
@@ -295,8 +310,41 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 404, "not_found", "endpoint not found")
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 16<<20))
+	if r.ContentLength > maxInferenceBody {
+		apiError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 16 MiB")
+		return
+	}
+	weight := r.ContentLength
+	if weight < 0 {
+		weight = maxInferenceBody
+	}
+	admission, cancel := context.WithTimeout(r.Context(), admissionWait)
+	lease, admitted := s.gate.acquire(admission, max(weight, minInferenceWeight))
+	cancel()
+	if !admitted {
+		if r.Context().Err() == nil {
+			w.Header().Set("Retry-After", "5")
+			apiError(w, 503, "server_busy", "too many large requests are in progress; retry later")
+		}
+		return
+	}
+	defer lease.release()
+	// Inference may run for minutes before its first byte; writes set their own deadline.
+	downstream := http.NewResponseController(w)
+	_ = downstream.SetWriteDeadline(time.Time{})
+	write := func(payload []byte) error {
+		_ = downstream.SetWriteDeadline(time.Now().Add(downstreamWriteTimeout))
+		_, err := w.Write(payload)
+		return err
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxInferenceBody))
 	_ = r.Body.Close()
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		apiError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 16 MiB")
+		return
+	}
+	lease.resize(max(int64(len(body)), minInferenceWeight))
 	if err != nil || !json.Valid(body) {
 		apiError(w, 400, "invalid_request", "invalid request body")
 		return
@@ -386,7 +434,7 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 			s.recordUsage(auth.ID, model, 200, started, input, output)
 			s.bindSession(session, auth.ID)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(response.Payload)
+			_ = write(response.Payload)
 			return
 		}
 		headers, ch, cleanup, executeErr := s.engine.Stream(ctx, auth, model, format, body, r.Header)
@@ -414,7 +462,7 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 		for chunk := range ch {
 			if chunk.Err != nil {
 				status = 502
-				_, _ = io.WriteString(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"message\":\"Copilot stream interrupted\"}}\n\n")
+				_ = write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"message\":\"Copilot stream interrupted\"}}\n\n"))
 				break
 			}
 			i, o := usageTokens(chunk.Payload)
@@ -430,16 +478,18 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 					payload = append(append([]byte("data: "), payload...), []byte("\n\n")...)
 				}
 			}
-			if _, err = w.Write(payload); err != nil {
+			// A client that stops reading must not pin the upstream stream and admission slot.
+			if err = write(payload); err != nil {
 				status = 499
 				break
 			}
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
+			if err = downstream.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				status = 499
+				break
 			}
 		}
 		if format == "openai" && status == 200 && !sentDone {
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			_ = write([]byte("data: [DONE]\n\n"))
 		}
 		cleanup()
 		s.recordUsage(auth.ID, model, status, started, input, output)
@@ -548,10 +598,27 @@ func (s *Server) recordUsage(id, model string, status int, start time.Time, inpu
 	}
 	s.usage.Input += input
 	s.usage.Output += output
-	raw, _ := json.Marshal(s.usage)
-	_ = atomicWrite(filepath.Join(s.dataDir, "usage.json"), raw)
+	s.usageDirty = true
 	s.usageMu.Unlock()
 	s.recordLog(Log{Time: time.Now().UTC(), Level: "info", Event: "request.completed", Account: id, Model: model, Status: status, Duration: time.Since(start).Milliseconds(), Input: input, Output: output})
+}
+
+// flushUsage persists counters from the monitor tick and on Close, so request
+// completion never waits on an fsync while holding the log lock.
+func (s *Server) flushUsage() {
+	s.usageMu.Lock()
+	if !s.usageDirty {
+		s.usageMu.Unlock()
+		return
+	}
+	raw, _ := json.Marshal(s.usage)
+	s.usageDirty = false
+	s.usageMu.Unlock()
+	if atomicWrite(filepath.Join(s.dataDir, "usage.json"), raw) != nil {
+		s.usageMu.Lock()
+		s.usageDirty = true
+		s.usageMu.Unlock()
+	}
 }
 func (s *Server) saveConfigLocked() error {
 	raw, err := yaml.Marshal(s.cfg)

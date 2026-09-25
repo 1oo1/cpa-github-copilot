@@ -25,6 +25,7 @@ type Config struct {
 	SessionAffinity bool              `yaml:"session-affinity" json:"session_affinity"`
 	ModelAliases    map[string]string `yaml:"model-aliases,omitempty" json:"model_aliases"`
 	ExcludedModels  []string          `yaml:"excluded-models,omitempty" json:"excluded_models"`
+	TrustedProxies  []string          `yaml:"trusted-proxies,omitempty" json:"-"`
 	Copilot         copilot.Settings  `yaml:"copilot" json:"-"`
 }
 
@@ -72,6 +73,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Routing != "round-robin" && cfg.Routing != "fill-first" {
 		return cfg, fmt.Errorf("routing-strategy must be round-robin or fill-first")
+	}
+	if _, err = parseTrustedProxies(cfg.TrustedProxies); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
 }

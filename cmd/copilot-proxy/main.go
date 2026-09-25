@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -44,6 +47,7 @@ func run() error {
 	if uiErr != nil && *importDir == "" {
 		return fmt.Errorf("management UI is not built: run make build")
 	}
+	applyContainerMemoryLimit()
 	server, err := app.New(cfg, *config, nil, ui)
 	if err != nil {
 		return err
@@ -60,7 +64,8 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server.Start(ctx)
-	httpServer := &http.Server{Addr: cfg.Listen, Handler: server, ReadHeaderTimeout: 10 * time.Second, MaxHeaderBytes: 1 << 20}
+	// No WriteTimeout: SSE responses are long-lived and the server sets per-write deadlines.
+	httpServer := &http.Server{Addr: cfg.Listen, Handler: server, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 5 * time.Minute, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	done := make(chan error, 1)
 	go func() { done <- httpServer.ListenAndServe() }()
 	fmt.Printf("Copilot Proxy %s listening on %s\n", version, cfg.Listen)
@@ -76,4 +81,24 @@ func run() error {
 		_ = httpServer.Close()
 	}
 	return nil
+}
+
+// applyContainerMemoryLimit sets a soft Go heap limit below the cgroup limit so
+// the collector works harder before the kernel OOM killer does. GOMEMLIMIT wins.
+func applyContainerMemoryLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		limit, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		// cgroup v1 reports "no limit" as a huge page-aligned number.
+		if err == nil && limit > 0 && limit < 1<<50 {
+			debug.SetMemoryLimit(limit / 10 * 8)
+		}
+		return
+	}
 }

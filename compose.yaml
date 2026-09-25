@@ -37,6 +37,7 @@ services:
 
     # 宿主默认仅绑定回环地址。面板和 API 共用同一端口。
     # COPILOT_BIND_ADDRESS=0.0.0.0 可允许外部连接，但务必配 HTTPS/防火墙。
+    # 经反向代理访问时，在 config.yaml 的 trusted-proxies 填写代理地址，认证失败限流才能区分客户端。
     # COPILOT_PORT 仅改变宿主映射端口；容器内仍为 8317。
     # 同一 Compose 网络中的反向代理应连接 http://copilot-proxy:8317。
     ports:
@@ -86,6 +87,7 @@ services:
 
     # 资源上限示例，可按账户数、并发量和 SSE event 上限调整。
     # 过小的内存可能导致 OOM；stop/restart 不能撤销已发往 GitHub 的请求。
+    # 程序自动读取该上限：Go 堆软上限取 80%，并按比例限制同时处理的大请求。
     mem_limit: "${COPILOT_MEMORY_LIMIT:-512m}"
     cpus: "${COPILOT_CPUS:-1.0}"
     pids_limit: 128

@@ -361,6 +361,7 @@ func (s *Server) monitor(ctx context.Context) {
 	var mu sync.Mutex
 	running := map[*account]bool{}
 	for {
+		s.flushUsage()
 		s.mu.Lock()
 		accounts := make([]*account, 0, len(s.accounts))
 		for _, a := range s.accounts {
