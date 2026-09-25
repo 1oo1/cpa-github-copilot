@@ -164,7 +164,7 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 }
 
 func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (preparedInference, *serviceError) {
-	// VS Code 1.136.1 没有独立 /responses/compact endpoint 的源码证据，GitHub Copilot 提供该
+	// VS Code 1.139.1 没有独立 /responses/compact endpoint 的源码证据，GitHub Copilot 提供该
 	// endpoint 也无从证实；在发出 HTTP 请求前拒绝，不误发普通 /responses 也不臆造新 endpoint。
 	if strings.TrimSpace(req.Alt) == "responses/compact" {
 		return preparedInference{}, &serviceError{code: "unsupported_feature", message: "GitHub Copilot does not support a separate Responses compaction endpoint", httpStatus: http.StatusNotImplemented}
@@ -509,7 +509,7 @@ func preserveAnthropicReasoningEffort(raw []byte, effort string) []byte {
 	return out
 }
 
-// responsesContextManagementExcludedFamilies 是 VS Code 1.136.1 源码证明的排除集合
+// responsesContextManagementExcludedFamilies 是 VS Code 1.139.1 源码证明的排除集合
 // （openai.ts modelsWithoutResponsesContextManagement）。
 var responsesContextManagementExcludedFamilies = map[string]bool{
 	"gpt-5":   true,
@@ -542,7 +542,7 @@ func normalizeOpenAIResponsesCompatibility(payload map[string]any, route modelRo
 			}
 			changed = true
 		}
-		// Copilot Chat 0.64 never sends reasoning.summary on its Grok Responses
+		// Copilot Chat 0.67 never sends reasoning.summary on its Grok Responses
 		// route. Codex commonly requests "auto", which the Copilot Grok endpoint
 		// rejects even though it is valid on the public OpenAI Responses API.
 		if isGrok {
@@ -1204,7 +1204,9 @@ func cloneResponseHeaders(input http.Header, contentType string) http.Header {
 		"request-id":          "Request-Id",
 		"x-request-id":        "X-Request-Id",
 		"x-github-request-id": "X-GitHub-Request-Id",
-		"retry-after":         "Retry-After",
+		// Response-only CAPI correlation ID (Copilot Chat 0.67); never a caller identity.
+		"x-copilot-service-request-id": "X-Copilot-Service-Request-Id",
+		"retry-after":                  "Retry-After",
 	}
 	for key, values := range input {
 		canonical, ok := allowed[strings.ToLower(strings.TrimSpace(key))]

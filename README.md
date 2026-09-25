@@ -189,8 +189,9 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 
 ## 协议边界
 
-- 流式和非流式请求均支持；Responses 必须出现真实终态，不会把 EOF 伪造成成功。
-- 会话历史、Responses continuation 和 compaction 重放由客户端负责。无法安全转换的 opaque state 仍拒绝跨协议转换。
+- HTTP 兼容基线为 VS Code `1.139.1` / Copilot Chat `0.67.0`，模型和能力仍由当前账户 `/models` 决定。
+- 流式和非流式请求均支持；Responses 必须出现真实终态，不会把 EOF 伪造成成功。JSON/SSE 响应保留上游 `X-Copilot-Service-Request-Id`，便于关联故障请求。
+- 会话历史、Responses continuation 和 compaction 重放由客户端负责。原生 Responses 保留包括非 `rs` 前缀 ID 在内的加密推理状态；无法安全转换的 opaque state 仍拒绝跨协议转换。
 - 不提供独立 `/v1/responses/compact` 或 token counting。
 - Copilot 原生 Web Search 的专用分流和原有请求头、同源、规范路径及 token 校验继续保留。
 - 所有外发 HTTP 经共享 transport 和 Copilot `hostClient`；只接受 HTTPS 上游，拒绝自动重定向。不会记录请求正文、授权头或 Copilot token。

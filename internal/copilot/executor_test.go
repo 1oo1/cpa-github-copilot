@@ -41,7 +41,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 		}
 		return contract.HTTPResponse{
 			StatusCode: 200,
-			Headers:    http.Header{"Content-Type": []string{"application/json"}, "X-GitHub-Request-Id": []string{"request-1"}},
+			Headers:    http.Header{"Content-Type": []string{"application/json"}, "X-GitHub-Request-Id": []string{"request-1"}, "x-copilot-service-request-id": []string{"synthetic-service-1"}},
 			Body:       []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`),
 		}, nil
 	}
@@ -64,7 +64,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 		t.Fatal(errExecute)
 	}
 	result := decodePluginResult[contract.ExecutorResponse](t, raw)
-	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" {
+	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-1" {
 		t.Fatalf("executor result = %#v", result)
 	}
 }
@@ -1571,6 +1571,7 @@ func TestPrepareInferenceRejectsCrossFormatWithResponsesStatefulMarkers(t *testi
 		{name: "previous_response_id", payload: `{"model":"gpt-4.1","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`},
 		{name: "context_management", payload: `{"model":"gpt-4.1","context_management":[{"type":"compaction","compact_threshold":1000}],"input":[{"role":"user","content":"hi"}]}`},
 		{name: "compaction input item", payload: `{"model":"gpt-4.1","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
+		{name: "opaque reasoning ID", payload: `{"model":"gpt-4.1","input":[{"type":"reasoning","id":"CzDhIBSZ31VSyW6rYILnFerwKDkArecaC","encrypted_content":"synthetic-enc"},{"role":"user","content":"hi"}]}`},
 		{name: "encrypted reasoning input item", payload: `{"model":"gpt-4.1","input":[{"type":"reasoning","id":"rs_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1949,5 +1950,42 @@ func TestPreparedInferenceLogFieldsOmitResponsesDiagnosticsForOtherFormats(t *te
 	}
 	if _, exists := fields["responses_state_present"]; exists {
 		t.Fatalf("unexpected responses_state_present for chat format: %#v", fields)
+	}
+}
+
+// VS Code 1.139.1 replays Responses-origin reasoning even without an rs prefix.
+// This proxy already knows the native wire format; it must not infer origin from IDs
+// or interpret the encrypted payload as a foreign thinking signature.
+func TestPrepareInferencePreservesNativeResponsesOpaqueReasoning(t *testing.T) {
+	for _, id := range []string{"rs_synthetic", "CzDhIBSZ31VSyW6rYILnFerwKDkArecaC"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%v", id, stream), func(t *testing.T) {
+				service := newService(nil)
+				now := time.Unix(152_000, 0).UTC()
+				service.now = func() time.Time { return now }
+				streaming := true
+				storage := executorStorage(now, storedModel{ID: "gpt-6-astra", Family: "gpt-6", Format: formatOpenAIResponse, Streaming: &streaming})
+				input := []any{
+					map[string]any{"type": "reasoning", "id": id, "summary": []any{}, "encrypted_content": "synthetic-opaque-blob"},
+					map[string]any{"type": "function_call_output", "call_id": "call_synthetic", "output": "done"},
+				}
+				payload := mustJSON(t, map[string]any{"model": "gpt-6-astra", "input": input})
+				before := string(payload)
+				prepared, failure := service.prepareInference(contract.ExecutorRequest{
+					AuthID: "auth", Model: "gpt-6-astra", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+					Payload: payload, StorageJSON: mustJSON(t, storage),
+				}, stream)
+				if failure != nil {
+					t.Fatal(failure)
+				}
+				var body map[string]any
+				if json.Unmarshal(prepared.upstreamPayload, &body) != nil || string(mustJSON(t, body["input"])) != string(mustJSON(t, input)) {
+					t.Fatal("native Responses reasoning or tool output changed")
+				}
+				if string(payload) != before {
+					t.Fatal("request normalization mutated caller history")
+				}
+			})
+		}
 	}
 }

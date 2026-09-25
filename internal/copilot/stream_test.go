@@ -96,7 +96,7 @@ func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, er
 		}
 	case operation.MethodHostHTTPDoStream:
 		f.upstream = append(f.upstream, payload.(localHostHTTPRequest))
-		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-1"}
+		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}}, StreamID: "upstream-1"}
 	case operation.MethodHostHTTPStreamRead:
 		if len(f.readChunks) == 0 {
 			return nil, fmt.Errorf("unexpected stream read")
@@ -160,7 +160,7 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 		t.Fatal(errStream)
 	}
 	result := decodePluginResult[localExecutorStreamResponse](t, raw)
-	if result.Headers.Get("Content-Type") != "text/event-stream" {
+	if result.Headers.Get("Content-Type") != "text/event-stream" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" {
 		t.Fatalf("stream headers = %#v", result.Headers)
 	}
 	bridge.wait(t)

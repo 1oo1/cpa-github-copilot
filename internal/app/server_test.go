@@ -71,7 +71,12 @@ func (f *fakeUpstream) Do(ctx context.Context, req contract.HTTPRequest) (*http.
 	return nil, fmt.Errorf("unexpected upstream path")
 }
 func fakeResponse(body string) *http.Response {
-	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}
+	return &http.Response{StatusCode: 200, Header: http.Header{
+		"Content-Type":                 {"application/json"},
+		"x-copilot-service-request-id": {"synthetic-service-request"},
+		"Authorization":                {"Bearer synthetic-upstream-secret"},
+		"Set-Cookie":                   {"synthetic-cookie"},
+	}, Body: io.NopCloser(strings.NewReader(body))}
 }
 func testServer(t *testing.T) (*Server, *fakeUpstream, Config, string) {
 	t.Helper()
@@ -327,6 +332,7 @@ func TestBudgetMonitorWorksWithoutUI(t *testing.T) {
 
 func TestStandaloneAllClientProtocols(t *testing.T) {
 	for _, tc := range []struct{ path, body, want string }{
+		{"/v1/chat/completions", `{"model":"test-model","messages":[{"role":"user","content":"hello"}]}`, "chat.completion.chunk"},
 		{"/v1/responses", `{"model":"test-model","input":[{"role":"user","content":"hello"}]}`, "response"},
 		{"/v1/messages", `{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}`, "message"},
 	} {
@@ -337,11 +343,13 @@ func TestStandaloneAllClientProtocols(t *testing.T) {
 			if out.Code != 200 || !strings.Contains(out.Body.String(), "OK") {
 				t.Fatalf("%d %s", out.Code, out.Body.String())
 			}
+			assertCopilotCorrelationHeaders(t, out.Header())
 			body := strings.TrimSuffix(tc.body, "}") + `,"stream":true}`
 			out = request(s, "POST", tc.path, cfg.APIKeys[0], body)
 			if out.Code != 200 || !strings.Contains(out.Body.String(), tc.want) || !strings.Contains(out.Body.String(), "data:") {
 				t.Fatalf("stream %d %s", out.Code, out.Body.String())
 			}
+			assertCopilotCorrelationHeaders(t, out.Header())
 		})
 	}
 }
@@ -496,5 +504,15 @@ func TestStandaloneUsageAcceptsFormattedJSON(t *testing.T) {
 	input, output = usageTokens([]byte("data: {\"message\":{\"usage\":{\"input_tokens\":21}}}\n\ndata: {\"usage\":{\"output_tokens\":8}}\n\n"))
 	if input != 21 || output != 8 {
 		t.Fatalf("stream usage=%d/%d", input, output)
+	}
+}
+
+func assertCopilotCorrelationHeaders(t *testing.T, headers http.Header) {
+	t.Helper()
+	if headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-request" {
+		t.Fatal("public API dropped Copilot service request ID")
+	}
+	if headers.Get("Authorization") != "" || headers.Get("Set-Cookie") != "" {
+		t.Fatal("public API leaked private upstream headers")
 	}
 }

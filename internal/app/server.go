@@ -433,6 +433,13 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 			input, output := usageTokens(response.Payload)
 			s.recordUsage(auth.ID, model, 200, started, input, output)
 			s.bindSession(session, auth.ID)
+			// The Copilot engine has already restricted these to its response-header
+			// allowlist. Keep correlation IDs on JSON responses as well as SSE.
+			for key, values := range response.Headers {
+				for _, value := range values {
+					w.Header().Add(key, value)
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = write(response.Payload)
 			return

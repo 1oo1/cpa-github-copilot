@@ -2,6 +2,7 @@ package copilot
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -499,6 +500,43 @@ func TestModelsForAuthPropagatesCapabilitiesFromDiscoveryToRoute(t *testing.T) {
 			if test.declared && (capability == nil || *capability != test.value) {
 				t.Fatalf("%s %s = %#v, want %v", test.id, name, capability, test.value)
 			}
+		}
+	}
+}
+
+// GPT-6 names recognized by Copilot Chat 0.67 are not a proxy-side capability
+// allowlist: declared endpoints and limits must still come from this account.
+func TestGPT6CatalogKeepsDeclaredCapabilitiesAndIndependentLimits(t *testing.T) {
+	for _, family := range []string{"gpt-6", "gpt-6-astra", "gpt-6.1-mini"} {
+		for _, tools := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/tools=%v", family, tools), func(t *testing.T) {
+				model := remoteModelFixture(family, true, "", true, []string{"/responses", "/chat/completions"})
+				capabilities := model["capabilities"].(map[string]any)
+				capabilities["family"] = family
+				capabilities["limits"] = map[string]any{
+					"max_context_window_tokens": 300_000,
+					"max_prompt_tokens":         200_000,
+					"max_output_tokens":         32_000,
+				}
+				capabilities["supports"] = map[string]any{
+					"tool_calls": true, "streaming": true, "tool_search": tools,
+					"reasoning_effort": []string{"low", "high"},
+				}
+				models, err := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
+				if err != nil || len(models) != 1 {
+					t.Fatalf("catalog parse failed: %v", err)
+				}
+				route := routeForStoredModel(models[0])
+				if route.Format != formatOpenAIResponse || route.Family != family ||
+					optionalBool(route.SupportsToolSearch) != tools || optionalBool(route.SupportsContextEditing) ||
+					strings.Join(route.ReasoningLevels, ",") != "low,high" {
+					t.Fatalf("route does not match catalog: %#v", route)
+				}
+				if modelInfos(models)[0].ContextLength != 300_000 || route.MaxPromptTokens != 200_000 || route.MaxOutputTokens != 32_000 ||
+					responsesCompactionThreshold(route) != 180_000 {
+					t.Fatal("context window, prompt and output limits were conflated")
+				}
+			})
 		}
 	}
 }

@@ -92,10 +92,10 @@ func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
 	}
 }
 
-func TestInferenceHeadersUseVSCode1136Identity(t *testing.T) {
+func TestInferenceHeadersUseVSCode1139Identity(t *testing.T) {
 	headers := inferenceHeaders("session", formatOpenAI, []byte(`{}`), nil)
-	if headers.Get("User-Agent") != "GitHubCopilotChat/0.64.1" || headers.Get("Editor-Version") != "vscode/1.136.1" ||
-		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.64.1" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
+	if headers.Get("User-Agent") != "GitHubCopilotChat/0.67.0" || headers.Get("Editor-Version") != "vscode/1.139.1" ||
+		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.67.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
 		headers.Get("X-GitHub-Api-Version") != "2026-08-01" {
 		t.Fatalf("identity headers = %#v", headers)
 	}
@@ -234,5 +234,45 @@ func TestAnthropicBetaHeaderIsSourceProven(t *testing.T) {
 				t.Fatalf("Anthropic-Beta = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+// Copilot Chat 0.67 reads this response-only correlation ID case-insensitively.
+func TestCloneResponseHeadersPreservesCopilotServiceRequestID(t *testing.T) {
+	for _, name := range []string{"x-copilot-service-request-id", "X-Copilot-Service-Request-Id", "X-COPILOT-SERVICE-REQUEST-ID"} {
+		for _, contentType := range []string{"application/json", "text/event-stream"} {
+			t.Run(name+"/"+contentType, func(t *testing.T) {
+				input := http.Header{
+					name:                  {"synthetic-service-request"},
+					"X-GitHub-Request-Id": {"synthetic-github-request"},
+					"Authorization":       {"Bearer synthetic-secret"},
+					"Set-Cookie":          {"synthetic-cookie"},
+					"X-Unknown":           {"not-allowed"},
+				}
+				out := cloneResponseHeaders(input, contentType)
+				if out.Get("X-Copilot-Service-Request-Id") != "synthetic-service-request" ||
+					out.Get("X-GitHub-Request-Id") != "synthetic-github-request" || out.Get("Content-Type") != contentType {
+					t.Fatalf("response correlation headers were not preserved: %#v", out)
+				}
+				if len(out) != 3 {
+					t.Fatalf("unexpected response headers: %#v", out)
+				}
+				out.Set("X-Copilot-Service-Request-Id", "changed")
+				if input[name][0] != "synthetic-service-request" {
+					t.Fatal("response headers share mutable state")
+				}
+			})
+		}
+	}
+}
+
+func TestInferenceDoesNotReplayCopilotServiceRequestID(t *testing.T) {
+	for _, format := range []string{formatOpenAI, formatOpenAIResponse, formatClaude} {
+		headers := inferenceHeaders("synthetic-session", format, []byte(`{}`), http.Header{
+			"X-Copilot-Service-Request-Id": {"caller-supplied"},
+		})
+		if headers.Get("X-Copilot-Service-Request-Id") != "" {
+			t.Fatal("response-only service request ID was forwarded upstream")
+		}
 	}
 }
