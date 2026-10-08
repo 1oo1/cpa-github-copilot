@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
 func TestQuotaThresholdAndDisplay(t *testing.T) {
@@ -78,7 +77,7 @@ func TestQuotaHostTransportAndRedaction(t *testing.T) {
 	for _, status := range []int{200, 401, 403, 429, 500} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-				if method != operation.MethodHostHTTPDo {
+				if method != legacyMethodHostHTTPDo {
 					t.Fatal(method)
 				}
 				req := payload.(localHostHTTPRequest)
@@ -87,7 +86,7 @@ func TestQuotaHostTransportAndRedaction(t *testing.T) {
 				}
 				return contract.HTTPResponse{StatusCode: status, Headers: http.Header{"Retry-After": {"120"}}, Body: []byte(`{"copilot_plan":"individual_max","secret":"secret-upstream"}`)}, nil
 			}}
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			req, _ := json.Marshal(localQuotaFetchRequest{QuotaFetchRequest: contract.QuotaFetchRequest{Provider: providerIdentifier, StorageJSON: []byte(`{"type":"github-copilot","github_access_token":"secret-github"}`)}, HostCallbackID: "quota-context"})
 			raw, err := service.fetchQuota(req)
 			if strings.Contains(string(raw), "secret") || err != nil && strings.Contains(err.Error(), "secret") {
@@ -109,7 +108,7 @@ func TestQuotaRejectsUnsafeHostAndMalformedResponse(t *testing.T) {
 	for _, host := range []string{"https://evil.example/path", "127.0.0.1", "github.com:8443", "unconfigured.example"} {
 		bridge := &fakeBridge{}
 		request, _ := json.Marshal(localQuotaFetchRequest{QuotaFetchRequest: contract.QuotaFetchRequest{StorageJSON: mustJSON(t, copilotStorage{Type: providerIdentifier, GitHubAccessToken: "test", GitHubHost: host})}})
-		_, err := newService(bridge).fetchQuota(request)
+		_, err := newService(newLegacyRuntime(bridge)).fetchQuota(request)
 		if err == nil || len(bridge.calls) != 0 {
 			t.Fatalf("unsafe host %s was dispatched", host)
 		}

@@ -2,6 +2,7 @@ package copilot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"math"
 	"math/big"
@@ -13,43 +14,34 @@ import (
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
 )
 
-type localQuotaFetchRequest struct {
-	contract.QuotaFetchRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-func (s *service) fetchQuota(raw []byte) ([]byte, error) {
-	var req localQuotaFetchRequest
-	if json.Unmarshal(raw, &req) != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode quota request"}
-	}
+func (s *service) fetchQuotaRequest(ctx context.Context, callbackID string, req contract.QuotaFetchRequest) (contract.QuotaFetchResponse, error) {
 	if req.Provider != "" && req.Provider != providerIdentifier {
-		return nil, &serviceError{code: "invalid_auth", message: "invalid quota provider", httpStatus: 400}
+		return contract.QuotaFetchResponse{}, &serviceError{code: "invalid_auth", message: "invalid quota provider", httpStatus: 400}
 	}
 	storage, err := decodeCopilotStorage(req.StorageJSON)
 	if err != nil || strings.TrimSpace(storage.GitHubAccessToken) == "" || strings.ContainsAny(storage.GitHubAccessToken, "\r\n") {
-		return nil, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: 401}
+		return contract.QuotaFetchResponse{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: 401}
 	}
 	endpoints, err := endpointsForHost(storage.GitHubHost)
 	if err != nil || endpoints.GitHubHost != s.loadedConfig().GitHubHost {
-		return nil, &serviceError{code: "invalid_auth", message: "GitHub Copilot host is invalid for this configuration", httpStatus: 400}
+		return contract.QuotaFetchResponse{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot host is invalid for this configuration", httpStatus: 400}
 	}
-	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	client := s.client(ctx, callbackID)
 	response, err := client.do(contract.HTTPRequest{Method: http.MethodGet, URL: endpoints.EntitlementURL, Headers: http.Header{"Authorization": {"Bearer " + storage.GitHubAccessToken}, "Accept": {"application/json"}}})
 	if err != nil {
-		return nil, &serviceError{code: "quota_unavailable", message: "GitHub Copilot quota request failed", retryable: true}
+		return contract.QuotaFetchResponse{}, &serviceError{code: "quota_unavailable", message: "GitHub Copilot quota request failed", retryable: true}
 	}
 	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden && response.Headers.Get("Retry-After") != "" {
-		return okEnvelope(contract.QuotaFetchResponse{Stale: true, RetryAfterSeconds: quotaRetryAfter(response.Headers.Get("Retry-After"), s.now()), Admission: &contract.QuotaAdmission{State: "unknown"}})
+		return contract.QuotaFetchResponse{Stale: true, RetryAfterSeconds: quotaRetryAfter(response.Headers.Get("Retry-After"), s.now()), Admission: &contract.QuotaAdmission{State: "unknown"}}, nil
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, upstreamFailure("quota_http_error", "GitHub Copilot quota request failed", response.StatusCode)
+		return contract.QuotaFetchResponse{}, upstreamFailure("quota_http_error", "GitHub Copilot quota request failed", response.StatusCode)
 	}
 	quota, err := parseQuota(response.Body)
 	if err != nil {
-		return nil, &serviceError{code: "invalid_quota", message: "GitHub Copilot quota response is invalid"}
+		return contract.QuotaFetchResponse{}, &serviceError{code: "invalid_quota", message: "GitHub Copilot quota response is invalid"}
 	}
-	return okEnvelope(quota)
+	return quota, nil
 }
 
 func quotaRetryAfter(value string, now time.Time) int {

@@ -12,7 +12,7 @@ import (
 const (
 	copilotUserAgent       = "GitHubCopilotChat/0.67.0"
 	copilotEditorVersion   = "vscode/1.139.1"
-	copilotPluginVersion   = "copilot-chat/0.67.0"
+	copilotChatVersion     = "copilot-chat/0.67.0"
 	copilotIntegrationID   = "vscode-chat"
 	copilotAPIVersion      = "2026-08-01"
 	copilotTokenAPIVersion = "2025-04-01"
@@ -58,7 +58,7 @@ func copilotIdentityHeaders() http.Header {
 	return http.Header{
 		"User-Agent":             []string{copilotUserAgent},
 		"Editor-Version":         []string{copilotEditorVersion},
-		"Editor-Plugin-Version":  []string{copilotPluginVersion},
+		"Editor-Plugin-Version":  []string{copilotChatVersion},
 		"Copilot-Integration-Id": []string{copilotIntegrationID},
 	}
 }

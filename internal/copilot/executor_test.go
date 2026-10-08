@@ -9,7 +9,6 @@ import (
 	"time"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 	sdktranslator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 )
 
@@ -19,7 +18,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-4.1", Format: formatOpenAI})
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -45,7 +44,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 			Body:       []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`),
 		}, nil
 	}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	payload := []byte(`{"model":"github-copilot/gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
 	raw, errExecute := service.execute(mustJSON(t, localExecutorRequest{
 		ExecutorRequest: contract.ExecutorRequest{
@@ -63,7 +62,7 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
-	result := decodePluginResult[contract.ExecutorResponse](t, raw)
+	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-1" {
 		t.Fatalf("executor result = %#v", result)
 	}
@@ -75,7 +74,7 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -99,7 +98,7 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
 		}`)}, nil
 	}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
 	raw, errExecute := service.execute(mustJSON(t, localExecutorRequest{
 		ExecutorRequest: contract.ExecutorRequest{
@@ -111,7 +110,7 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
-	result := decodePluginResult[contract.ExecutorResponse](t, raw)
+	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	var completion map[string]any
 	if errDecode := json.Unmarshal(result.Payload, &completion); errDecode != nil {
 		t.Fatalf("decode translated completion: %v; payload=%s", errDecode, result.Payload)
@@ -132,7 +131,7 @@ func TestExecuteRejectsFailedResponsesBeforeChatTranslation(t *testing.T) {
 			"error":{"code":"server_error","message":"` + sentinel + `"}
 		}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
 	_, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
 		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
@@ -179,7 +178,7 @@ func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) 
 			bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 				return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(test.body)}, nil
 			}}
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`)
 			raw, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
@@ -196,7 +195,7 @@ func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) 
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodePluginResult[contract.ExecutorResponse](t, raw)
+			result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 			if string(result.Payload) != test.body {
 				t.Fatalf("native terminal payload changed: got=%s want=%s", result.Payload, test.body)
 			}
@@ -315,7 +314,7 @@ func TestExecuteTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodePluginResult[contract.ExecutorResponse](t, raw)
+			result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 			var response map[string]any
 			if errDecode := json.Unmarshal(result.Payload, &response); errDecode != nil {
 				t.Fatalf("decode translated response: %v; payload=%s", errDecode, result.Payload)
@@ -349,7 +348,7 @@ func TestExecuteTranslatedClaudeNonStreamPreservesStructuredContent(t *testing.T
 	if failure != nil {
 		t.Fatal(failure)
 	}
-	result := decodePluginResult[contract.ExecutorResponse](t, raw)
+	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	var response struct {
 		Status string `json:"status"`
 		Output []struct {
@@ -386,7 +385,7 @@ func executeSourceResponseAsResponses(t *testing.T, model, upstreamFormat string
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: upstreamBody}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"` + model + `","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
 	raw, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
@@ -1003,7 +1002,7 @@ func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(sentinel)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
 	_, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
 		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
@@ -1027,7 +1026,7 @@ func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL: "https://attacker.example/collect", Method: http.MethodPost, Body: []byte(`{"model":"gpt-4.1"}`), StorageJSON: mustJSON(t, storage),
 	}}))
@@ -1047,7 +1046,7 @@ func TestExecuteHTTPRequestRejectsResponsesCompactWithoutHostCall(t *testing.T) 
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/responses/compact",
 		Method:      http.MethodPost,
@@ -1070,7 +1069,7 @@ func TestExecuteHTTPRequestRejectsInferenceNonPOSTWithoutHostCall(t *testing.T) 
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	for _, method := range []string{http.MethodGet, "post", " POST ", ""} {
 		t.Run(method, func(t *testing.T) {
 			_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
@@ -1097,7 +1096,7 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	for _, endpoint := range []string{
 		"/responses/.",
 		"/responses/",
@@ -1146,7 +1145,7 @@ func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 	})
 	var upstreamBody map[string]any
 	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -1155,7 +1154,7 @@ func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		AuthID:      "auth",
 		URL:         "https://api.individual.githubcopilot.com/responses",
@@ -1211,7 +1210,7 @@ func TestExecuteHTTPRequestNativeResponsesRequiresTerminalStatus(t *testing.T) {
 			bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 				return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(test.body)}, nil
 			}}
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			service.now = func() time.Time { return now }
 			requestBody := fmt.Sprintf(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}],"stream":%t}`, test.stream)
 			raw, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
@@ -1228,7 +1227,7 @@ func TestExecuteHTTPRequestNativeResponsesRequiresTerminalStatus(t *testing.T) {
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodePluginResult[contract.ExecutorHTTPResponse](t, raw)
+			result := decodeEnvelopeResult[contract.ExecutorHTTPResponse](t, raw)
 			if string(result.Body) != test.body {
 				t.Fatalf("native HTTP terminal payload changed: got=%s want=%s", result.Body, test.body)
 			}
@@ -1249,7 +1248,7 @@ func TestExecuteHTTPRequestAppliesChatBodyPolicy(t *testing.T) {
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		AuthID: "auth", URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
 		Body:        []byte(`{"model":"gpt-4.1","store":true,"reasoning_effort":"high","messages":[{"role":"developer","content":"rules"}]}`),
@@ -1283,7 +1282,7 @@ func TestExecuteHTTPRequestPreservesSameOriginNonInferenceRequest(t *testing.T) 
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[]}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/models?editor=vscode",
 		Method:      http.MethodGet,
@@ -1308,7 +1307,7 @@ func TestExecuteHTTPRequestPreservesClaudeBodyOnSameOriginNonInferenceRequest(t 
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/models?editor=vscode",
 		Method:      http.MethodGet,
@@ -1326,7 +1325,7 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
 	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -1347,7 +1346,7 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	body := []byte(`{
 		"model":"claude-haiku-4.5",
 		"messages":[{"role":"user","content":"Use the tool"}],
@@ -1373,7 +1372,7 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 		ReasoningLevels: []string{"low", "medium", "high"}, ReasoningLevelsDeclared: true,
 	})
 	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -1394,7 +1393,7 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	body := []byte(`{
 		"model":"claude-opus-4.8",
 		"max_tokens":32000,
@@ -1432,7 +1431,7 @@ func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 		"context_management":{"edits":[]}
 	}`)
 	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -1458,7 +1457,7 @@ func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/v1/messages",
 		Method:      http.MethodPost,
@@ -1547,7 +1546,7 @@ func TestExecuteHTTPRequestRejectsUnsupportedStreamingBody(t *testing.T) {
 		t.Fatalf("unexpected host call %s", method)
 		return nil, nil
 	}}
-	service.bridge = bridge
+	service.host = newLegacyRuntime(bridge)
 	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
 		URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
 		Body: []byte(`{"model":"gpt-4.1","stream":true,"messages":[]}`), StorageJSON: mustJSON(t, storage),

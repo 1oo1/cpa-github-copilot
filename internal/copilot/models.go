@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -101,23 +102,19 @@ var knownCopilotModels = []string{
 	"mai-code-1-flash-picker",
 }
 
-func (s *service) modelsForAuth(raw []byte) ([]byte, error) {
-	var req localAuthModelRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode model discovery request"}
-	}
+func (s *service) modelsForAuthRequest(ctx context.Context, callbackID string, req contract.AuthModelRequest) (contract.ModelResponse, error) {
 	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil || strings.TrimSpace(storage.CopilotSessionToken) == "" {
 		failure := &serviceError{code: "invalid_auth", message: "GitHub Copilot credential requires refresh", httpStatus: http.StatusUnauthorized}
-		s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "credential_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "credential_validation"})
+		return contract.ModelResponse{}, failure
 	}
 	if host, errHost := normalizeGitHubHost(storage.GitHubHost); errHost != nil || host != s.loadedConfig().GitHubHost {
-		failure := &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
-		s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "github_host_validation"})
-		return nil, failure
+		failure := &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match service configuration"}
+		s.logFailure(callbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "github_host_validation"})
+		return contract.ModelResponse{}, failure
 	}
-	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	client := s.client(ctx, callbackID)
 	models := storage.Models
 	storageChanged := false
 	cacheFresh := s.modelCacheFresh(storage)
@@ -131,11 +128,11 @@ func (s *service) modelsForAuth(raw []byte) ([]byte, error) {
 			storage.ModelsFetchedAt = s.now().UTC().UnixMilli()
 			storageChanged = true
 		} else if len(models) == 0 {
-			s.logFailure(req.HostCallbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
-			return nil, failure
+			s.logFailure(callbackID, "models.resolve.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "model_discovery"})
+			return contract.ModelResponse{}, failure
 		} else {
 			source = "stale_cache"
-			s.logFailure(req.HostCallbackID, "models.discovery.fallback", failure, map[string]any{
+			s.logFailure(callbackID, "models.discovery.fallback", failure, map[string]any{
 				"auth_id":            req.AuthID,
 				"cached_model_count": len(models),
 				"cached_model_ids":   storedModelIDs(models),
@@ -143,7 +140,7 @@ func (s *service) modelsForAuth(raw []byte) ([]byte, error) {
 		}
 	}
 	s.setModelRoutes(req.AuthID, models)
-	s.logEvent(req.HostCallbackID, "info", "models.resolved", map[string]any{
+	s.logEvent(callbackID, "info", "models.resolved", map[string]any{
 		"auth_id":        req.AuthID,
 		"catalog_source": source,
 		"cache_fresh":    cacheFresh,
@@ -159,7 +156,7 @@ func (s *service) modelsForAuth(raw []byte) ([]byte, error) {
 			Attributes: req.Attributes,
 		})
 	}
-	return okEnvelope(response)
+	return response, nil
 }
 
 func (s *service) modelCacheFresh(storage copilotStorage) bool {

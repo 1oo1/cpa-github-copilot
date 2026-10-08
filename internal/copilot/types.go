@@ -2,13 +2,9 @@ package copilot
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"io"
-	"net/http"
 	"sync"
 	"time"
-
-	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
 )
 
 const (
@@ -24,19 +20,6 @@ const (
 
 var providerVersion = "0.0.0-dev"
 
-type envelope struct {
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *envelopeError  `json:"error,omitempty"`
-}
-
-type envelopeError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
-}
-
 type serviceError struct {
 	code       string
 	message    string
@@ -46,13 +29,9 @@ type serviceError struct {
 
 func (e *serviceError) Error() string {
 	if e == nil {
-		return "plugin request failed"
+		return "service request failed"
 	}
 	return e.message
-}
-
-type lifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
 }
 
 type settings struct {
@@ -69,48 +48,13 @@ type settings struct {
 	EnableResponsesContextManagement bool `yaml:"enable_responses_context_management"`
 }
 
-type localAuthLoginStartRequest struct {
-	contract.AuthLoginStartRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localAuthLoginPollRequest struct {
-	contract.AuthLoginPollRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localAuthRefreshRequest struct {
-	contract.AuthRefreshRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localAuthModelRequest struct {
-	contract.AuthModelRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localExecutorRequest struct {
-	contract.ExecutorRequest
-	StreamID       string `json:"stream_id,omitempty"`
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localExecutorHTTPRequest struct {
-	contract.ExecutorHTTPRequest
-	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-type localExecutorStreamResponse struct {
-	Headers http.Header `json:"headers,omitempty"`
-}
-
 type routeKey struct {
 	AuthID  string
 	ModelID string
 }
 
 type service struct {
-	bridge hostBridge
+	host   hostRuntime
 	now    func() time.Time
 	random io.Reader
 
@@ -125,12 +69,12 @@ type service struct {
 	streamsShuttingDown bool
 }
 
-func newService(bridge hostBridge) *service {
+func newService(host hostRuntime) *service {
 	return &service{
-		bridge:      bridge,
+		host:        host,
 		now:         time.Now,
 		random:      rand.Reader,
-		config:      defaultPluginConfig(),
+		config:      defaultSettings(),
 		sessions:    make(map[string]*loginSession),
 		routes:      make(map[routeKey]modelRoute),
 		streamTasks: make(map[*streamForwardTask]struct{}),

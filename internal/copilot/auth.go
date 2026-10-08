@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -94,12 +95,7 @@ type loginSession struct {
 	polling           bool
 }
 
-func (s *service) parseAuth(raw []byte) ([]byte, error) {
-	var req contract.AuthParseRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		s.logEvent("", "debug", "auth.parse.ignored", map[string]any{"reason": "invalid_envelope"})
-		return okEnvelope(contract.AuthParseResponse{Handled: false})
-	}
+func (s *service) parseAuthRequest(req contract.AuthParseRequest) (contract.AuthParseResponse, error) {
 	var marker struct {
 		Type string `json:"type"`
 	}
@@ -108,14 +104,14 @@ func (s *service) parseAuth(raw []byte) ([]byte, error) {
 			"file_name": safeLogFileName(req.FileName),
 			"reason":    "invalid_json",
 		})
-		return okEnvelope(contract.AuthParseResponse{Handled: false})
+		return contract.AuthParseResponse{Handled: false}, nil
 	}
 	if strings.ToLower(strings.TrimSpace(marker.Type)) != providerIdentifier {
 		s.logEvent("", "debug", "auth.parse.ignored", map[string]any{
 			"file_name": safeLogFileName(req.FileName),
 			"reason":    "provider_mismatch",
 		})
-		return okEnvelope(contract.AuthParseResponse{Handled: false})
+		return contract.AuthParseResponse{Handled: false}, nil
 	}
 	storage, errStorage := decodeCopilotStorage(req.RawJSON)
 	disabledReasons := make([]string, 0, 3)
@@ -155,7 +151,7 @@ func (s *service) parseAuth(raw []byte) ([]byte, error) {
 		level = "warn"
 	}
 	s.logEvent("", level, "auth.parsed", fields)
-	return okEnvelope(contract.AuthParseResponse{Handled: true, Auth: auth})
+	return contract.AuthParseResponse{Handled: true, Auth: auth}, nil
 }
 
 func decodeCopilotStorage(raw []byte) (copilotStorage, error) {
@@ -326,18 +322,14 @@ func normalizeAccount(raw string) string {
 	return strings.Trim(out.String(), "-._")
 }
 
-func (s *service) startLogin(raw []byte) ([]byte, error) {
-	var req localAuthLoginStartRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode login start request"}
-	}
+func (s *service) startLoginRequest(ctx context.Context, callbackID string, _ contract.AuthLoginStartRequest) (contract.AuthLoginStartResponse, error) {
 	cfg := s.loadedConfig()
 	endpoints, errEndpoints := endpointsForHost(cfg.GitHubHost)
 	if errEndpoints != nil {
-		return nil, &serviceError{code: "invalid_config", message: "invalid GitHub endpoint configuration"}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "invalid_config", message: "invalid GitHub endpoint configuration"}
 	}
 	form := url.Values{"client_id": {cfg.ClientID}, "scope": {"read:user"}}
-	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(contract.HTTPRequest{
+	resp, errHTTP := s.client(ctx, callbackID).do(contract.HTTPRequest{
 		Method: http.MethodPost,
 		URL:    endpoints.DeviceCodeURL,
 		Headers: http.Header{
@@ -348,29 +340,29 @@ func (s *service) startLogin(raw []byte) ([]byte, error) {
 		Body: []byte(form.Encode()),
 	})
 	if errHTTP != nil {
-		return nil, &serviceError{code: "device_flow_network_error", message: "failed to start GitHub device authorization", retryable: true, httpStatus: http.StatusBadGateway}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "device_flow_network_error", message: "failed to start GitHub device authorization", retryable: true, httpStatus: http.StatusBadGateway}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, upstreamFailure("device_flow_http_error", "GitHub device authorization failed", resp.StatusCode)
+		return contract.AuthLoginStartResponse{}, upstreamFailure("device_flow_http_error", "GitHub device authorization failed", resp.StatusCode)
 	}
 	var device deviceCodeResponse
 	if errDecode := json.Unmarshal(resp.Body, &device); errDecode != nil || strings.TrimSpace(device.DeviceCode) == "" ||
 		strings.TrimSpace(device.UserCode) == "" || device.ExpiresIn <= 0 || device.ExpiresIn > 24*60*60 ||
 		device.Interval < 0 || device.Interval > 5*60 || math.IsNaN(device.ExpiresIn) || math.IsInf(device.ExpiresIn, 0) {
-		return nil, &serviceError{code: "device_flow_invalid_response", message: "GitHub device authorization returned an invalid response", httpStatus: http.StatusBadGateway}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "device_flow_invalid_response", message: "GitHub device authorization returned an invalid response", httpStatus: http.StatusBadGateway}
 	}
 	verificationURL, errVerification := validateVerificationURL(device.VerificationURI, endpoints.GitHubHost)
 	if errVerification != nil {
-		return nil, &serviceError{code: "device_flow_invalid_response", message: errVerification.Error(), httpStatus: http.StatusBadGateway}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "device_flow_invalid_response", message: errVerification.Error(), httpStatus: http.StatusBadGateway}
 	}
 	state, errState := randomState(s.random)
 	if errState != nil {
-		return nil, &serviceError{code: "internal_error", message: "failed to create device authorization state"}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "internal_error", message: "failed to create device authorization state"}
 	}
 	interval := durationSeconds(device.Interval, defaultPollInterval)
 	now := s.now().UTC()
 	if !s.reserveLoginSessionCapacity(now) {
-		return nil, &serviceError{code: "too_many_login_sessions", message: "too many GitHub device authorization sessions are pending", retryable: true, httpStatus: http.StatusTooManyRequests}
+		return contract.AuthLoginStartResponse{}, &serviceError{code: "too_many_login_sessions", message: "too many GitHub device authorization sessions are pending", retryable: true, httpStatus: http.StatusTooManyRequests}
 	}
 	expiresAt := now.Add(durationSeconds(device.ExpiresIn, 15*time.Minute))
 	session := &loginSession{
@@ -386,12 +378,12 @@ func (s *service) startLogin(raw []byte) ([]byte, error) {
 	s.mu.Lock()
 	s.sessions[state] = session
 	s.mu.Unlock()
-	s.logEvent(req.HostCallbackID, "info", "auth.login.started", map[string]any{
+	s.logEvent(callbackID, "info", "auth.login.started", map[string]any{
 		"github_host":           endpoints.GitHubHost,
 		"poll_interval_seconds": int(interval / time.Second),
 		"expires_at":            expiresAt,
 	})
-	return okEnvelope(contract.AuthLoginStartResponse{
+	return contract.AuthLoginStartResponse{
 		Provider:  providerIdentifier,
 		URL:       verificationURLWithCode(verificationURL, strings.TrimSpace(device.UserCode)),
 		State:     state,
@@ -401,7 +393,7 @@ func (s *service) startLogin(raw []byte) ([]byte, error) {
 			"interval":   int(interval / time.Second),
 			"expires_at": expiresAt.Format(time.RFC3339),
 		},
-	})
+	}, nil
 }
 
 func randomState(reader io.Reader) (string, error) {
@@ -426,36 +418,32 @@ func durationSeconds(raw float64, fallback time.Duration) time.Duration {
 	return duration
 }
 
-func (s *service) pollLogin(raw []byte) ([]byte, error) {
-	var req localAuthLoginPollRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode login poll request"}
-	}
+func (s *service) pollLoginRequest(ctx context.Context, callbackID string, req contract.AuthLoginPollRequest) (contract.AuthLoginPollResponse, error) {
 	state := strings.TrimSpace(req.State)
 	s.mu.RLock()
 	session := s.sessions[state]
 	s.mu.RUnlock()
 	if session == nil {
-		s.logEvent(req.HostCallbackID, "warn", "auth.login.failed", map[string]any{"reason": "unknown_session"})
-		return okEnvelope(contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: "Device authorization session is unknown or expired"})
+		s.logEvent(callbackID, "warn", "auth.login.failed", map[string]any{"reason": "unknown_session"})
+		return contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: "Device authorization session is unknown or expired"}, nil
 	}
 	now := s.now().UTC()
 	session.mu.Lock()
 	if !now.Before(session.expiresAt) {
 		session.mu.Unlock()
 		s.deleteSession(state)
-		s.logEvent(req.HostCallbackID, "warn", "auth.login.failed", map[string]any{"reason": "expired"})
-		return okEnvelope(contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: "GitHub device authorization expired"})
+		s.logEvent(callbackID, "warn", "auth.login.failed", map[string]any{"reason": "expired"})
+		return contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: "GitHub device authorization expired"}, nil
 	}
 	if session.polling || now.Before(session.nextPoll) {
 		nextPoll := session.nextPoll
 		polling := session.polling
 		session.mu.Unlock()
-		s.logEvent(req.HostCallbackID, "debug", "auth.login.pending", map[string]any{
+		s.logEvent(callbackID, "debug", "auth.login.pending", map[string]any{
 			"poll_in_progress": polling,
 			"next_poll_at":     nextPoll,
 		})
-		return pendingLoginResponse()
+		return pendingLoginResponseValue(), nil
 	}
 	session.polling = true
 	phase := session.phase
@@ -465,46 +453,46 @@ func (s *service) pollLogin(raw []byte) ([]byte, error) {
 		session.polling = false
 		session.mu.Unlock()
 	}()
-	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	client := s.client(ctx, callbackID)
 	if phase == loginWaitingForUser {
 		outcome, errPoll := s.pollGitHubToken(client, session)
 		if errPoll != nil {
 			if errPoll.retryable {
 				s.reschedule(session, 0)
-				s.logFailure(req.HostCallbackID, "auth.login.retry_scheduled", errPoll, nil)
-				return pendingLoginResponse()
+				s.logFailure(callbackID, "auth.login.retry_scheduled", errPoll, nil)
+				return pendingLoginResponseValue(), nil
 			}
 			s.deleteSession(state)
-			s.logFailure(req.HostCallbackID, "auth.login.failed", errPoll, nil)
-			return okEnvelope(contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: errPoll.message})
+			s.logFailure(callbackID, "auth.login.failed", errPoll, nil)
+			return contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: errPoll.message}, nil
 		}
 		if !outcome {
-			s.logEvent(req.HostCallbackID, "debug", "auth.login.pending", map[string]any{"reason": "awaiting_authorization"})
-			return pendingLoginResponse()
+			s.logEvent(callbackID, "debug", "auth.login.pending", map[string]any{"reason": "awaiting_authorization"})
+			return pendingLoginResponseValue(), nil
 		}
 	}
 	storage, failure := s.completeLogin(client, session)
 	if failure != nil {
 		if failure.retryable {
 			s.reschedule(session, 0)
-			s.logFailure(req.HostCallbackID, "auth.login.retry_scheduled", failure, nil)
-			return pendingLoginResponse()
+			s.logFailure(callbackID, "auth.login.retry_scheduled", failure, nil)
+			return pendingLoginResponseValue(), nil
 		}
 		s.deleteSession(state)
-		s.logFailure(req.HostCallbackID, "auth.login.failed", failure, nil)
-		return okEnvelope(contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: failure.message})
+		s.logFailure(callbackID, "auth.login.failed", failure, nil)
+		return contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusError, Message: failure.message}, nil
 	}
 	s.deleteSession(state)
-	s.logEvent(req.HostCallbackID, "info", "auth.login.completed", authLogFields(storage, now))
-	return okEnvelope(contract.AuthLoginPollResponse{
+	s.logEvent(callbackID, "info", "auth.login.completed", authLogFields(storage, now))
+	return contract.AuthLoginPollResponse{
 		Status:  contract.AuthLoginStatusSuccess,
 		Message: "GitHub Copilot authentication completed",
 		Auth:    authDataFromStorage(storage, authDataDefaults{}),
-	})
+	}, nil
 }
 
-func pendingLoginResponse() ([]byte, error) {
-	return okEnvelope(contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusPending, Message: "Waiting for GitHub device authorization"})
+func pendingLoginResponseValue() contract.AuthLoginPollResponse {
+	return contract.AuthLoginPollResponse{Status: contract.AuthLoginStatusPending, Message: "Waiting for GitHub device authorization"}
 }
 
 func (s *service) pollGitHubToken(client hostClient, session *loginSession) (bool, *serviceError) {
@@ -647,7 +635,7 @@ func (s *service) exchangeSession(client hostClient, githubToken, githubHost str
 	}
 	endpoints, errEndpoints := endpointsForHost(githubHost)
 	if errEndpoints != nil || endpoints.GitHubHost != s.loadedConfig().GitHubHost {
-		return copilotStorage{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
+		return copilotStorage{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match service configuration"}
 	}
 	resp, errHTTP := client.do(contract.HTTPRequest{
 		Method:  http.MethodGet,
@@ -728,32 +716,28 @@ func (s *service) fetchGitHubAccount(client hostClient, githubToken, githubHost 
 	}
 }
 
-func (s *service) refreshAuth(raw []byte) ([]byte, error) {
-	var req localAuthRefreshRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode auth refresh request"}
-	}
+func (s *service) refreshAuthRequest(ctx context.Context, callbackID string, req contract.AuthRefreshRequest) (contract.AuthRefreshResponse, error) {
 	previous, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil {
-		s.logFailure(req.HostCallbackID, "auth.refresh.failed", &serviceError{code: "invalid_auth", httpStatus: http.StatusUnauthorized}, map[string]any{
+		s.logFailure(callbackID, "auth.refresh.failed", &serviceError{code: "invalid_auth", httpStatus: http.StatusUnauthorized}, map[string]any{
 			"auth_id": req.AuthID,
 		})
-		return nil, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
+		return contract.AuthRefreshResponse{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
 	}
 	startFields := authLogFields(previous, s.now().UTC())
 	startFields["auth_id"] = req.AuthID
-	s.logEvent(req.HostCallbackID, "info", "auth.refresh.started", startFields)
-	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	s.logEvent(callbackID, "info", "auth.refresh.started", startFields)
+	client := s.client(ctx, callbackID)
 	next, failure := s.exchangeSession(client, previous.GitHubAccessToken, previous.GitHubHost)
 	if failure != nil {
-		s.logFailure(req.HostCallbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "session_exchange"})
-		return nil, failure
+		s.logFailure(callbackID, "auth.refresh.failed", failure, map[string]any{"auth_id": req.AuthID, "stage": "session_exchange"})
+		return contract.AuthRefreshResponse{}, failure
 	}
 	models, failure := s.discoverModels(client, next)
 	if failure != nil {
 		next.Models = append([]storedModel(nil), previous.Models...)
 		next.ModelsFetchedAt = previous.ModelsFetchedAt
-		s.logFailure(req.HostCallbackID, "auth.refresh.models_fallback", failure, map[string]any{
+		s.logFailure(callbackID, "auth.refresh.models_fallback", failure, map[string]any{
 			"auth_id":            req.AuthID,
 			"cached_model_count": len(next.Models),
 			"cached_model_ids":   storedModelIDs(next.Models),
@@ -772,8 +756,8 @@ func (s *service) refreshAuth(raw []byte) ([]byte, error) {
 	})
 	completedFields := authLogFields(next, s.now().UTC())
 	completedFields["auth_id"] = req.AuthID
-	s.logEvent(req.HostCallbackID, "info", "auth.refresh.completed", completedFields)
-	return okEnvelope(contract.AuthRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter})
+	s.logEvent(callbackID, "info", "auth.refresh.completed", completedFields)
+	return contract.AuthRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter}, nil
 }
 
 func fileNameFromAttributes(attributes map[string]string, fallback string) string {

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
 type streamBridgeFake struct {
@@ -53,10 +52,10 @@ func newShutdownStreamBridgeFake() *shutdownStreamBridgeFake {
 func (f *shutdownStreamBridgeFake) Call(method string, _ any) (json.RawMessage, error) {
 	var result any = map[string]any{}
 	switch method {
-	case operation.MethodHostLog:
-	case operation.MethodHostHTTPDoStream:
+	case legacyMethodHostLog:
+	case legacyMethodHostHTTPDoStream:
 		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-shutdown"}
-	case operation.MethodHostHTTPStreamRead:
+	case legacyMethodHostHTTPStreamRead:
 		f.mu.Lock()
 		f.readCount++
 		readCount := f.readCount
@@ -67,12 +66,12 @@ func (f *shutdownStreamBridgeFake) Call(method string, _ any) (json.RawMessage, 
 			<-f.upstreamClosed
 			result = localHostHTTPStreamReadResponse{Done: true}
 		}
-	case operation.MethodHostHTTPStreamClose:
+	case legacyMethodHostHTTPStreamClose:
 		f.upstreamOnce.Do(func() { close(f.upstreamClosed) })
-	case operation.MethodHostStreamEmit:
+	case legacyMethodHostStreamEmit:
 		f.emitOnce.Do(func() { close(f.emitStarted) })
 		<-f.emitRelease
-	case operation.MethodHostStreamClose:
+	case legacyMethodHostStreamClose:
 		f.pluginOnce.Do(func() { close(f.pluginClosed) })
 	default:
 		return nil, fmt.Errorf("unexpected method %s", method)
@@ -90,28 +89,28 @@ func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, er
 	defer f.mu.Unlock()
 	var result any = map[string]any{}
 	switch method {
-	case operation.MethodHostLog:
+	case legacyMethodHostLog:
 		if request, ok := payload.(localHostLogRequest); ok {
 			f.logs = append(f.logs, request)
 		}
-	case operation.MethodHostHTTPDoStream:
+	case legacyMethodHostHTTPDoStream:
 		f.upstream = append(f.upstream, payload.(localHostHTTPRequest))
 		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}}, StreamID: "upstream-1"}
-	case operation.MethodHostHTTPStreamRead:
+	case legacyMethodHostHTTPStreamRead:
 		if len(f.readChunks) == 0 {
 			return nil, fmt.Errorf("unexpected stream read")
 		}
 		result = f.readChunks[0]
 		f.readChunks = f.readChunks[1:]
-	case operation.MethodHostHTTPStreamClose:
+	case legacyMethodHostHTTPStreamClose:
 		f.upstreamClosed = true
-	case operation.MethodHostStreamEmit:
+	case legacyMethodHostStreamEmit:
 		if f.emitError {
 			return nil, fmt.Errorf("downstream closed")
 		}
 		req := payload.(localHostStreamEmitRequest)
 		f.emitted = append(f.emitted, append([]byte(nil), req.Payload...))
-	case operation.MethodHostStreamClose:
+	case legacyMethodHostStreamClose:
 		req := payload.(localHostStreamCloseRequest)
 		f.pluginClosed = true
 		f.pluginError = req.Error
@@ -144,7 +143,7 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n\n")},
 		localHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n")},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(100_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -159,7 +158,7 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	result := decodePluginResult[localExecutorStreamResponse](t, raw)
+	result := decodeEnvelopeResult[localExecutorStreamResponse](t, raw)
 	if result.Headers.Get("Content-Type") != "text/event-stream" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" {
 		t.Fatalf("stream headers = %#v", result.Headers)
 	}
@@ -180,7 +179,7 @@ func TestExecuteStreamPassThroughAcceptsSingleNewlineChatEvents(t *testing.T) {
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n")},
 		localHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n")},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(102_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -210,7 +209,7 @@ func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
 		localHostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(105_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.6-sol","input":"hi","stream":true}`)
@@ -259,7 +258,7 @@ func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.
 		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}","status":"completed"}}` + "\n\n" +
 		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}"}]}}` + "\n\n"
 	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(stream)})
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(106_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
@@ -313,7 +312,7 @@ func TestExecuteStreamNativeClaudeClosesAtMessageStop(t *testing.T) {
 		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_start","message":{"id":"msg-1"}}` + "\n\n")},
 		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_stop"}` + "\n\n")},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(107_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"claude-sonnet-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -346,7 +345,7 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 		localHostHTTPStreamReadResponse{Payload: []byte(first[:31])},
 		localHostHTTPStreamReadResponse{Payload: []byte(first[31:] + finish + done)},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(110_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -388,7 +387,7 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 		chunks = append(chunks, localHostHTTPStreamReadResponse{Payload: []byte(frame)})
 	}
 	bridge := newStreamBridgeFake(chunks...)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(115_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
@@ -433,7 +432,7 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
 	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
 	bridge.emitError = true
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(120_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -457,7 +456,7 @@ func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
 
 func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
 	bridge := newShutdownStreamBridgeFake()
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(122_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -516,7 +515,7 @@ func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
 
 func TestExecuteStreamUpstreamErrorStillClosesBothStreams(t *testing.T) {
 	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(125_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -619,7 +618,7 @@ func hasLogEvent(logs []localHostLogRequest, event string) bool {
 
 func executeOpenAIStream(t *testing.T, bridge *streamBridgeFake, streamID string, at time.Time) {
 	t.Helper()
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return at }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
@@ -868,7 +867,7 @@ func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
 	bridge := newStreamBridgeFake(
 		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"), Done: true},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(190_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
@@ -918,7 +917,7 @@ func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
 			bridge := newStreamBridgeFake(
 				localHostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n")},
 			)
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			now := time.Unix(191_000, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
@@ -948,7 +947,7 @@ func TestResponsesStreamLogsTerminalStatus(t *testing.T) {
 	bridge := newStreamBridgeFake(
 		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n")},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(196_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
@@ -981,7 +980,7 @@ func TestResponsesStreamLogsNeverContainCompactionOrPromptContent(t *testing.T) 
 	bridge := newStreamBridgeFake(
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(197_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"` + promptSentinel + `"}]}`)
@@ -1015,7 +1014,7 @@ func TestResponsesPassthroughPreservesCompactionEventsBeforeTerminal(t *testing.
 	bridge := newStreamBridgeFake(
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(192_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
@@ -1061,7 +1060,7 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			now := time.Unix(193_000, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -1100,7 +1099,7 @@ func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
 	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
 	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done)})
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(194_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -1161,7 +1160,7 @@ func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			now := time.Unix(194_250, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"` + test.model + `","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`)
@@ -1214,7 +1213,7 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frame), Done: true})
-			service := newService(bridge)
+			service := newService(newLegacyRuntime(bridge))
 			now := time.Unix(194_500, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -1252,7 +1251,7 @@ func TestExecuteStreamResponsesToChatAcceptsEventsWithoutSSESeparators(t *testin
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + delta)},
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + completed)},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(194_750, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
@@ -1294,7 +1293,7 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + item1 + "\n\ndata: " + item2 + "\n\n")},
 		localHostHTTPStreamReadResponse{Payload: []byte("data: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	now := time.Unix(195_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	firstPayload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
@@ -1337,7 +1336,7 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 		capturedBody = req.Body
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp_2","object":"response","status":"completed","output":[]}`)}, nil
 	}}
-	service2 := newService(bridge2)
+	service2 := newService(newLegacyRuntime(bridge2))
 	service2.now = func() time.Time { return now }
 	_, errExecute := service2.execute(mustJSON(t, localExecutorRequest{
 		ExecutorRequest: contract.ExecutorRequest{

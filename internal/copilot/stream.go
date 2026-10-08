@@ -12,22 +12,18 @@ import (
 	sdktranslator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 )
 
-func (s *service) executeStream(raw []byte) ([]byte, error) {
-	var req localExecutorRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode executor stream request"}
-	}
-	streamID := strings.TrimSpace(req.StreamID)
+func (s *service) executeStreamRequest(ctx context.Context, callbackID, streamID string, req contract.ExecutorRequest) (http.Header, error) {
+	streamID = strings.TrimSpace(streamID)
 	if streamID == "" {
-		return nil, &serviceError{code: "invalid_stream", message: "stream_id is required for executor.execute_stream"}
+		return nil, &serviceError{code: "invalid_stream", message: "stream id is required"}
 	}
-	prepared, failure := s.prepareInference(req.ExecutorRequest, true)
+	prepared, failure := s.prepareInference(req, true)
 	if failure != nil {
-		s.logFailure(req.HostCallbackID, "inference.rejected", failure, inferenceRequestLogFields(req.ExecutorRequest, true, s.now().UTC()))
+		s.logFailure(callbackID, "inference.rejected", failure, inferenceRequestLogFields(req, true, s.now().UTC()))
 		return nil, failure
 	}
-	s.logEvent(req.HostCallbackID, "debug", "inference.stream.started", preparedInferenceLogFields(prepared, true))
-	client := hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}
+	s.logEvent(callbackID, "debug", "inference.stream.started", preparedInferenceLogFields(prepared, true))
+	client := s.client(ctx, callbackID)
 	upstream, errOpen := client.openStream(contract.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     prepared.upstreamURL,
@@ -36,27 +32,27 @@ func (s *service) executeStream(raw []byte) ([]byte, error) {
 	})
 	if errOpen != nil {
 		failure = &serviceError{code: "upstream_network_error", message: "GitHub Copilot stream request failed", retryable: true, httpStatus: http.StatusBadGateway}
-		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		s.logFailure(callbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
 		return nil, failure
 	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		client.closeStream(upstream.StreamID)
 		failure = upstreamFailure("upstream_http_error", "GitHub Copilot stream request failed", upstream.StatusCode)
-		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		s.logFailure(callbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
 		return nil, failure
 	}
 	openedFields := preparedInferenceLogFields(prepared, true)
 	openedFields["upstream_status"] = upstream.StatusCode
-	s.logEvent(req.HostCallbackID, "debug", "inference.stream.opened", openedFields)
-	if !s.startStreamForwarding(client, streamID, upstream.StreamID, prepared) {
+	s.logEvent(callbackID, "debug", "inference.stream.opened", openedFields)
+	if !s.startStreamForwarding(ctx, client, streamID, upstream.StreamID, prepared) {
 		client.closeStream(upstream.StreamID)
-		failure = &serviceError{code: "plugin_shutdown", message: "plugin is shutting down", retryable: true, httpStatus: http.StatusServiceUnavailable}
-		s.logFailure(req.HostCallbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
+		failure = &serviceError{code: "service_shutdown", message: "service is shutting down", retryable: true, httpStatus: http.StatusServiceUnavailable}
+		s.logFailure(callbackID, "inference.stream.failed", failure, preparedInferenceLogFields(prepared, true))
 		return nil, failure
 	}
 	headers := cloneResponseHeaders(http.Header(upstream.Headers), "text/event-stream")
 	headers.Set("Content-Type", "text/event-stream")
-	return okEnvelope(localExecutorStreamResponse{Headers: headers})
+	return headers, nil
 }
 
 type streamForwardTask struct {
@@ -65,8 +61,8 @@ type streamForwardTask struct {
 	cancel           context.CancelFunc
 }
 
-func (s *service) startStreamForwarding(client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) bool {
-	ctx, cancel := context.WithCancel(context.Background())
+func (s *service) startStreamForwarding(ctx context.Context, client hostClient, downstreamStreamID, upstreamStreamID string, prepared preparedInference) bool {
+	ctx, cancel := context.WithCancel(ctx)
 	task := &streamForwardTask{client: client, upstreamStreamID: upstreamStreamID, cancel: cancel}
 	s.streamMu.Lock()
 	if s.streamsShuttingDown {
@@ -85,7 +81,7 @@ func (s *service) startStreamForwarding(client hostClient, pluginStreamID, upstr
 			s.streamMu.Unlock()
 			s.streamWG.Done()
 		}()
-		s.forwardCopilotStream(ctx, client, pluginStreamID, upstreamStreamID, prepared)
+		s.forwardCopilotStream(ctx, client, downstreamStreamID, upstreamStreamID, prepared)
 	}()
 	return true
 }
@@ -105,7 +101,7 @@ func (s *service) stopStreamForwarding() {
 	s.streamWG.Wait()
 }
 
-func (s *service) forwardCopilotStream(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference) {
+func (s *service) forwardCopilotStream(ctx context.Context, client hostClient, downstreamStreamID, upstreamStreamID string, prepared preparedInference) {
 	var forwardErr error
 	tracker := newResponsesTerminalTracker(prepared.outputFormat)
 	defer func() {
@@ -136,14 +132,14 @@ func (s *service) forwardCopilotStream(ctx context.Context, client hostClient, p
 			s.logEvent(client.callbackID, "warn", "inference.stream.forward_failed", fields)
 		}
 		client.closeStream(upstreamStreamID)
-		client.closePluginStream(pluginStreamID, errorMessage)
+		client.closeDownstreamStream(downstreamStreamID, errorMessage)
 	}()
 	maxBuffer := s.loadedConfig().MaxStreamBytes
 	if prepared.translatorFormat == prepared.outputFormat {
-		forwardErr = forwardStreamPassThrough(ctx, client, pluginStreamID, upstreamStreamID, prepared.outputFormat, maxBuffer, tracker, newGrokResponsesResponseNormalizer(prepared.grokToolRefs))
+		forwardErr = forwardStreamPassThrough(ctx, client, downstreamStreamID, upstreamStreamID, prepared.outputFormat, maxBuffer, tracker, newGrokResponsesResponseNormalizer(prepared.grokToolRefs))
 		return
 	}
-	forwardErr = forwardTranslatedStream(ctx, client, pluginStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
+	forwardErr = forwardTranslatedStream(ctx, client, downstreamStreamID, upstreamStreamID, prepared, maxBuffer, tracker)
 }
 
 // streamForwardError classifies why stream forwarding stopped so the deferred
@@ -151,11 +147,11 @@ func (s *service) forwardCopilotStream(ctx context.Context, client hostClient, p
 // endings are expected during normal operation and must not be logged as
 // warnings: a downstream close, where the client goes away and the host rejects
 // the next emit, and a cancelled upstream read, where the client goes away while
-// the plugin is parked on a host read. Host read failures are deliberately NOT
-// treated as benign. The host dispatches plugin stream reads on a background
+// the forwarding task is parked on a host read. Host read failures are deliberately NOT
+// treated as benign. The runtime dispatches upstream stream reads on a background
 // context, so a client disconnect surfaces as a normal end-of-stream (the
 // upstream channel closes), a rejected emit, or a cancelled upstream chunk,
-// never as a read error. A read error therefore signals a real host/ABI failure
+// never as a read error. A read error therefore signals a real runtime failure
 // (teardown, a closed-stream race, or an undecodable response) and must warn.
 //
 // cause carries the redacted upstream category for chunk errors and is empty for
@@ -175,7 +171,7 @@ const (
 	streamReasonBufferExceeded   = "buffer_exceeded"
 	streamReasonPanic            = "panic"
 	streamReasonMissingTerminal  = "missing_terminal_event"
-	streamReasonPluginShutdown   = "plugin_shutdown"
+	streamReasonServiceShutdown  = "service_shutdown"
 )
 
 // The host classifies an unexpected EOF as a connection-lifecycle failure, so
@@ -562,7 +558,7 @@ func classifyStreamForwardError(err error) (reason, message string, benign bool)
 	return "unknown", err.Error(), false
 }
 
-func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID, outputFormat string, maxBuffer int, tracker *responsesTerminalTracker, grokNormalizer *grokResponsesResponseNormalizer) error {
+func forwardStreamPassThrough(ctx context.Context, client hostClient, downstreamStreamID, upstreamStreamID, outputFormat string, maxBuffer int, tracker *responsesTerminalTracker, grokNormalizer *grokResponsesResponseNormalizer) error {
 	framer := newSSEFramer(maxBuffer)
 	emitFrame := func(frame []byte) (bool, error) {
 		if len(frame) == 0 {
@@ -578,7 +574,7 @@ func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStre
 			if len(payload) == 0 {
 				return false, nil
 			}
-			if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
+			if errEmit := client.emit(downstreamStreamID, payload); errEmit != nil {
 				return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 			}
 			return false, nil
@@ -587,7 +583,7 @@ func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStre
 		payload := make([]byte, 0, len(frame)+2)
 		payload = append(payload, frame...)
 		payload = append(payload, '\n', '\n')
-		if errEmit := client.emit(pluginStreamID, payload); errEmit != nil {
+		if errEmit := client.emit(downstreamStreamID, payload); errEmit != nil {
 			return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 		}
 		return terminal, nil
@@ -595,7 +591,7 @@ func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStre
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
 		if ctx.Err() != nil {
-			return newStreamForwardError(streamReasonPluginShutdown, "GitHub Copilot stream forwarding stopped during plugin shutdown", true)
+			return newStreamForwardError(streamReasonServiceShutdown, "GitHub Copilot stream forwarding stopped during service shutdown", true)
 		}
 		if errRead != nil {
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)
@@ -635,7 +631,7 @@ func forwardStreamPassThrough(ctx context.Context, client hostClient, pluginStre
 	}
 }
 
-func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
+func forwardTranslatedStream(ctx context.Context, client hostClient, downstreamStreamID, upstreamStreamID string, prepared preparedInference, maxBuffer int, tracker *responsesTerminalTracker) error {
 	framer := newSSEFramer(maxBuffer)
 	var state any
 	grokNormalizer := newGrokResponsesResponseNormalizer(prepared.grokToolRefs)
@@ -684,7 +680,7 @@ func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStrea
 				continue
 			}
 			tracker.observe(output)
-			if errEmit := client.emit(pluginStreamID, output); errEmit != nil {
+			if errEmit := client.emit(downstreamStreamID, output); errEmit != nil {
 				return false, newStreamForwardError(streamReasonDownstreamClosed, "GitHub Copilot downstream stream closed", true)
 			}
 		}
@@ -702,7 +698,7 @@ func forwardTranslatedStream(ctx context.Context, client hostClient, pluginStrea
 	for {
 		chunk, errRead := client.readStream(upstreamStreamID)
 		if ctx.Err() != nil {
-			return newStreamForwardError(streamReasonPluginShutdown, "GitHub Copilot stream forwarding stopped during plugin shutdown", true)
+			return newStreamForwardError(streamReasonServiceShutdown, "GitHub Copilot stream forwarding stopped during service shutdown", true)
 		}
 		if errRead != nil {
 			return newStreamForwardError(streamReasonReadFailed, "GitHub Copilot upstream stream read failed", false)

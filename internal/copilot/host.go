@@ -1,147 +1,99 @@
 package copilot
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
-type hostBridge interface {
-	Call(method string, payload any) (json.RawMessage, error)
+type hostRuntime interface {
+	do(context.Context, string, contract.HTTPRequest) (contract.HTTPResponse, error)
+	openStream(context.Context, string, contract.HTTPRequest) (hostHTTPStreamResponse, error)
+	readStream(string) (hostHTTPStreamReadResponse, error)
+	closeStream(string)
+	emit(string, []byte) error
+	closeOutput(string, string)
+	log(string, string, string, map[string]any)
 }
 
 type hostClient struct {
-	bridge     hostBridge
+	ctx        context.Context
+	host       hostRuntime
 	callbackID string
 }
 
-type localHostHTTPRequest struct {
-	HostCallbackID string      `json:"host_callback_id,omitempty"`
-	Method         string      `json:"method,omitempty"`
-	URL            string      `json:"url,omitempty"`
-	Headers        httpHeaders `json:"headers,omitempty"`
-	Body           []byte      `json:"body,omitempty"`
+type hostHTTPStreamResponse struct {
+	StatusCode int
+	Headers    http.Header
+	StreamID   string
 }
 
-type httpHeaders map[string][]string
-
-type localHostHTTPStreamResponse struct {
-	StatusCode int         `json:"status_code"`
-	Headers    httpHeaders `json:"headers,omitempty"`
-	StreamID   string      `json:"stream_id,omitempty"`
+type hostHTTPStreamReadResponse struct {
+	Payload []byte
+	Error   string
+	Done    bool
 }
 
-type localHostHTTPStreamReadRequest struct {
-	StreamID string `json:"stream_id"`
-}
-
-type localHostHTTPStreamReadResponse struct {
-	Payload []byte `json:"payload,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Done    bool   `json:"done,omitempty"`
-}
-
-type localHostHTTPStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-}
-
-type localHostStreamEmitRequest struct {
-	StreamID string `json:"stream_id"`
-	Payload  []byte `json:"payload,omitempty"`
-}
-
-type localHostStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-	Error    string `json:"error,omitempty"`
+func (s *service) client(ctx context.Context, callbackID string) hostClient {
+	return hostClient{ctx: ctx, host: s.host, callbackID: callbackID}
 }
 
 func (c hostClient) do(req contract.HTTPRequest) (contract.HTTPResponse, error) {
-	if c.bridge == nil {
-		return contract.HTTPResponse{}, fmt.Errorf("host HTTP bridge is unavailable")
+	if c.host == nil {
+		return contract.HTTPResponse{}, fmt.Errorf("upstream transport is unavailable")
 	}
-	raw, errCall := c.bridge.Call(operation.MethodHostHTTPDo, localHostHTTPRequest{
-		HostCallbackID: c.callbackID,
-		Method:         req.Method,
-		URL:            req.URL,
-		Headers:        httpHeaders(req.Headers),
-		Body:           append([]byte(nil), req.Body...),
-	})
-	if errCall != nil {
-		return contract.HTTPResponse{}, fmt.Errorf("host HTTP request failed")
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	var resp contract.HTTPResponse
-	if errDecode := json.Unmarshal(raw, &resp); errDecode != nil {
-		return contract.HTTPResponse{}, fmt.Errorf("decode host HTTP response: %w", errDecode)
-	}
-	return resp, nil
+	return c.host.do(ctx, c.callbackID, req)
 }
 
-func (c hostClient) openStream(req contract.HTTPRequest) (localHostHTTPStreamResponse, error) {
-	if c.bridge == nil {
-		return localHostHTTPStreamResponse{}, fmt.Errorf("host HTTP bridge is unavailable")
+func (c hostClient) openStream(req contract.HTTPRequest) (hostHTTPStreamResponse, error) {
+	if c.host == nil {
+		return hostHTTPStreamResponse{}, fmt.Errorf("upstream transport is unavailable")
 	}
-	raw, errCall := c.bridge.Call(operation.MethodHostHTTPDoStream, localHostHTTPRequest{
-		HostCallbackID: c.callbackID,
-		Method:         req.Method,
-		URL:            req.URL,
-		Headers:        httpHeaders(req.Headers),
-		Body:           append([]byte(nil), req.Body...),
-	})
-	if errCall != nil {
-		return localHostHTTPStreamResponse{}, fmt.Errorf("host HTTP stream request failed")
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	var resp localHostHTTPStreamResponse
-	if errDecode := json.Unmarshal(raw, &resp); errDecode != nil {
-		return localHostHTTPStreamResponse{}, fmt.Errorf("decode host HTTP stream response: %w", errDecode)
+	resp, err := c.host.openStream(ctx, c.callbackID, req)
+	if err != nil {
+		return hostHTTPStreamResponse{}, fmt.Errorf("upstream stream request failed")
 	}
 	if strings.TrimSpace(resp.StreamID) == "" {
-		return localHostHTTPStreamResponse{}, fmt.Errorf("host HTTP stream returned no stream id")
+		return hostHTTPStreamResponse{}, fmt.Errorf("upstream stream returned no stream id")
 	}
 	return resp, nil
 }
 
-func (c hostClient) readStream(streamID string) (localHostHTTPStreamReadResponse, error) {
-	raw, errCall := c.bridge.Call(operation.MethodHostHTTPStreamRead, localHostHTTPStreamReadRequest{StreamID: streamID})
-	if errCall != nil {
-		return localHostHTTPStreamReadResponse{}, fmt.Errorf("host HTTP stream read failed")
+func (c hostClient) readStream(streamID string) (hostHTTPStreamReadResponse, error) {
+	if c.host == nil {
+		return hostHTTPStreamReadResponse{}, fmt.Errorf("upstream transport is unavailable")
 	}
-	var resp localHostHTTPStreamReadResponse
-	if errDecode := json.Unmarshal(raw, &resp); errDecode != nil {
-		return localHostHTTPStreamReadResponse{}, fmt.Errorf("decode host HTTP stream chunk: %w", errDecode)
-	}
-	return resp, nil
+	return c.host.readStream(streamID)
 }
 
 func (c hostClient) closeStream(streamID string) {
-	if c.bridge == nil || strings.TrimSpace(streamID) == "" {
+	if c.host == nil || strings.TrimSpace(streamID) == "" {
 		return
 	}
-	_, _ = c.bridge.Call(operation.MethodHostHTTPStreamClose, localHostHTTPStreamCloseRequest{StreamID: streamID})
+	c.host.closeStream(streamID)
 }
 
 func (c hostClient) emit(streamID string, payload []byte) error {
-	if c.bridge == nil {
-		return fmt.Errorf("host stream bridge is unavailable")
+	if c.host == nil {
+		return fmt.Errorf("downstream stream is unavailable")
 	}
-	_, errCall := c.bridge.Call(operation.MethodHostStreamEmit, localHostStreamEmitRequest{
-		StreamID: streamID,
-		Payload:  append([]byte(nil), payload...),
-	})
-	if errCall != nil {
-		return fmt.Errorf("host stream emit failed")
-	}
-	return nil
+	return c.host.emit(streamID, append([]byte(nil), payload...))
 }
 
-func (c hostClient) closePluginStream(streamID, message string) {
-	if c.bridge == nil || strings.TrimSpace(streamID) == "" {
+func (c hostClient) closeDownstreamStream(streamID, message string) {
+	if c.host == nil || strings.TrimSpace(streamID) == "" {
 		return
 	}
-	_, _ = c.bridge.Call(operation.MethodHostStreamClose, localHostStreamCloseRequest{
-		StreamID: streamID,
-		Error:    strings.TrimSpace(message),
-	})
+	c.host.closeOutput(streamID, strings.TrimSpace(message))
 }

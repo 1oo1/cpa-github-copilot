@@ -38,18 +38,14 @@ const (
 	anthropicWebSearchMixed
 )
 
-func (s *service) execute(raw []byte) ([]byte, error) {
-	var req localExecutorRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode executor request"}
-	}
-	prepared, failure := s.prepareInference(req.ExecutorRequest, false)
+func (s *service) executeRequest(ctx context.Context, callbackID string, req contract.ExecutorRequest) (contract.ExecutorResponse, error) {
+	prepared, failure := s.prepareInference(req, false)
 	if failure != nil {
-		s.logFailure(req.HostCallbackID, "inference.rejected", failure, inferenceRequestLogFields(req.ExecutorRequest, false, s.now().UTC()))
-		return nil, failure
+		s.logFailure(callbackID, "inference.rejected", failure, inferenceRequestLogFields(req, false, s.now().UTC()))
+		return contract.ExecutorResponse{}, failure
 	}
-	s.logEvent(req.HostCallbackID, "debug", "inference.started", preparedInferenceLogFields(prepared, false))
-	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(contract.HTTPRequest{
+	s.logEvent(callbackID, "debug", "inference.started", preparedInferenceLogFields(prepared, false))
+	resp, errHTTP := s.client(ctx, callbackID).do(contract.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     prepared.upstreamURL,
 		Headers: prepared.headers,
@@ -57,13 +53,13 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 	})
 	if errHTTP != nil {
 		failure = &serviceError{code: "upstream_network_error", message: "GitHub Copilot request failed", retryable: true, httpStatus: http.StatusBadGateway}
-		s.logFailure(req.HostCallbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
-		return nil, failure
+		s.logFailure(callbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
+		return contract.ExecutorResponse{}, failure
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		failure = upstreamFailure("upstream_http_error", "GitHub Copilot request failed", resp.StatusCode)
-		s.logFailure(req.HostCallbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
-		return nil, failure
+		s.logFailure(callbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
+		return contract.ExecutorResponse{}, failure
 	}
 	payload := append([]byte(nil), resp.Body...)
 	if normalizer := newGrokResponsesResponseNormalizer(prepared.grokToolRefs); normalizer != nil {
@@ -82,8 +78,8 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 			failure = &serviceError{code: code, message: message, httpStatus: http.StatusBadGateway}
 			fields := preparedInferenceLogFields(prepared, false)
 			fields["responses_terminal_status"] = valueOr(status, "missing")
-			s.logFailure(req.HostCallbackID, "inference.failed", failure, fields)
-			return nil, failure
+			s.logFailure(callbackID, "inference.failed", failure, fields)
+			return contract.ExecutorResponse{}, failure
 		}
 		responsesSourceStatus = status
 	}
@@ -102,8 +98,8 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 				failure = &serviceError{code: code, message: message, httpStatus: http.StatusBadGateway}
 				fields := preparedInferenceLogFields(prepared, false)
 				fields["source_terminal_status"] = valueOr(status, "missing")
-				s.logFailure(req.HostCallbackID, "inference.failed", failure, fields)
-				return nil, failure
+				s.logFailure(callbackID, "inference.failed", failure, fields)
+				return contract.ExecutorResponse{}, failure
 			}
 			sourceStatus = status
 			sourceReason = reason
@@ -112,7 +108,7 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 			sdktranslator.Format(prepared.outputFormat),
 			sdktranslator.Format(prepared.translatorFormat),
 		) {
-			return nil, &serviceError{code: "format_mismatch", message: "GitHub Copilot response format cannot be converted"}
+			return contract.ExecutorResponse{}, &serviceError{code: "format_mismatch", message: "GitHub Copilot response format cannot be converted"}
 		}
 		original := prepared.request.OriginalRequest
 		if len(original) == 0 {
@@ -125,7 +121,7 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 			translatorPayload = wrapClaudeNonStreamResponse(payload)
 		}
 		payload = sdktranslator.TranslateNonStream(
-			context.Background(),
+			ctx,
 			sdktranslator.Format(prepared.translatorFormat),
 			sdktranslator.Format(prepared.outputFormat),
 			prepared.model,
@@ -135,13 +131,13 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 			nil,
 		)
 		if len(payload) == 0 {
-			return nil, &serviceError{code: "format_mismatch", message: "GitHub Copilot response conversion produced no output"}
+			return contract.ExecutorResponse{}, &serviceError{code: "format_mismatch", message: "GitHub Copilot response conversion produced no output"}
 		}
 		if sourceStatus == "response.incomplete" {
 			var rewritten bool
 			payload, rewritten = rewriteResponsesNonStreamIncomplete(payload, sourceReason)
 			if !rewritten {
-				return nil, &serviceError{code: "format_mismatch", message: "GitHub Copilot response conversion produced an invalid terminal response"}
+				return contract.ExecutorResponse{}, &serviceError{code: "format_mismatch", message: "GitHub Copilot response conversion produced an invalid terminal response"}
 			}
 		}
 	}
@@ -152,15 +148,15 @@ func (s *service) execute(raw []byte) ([]byte, error) {
 	if responsesSourceStatus != "" {
 		completedFields["responses_terminal_status"] = responsesSourceStatus
 	}
-	s.logEvent(req.HostCallbackID, "debug", "inference.completed", completedFields)
-	return okEnvelope(contract.ExecutorResponse{
+	s.logEvent(callbackID, "debug", "inference.completed", completedFields)
+	return contract.ExecutorResponse{
 		Payload: payload,
 		Headers: headers,
 		Metadata: map[string]any{
 			"upstream_format": prepared.upstreamFormat,
 			"upstream_status": resp.StatusCode,
 		},
-	})
+	}, nil
 }
 
 func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (preparedInference, *serviceError) {
@@ -179,7 +175,7 @@ func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (p
 	cfg := s.loadedConfig()
 	githubHost, errHost := normalizeGitHubHost(storage.GitHubHost)
 	if errHost != nil || githubHost != cfg.GitHubHost {
-		return preparedInference{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match plugin configuration"}
+		return preparedInference{}, &serviceError{code: "invalid_auth", message: "GitHub Copilot credential host does not match service configuration"}
 	}
 	model := normalizeModelID(req.Model)
 	if model == "" {
@@ -1223,50 +1219,46 @@ func cloneResponseHeaders(input http.Header, contentType string) http.Header {
 	return out
 }
 
-func (s *service) executeHTTPRequest(raw []byte) ([]byte, error) {
-	var req localExecutorHTTPRequest
-	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-		return nil, &serviceError{code: "invalid_request", message: "decode executor HTTP request"}
-	}
+func (s *service) executeProviderHTTPRequest(ctx context.Context, callbackID string, req contract.ExecutorHTTPRequest) (contract.ExecutorHTTPResponse, error) {
 	storage, errStorage := decodeCopilotStorage(req.StorageJSON)
 	if errStorage != nil || strings.TrimSpace(storage.CopilotSessionToken) == "" {
 		failure := &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is invalid", httpStatus: http.StatusUnauthorized}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "credential_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "credential_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	githubHost, errHost := normalizeGitHubHost(storage.GitHubHost)
 	if errHost != nil || githubHost != s.loadedConfig().GitHubHost ||
 		(storage.ExpiresAt > 0 && !s.now().UTC().Before(timeFromUnixMilli(storage.ExpiresAt))) {
 		failure := &serviceError{code: "invalid_auth", message: "GitHub Copilot credential is not valid for this configuration", httpStatus: http.StatusUnauthorized}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, authLogFields(storage, s.now().UTC()))
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, authLogFields(storage, s.now().UTC()))
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	baseURL := apiBaseFromSessionToken(storage.CopilotSessionToken, storage.GitHubHost)
 	if baseURL == "" || !sameOrigin(req.URL, baseURL) {
 		failure := &serviceError{code: "invalid_request", message: "GitHub Copilot HTTP request must target the credential API origin", httpStatus: http.StatusBadRequest}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "origin_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "origin_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	endpointFormat, compactEndpoint, exactEndpoint := classifyInferenceEndpoint(req.URL)
 	if endpointFormat != "" && !exactEndpoint {
 		failure := &serviceError{code: "invalid_request", message: "GitHub Copilot inference HTTP request path must be canonical", httpStatus: http.StatusBadRequest}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	if compactEndpoint {
 		failure := &serviceError{code: "unsupported_feature", message: "GitHub Copilot does not support a separate Responses compaction endpoint", httpStatus: http.StatusNotImplemented}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	if endpointFormat != "" && req.URL != baseURL+endpointPath(endpointFormat) {
 		failure := &serviceError{code: "invalid_request", message: "GitHub Copilot inference HTTP request must target the exact credential endpoint", httpStatus: http.StatusBadRequest}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "endpoint_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	if endpointFormat != "" && req.Method != http.MethodPost {
 		failure := &serviceError{code: "invalid_request", message: "GitHub Copilot inference HTTP requests must use POST", httpStatus: http.StatusBadRequest}
-		s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "method_validation"})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "method_validation"})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	model := modelFromPayload(req.Body)
 	route := s.resolveModelRoute(req.AuthID, model, storage)
@@ -1280,31 +1272,31 @@ func (s *service) executeHTTPRequest(raw []byte) ([]byte, error) {
 	if endpointFormat != "" {
 		if model == "" {
 			failure := &serviceError{code: "invalid_request", message: "GitHub Copilot request is missing model", httpStatus: http.StatusBadRequest}
-			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation"})
-			return nil, failure
+			s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation"})
+			return contract.ExecutorHTTPResponse{}, failure
 		}
 		if route.Path == "" || route.Format != endpointFormat || route.Path != endpointPath(endpointFormat) {
 			failure := &serviceError{code: "model_not_supported", message: "GitHub Copilot model does not support the requested endpoint", httpStatus: http.StatusBadRequest}
-			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "route_validation", "model": model})
-			return nil, failure
+			s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "route_validation", "model": model})
+			return contract.ExecutorHTTPResponse{}, failure
 		}
 		requestedStream = streamRequested(body)
 		if requestedStream && !optionalBool(route.Streaming) {
 			failure := &serviceError{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
-			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "capability_validation", "model": model})
-			return nil, failure
+			s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "capability_validation", "model": model})
+			return contract.ExecutorHTTPResponse{}, failure
 		}
 		var errNormalize error
 		body, errNormalize = normalizeInferencePayloadForRoute(body, model, route, requestedStream, s.loadedConfig().EnableResponsesContextManagement)
 		if errNormalize != nil {
 			failure := &serviceError{code: "invalid_request", message: errNormalize.Error(), httpStatus: http.StatusBadRequest}
-			s.logFailure(req.HostCallbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation", "model": model})
-			return nil, failure
+			s.logFailure(callbackID, "http_request.rejected", failure, map[string]any{"stage": "body_validation", "model": model})
+			return contract.ExecutorHTTPResponse{}, failure
 		}
 		format = endpointFormat
 	}
 	headers := inferenceHeadersForRoute(storage.CopilotSessionToken, route, body, req.Headers, format)
-	resp, errHTTP := (hostClient{bridge: s.bridge, callbackID: req.HostCallbackID}).do(contract.HTTPRequest{
+	resp, errHTTP := s.client(ctx, callbackID).do(contract.HTTPRequest{
 		Method:  valueOr(strings.TrimSpace(req.Method), http.MethodPost),
 		URL:     req.URL,
 		Headers: headers,
@@ -1312,33 +1304,33 @@ func (s *service) executeHTTPRequest(raw []byte) ([]byte, error) {
 	})
 	if errHTTP != nil {
 		failure := &serviceError{code: "upstream_network_error", message: "GitHub Copilot HTTP request failed", retryable: true, httpStatus: http.StatusBadGateway}
-		s.logFailure(req.HostCallbackID, "http_request.failed", failure, map[string]any{"model": model})
-		return nil, failure
+		s.logFailure(callbackID, "http_request.failed", failure, map[string]any{"model": model})
+		return contract.ExecutorHTTPResponse{}, failure
 	}
 	if endpointFormat == formatOpenAIResponse && !requestedStream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		status, terminal := responsesNonStreamTerminalStatus(resp.Body)
 		if !terminal {
 			failure := &serviceError{code: "upstream_protocol_error", message: "GitHub Copilot Responses request ended without a terminal response", httpStatus: http.StatusBadGateway}
-			s.logFailure(req.HostCallbackID, "http_request.failed", failure, map[string]any{
+			s.logFailure(callbackID, "http_request.failed", failure, map[string]any{
 				"model":                     model,
 				"upstream_format":           format,
 				"upstream_status":           resp.StatusCode,
 				"responses_terminal_status": valueOr(status, "missing"),
 			})
-			return nil, failure
+			return contract.ExecutorHTTPResponse{}, failure
 		}
 	}
-	s.logEvent(req.HostCallbackID, "debug", "http_request.completed", map[string]any{
+	s.logEvent(callbackID, "debug", "http_request.completed", map[string]any{
 		"model":           model,
 		"upstream_format": format,
 		"upstream_status": resp.StatusCode,
 		"output_bytes":    len(resp.Body),
 	})
-	return okEnvelope(contract.ExecutorHTTPResponse{
+	return contract.ExecutorHTTPResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    cloneResponseHeaders(resp.Headers, "application/json"),
 		Body:       append([]byte(nil), resp.Body...),
-	})
+	}, nil
 }
 
 func streamRequested(raw []byte) bool {

@@ -1,24 +1,14 @@
 package copilot
 
 import (
-	"encoding/json"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
-type localHostLogRequest struct {
-	HostCallbackID string         `json:"host_callback_id,omitempty"`
-	Level          string         `json:"level,omitempty"`
-	Message        string         `json:"message,omitempty"`
-	Fields         map[string]any `json:"fields,omitempty"`
-}
-
 func (s *service) logEvent(callbackID, level, event string, fields map[string]any) {
-	if s == nil || s.bridge == nil {
+	if s == nil || s.host == nil {
 		return
 	}
 	defer func() {
@@ -40,12 +30,7 @@ func (s *service) logEvent(callbackID, level, event string, fields map[string]an
 			safeFields[key] = safeValue
 		}
 	}
-	_, _ = s.bridge.Call(operation.MethodHostLog, localHostLogRequest{
-		HostCallbackID: strings.TrimSpace(callbackID),
-		Level:          normalizeLogLevel(level),
-		Message:        "github-copilot: " + event,
-		Fields:         safeFields,
-	})
+	s.host.log(strings.TrimSpace(callbackID), normalizeLogLevel(level), event, safeFields)
 }
 
 func (s *service) logFailure(callbackID, event string, failure *serviceError, fields map[string]any) {
@@ -169,16 +154,6 @@ func safeLogString(value string) (any, bool) {
 		value = value[:256]
 	}
 	return value, true
-}
-
-func callbackIDFromRequest(raw []byte) string {
-	var request struct {
-		HostCallbackID string `json:"host_callback_id,omitempty"`
-	}
-	if len(raw) == 0 || json.Unmarshal(raw, &request) != nil {
-		return ""
-	}
-	return strings.TrimSpace(request.HostCallbackID)
 }
 
 func authLogFields(storage copilotStorage, now time.Time) map[string]any {

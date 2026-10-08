@@ -11,7 +11,6 @@ import (
 	"time"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
 func TestParseAuthHandledContract(t *testing.T) {
@@ -32,7 +31,7 @@ func TestParseAuthHandledContract(t *testing.T) {
 			if errParse != nil {
 				t.Fatalf("parseAuth error: %v", errParse)
 			}
-			result := decodePluginResult[contract.AuthParseResponse](t, raw)
+			result := decodeEnvelopeResult[contract.AuthParseResponse](t, raw)
 			if result.Handled != test.wantHandled {
 				t.Fatalf("Handled = %v, want %v", result.Handled, test.wantHandled)
 			}
@@ -53,7 +52,7 @@ func TestStartLoginRejectsUntrustedVerificationURL(t *testing.T) {
 			"expires_in":900
 		}`)}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	_, failure := service.startLogin(mustJSON(t, localAuthLoginStartRequest{HostCallbackID: "callback"}))
 	if failure == nil || !strings.Contains(failure.Error(), "untrusted") {
 		t.Fatalf("failure = %v", failure)
@@ -77,7 +76,7 @@ func TestParseAuthKeepsSecretsOnlyInStorageJSON(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	result := decodePluginResult[contract.AuthParseResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthParseResponse](t, raw)
 	metadata := string(mustJSON(t, result.Auth.Metadata))
 	attributes := string(mustJSON(t, result.Auth.Attributes))
 	if strings.Contains(metadata, "SENTINEL") || strings.Contains(attributes, "SENTINEL") || strings.Contains(result.Auth.Label, "SENTINEL") {
@@ -102,7 +101,7 @@ func TestParseAuthExposesPersistedPriorityToScheduler(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	result := decodePluginResult[contract.AuthParseResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthParseResponse](t, raw)
 	if result.Auth.Attributes["priority"] != "7" {
 		t.Fatalf("priority attribute = %q, want 7", result.Auth.Attributes["priority"])
 	}
@@ -139,7 +138,7 @@ func TestDecodeLegacyPiCredential(t *testing.T) {
 func TestStartLoginUsesHostBridgeAndValidatesResponse(t *testing.T) {
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -158,14 +157,14 @@ func TestStartLoginUsesHostBridgeAndValidatesResponse(t *testing.T) {
 			"expires_in":900
 		}`)}, nil
 	}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return time.Unix(1000, 0).UTC() }
 	service.random = bytes.NewReader(bytes.Repeat([]byte{7}, 32))
 	raw, errStart := service.startLogin(mustJSON(t, localAuthLoginStartRequest{HostCallbackID: "callback-1"}))
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
-	result := decodePluginResult[contract.AuthLoginStartResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthLoginStartResponse](t, raw)
 	if result.State == "" || !strings.Contains(result.URL, "user_code=ABCD-EFGH") {
 		t.Fatalf("login response = %#v", result)
 	}
@@ -184,7 +183,7 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 	accessCalls := 0
 	bridge := &fakeBridge{}
 	bridge.handler = func(method string, payload any) (any, error) {
-		if method != operation.MethodHostHTTPDo {
+		if method != legacyMethodHostHTTPDo {
 			t.Fatalf("method = %s", method)
 		}
 		req := payload.(localHostHTTPRequest)
@@ -206,7 +205,7 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 			return nil, nil
 		}
 	}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	service.random = bytes.NewReader(bytes.Repeat([]byte{9}, 32))
 	service.mu.Lock()
@@ -216,7 +215,7 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 	if errStart != nil {
 		t.Fatal(errStart)
 	}
-	state := decodePluginResult[contract.AuthLoginStartResponse](t, startRaw).State
+	state := decodeEnvelopeResult[contract.AuthLoginStartResponse](t, startRaw).State
 	poll := func() contract.AuthLoginPollResponse {
 		raw, errPoll := service.pollLogin(mustJSON(t, localAuthLoginPollRequest{
 			AuthLoginPollRequest: contract.AuthLoginPollRequest{State: state},
@@ -225,7 +224,7 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 		if errPoll != nil {
 			t.Fatal(errPoll)
 		}
-		return decodePluginResult[contract.AuthLoginPollResponse](t, raw)
+		return decodeEnvelopeResult[contract.AuthLoginPollResponse](t, raw)
 	}
 	if got := poll(); got.Status != contract.AuthLoginStatusPending || accessCalls != 0 {
 		t.Fatalf("immediate poll = %#v, access calls=%d", got, accessCalls)
@@ -261,10 +260,10 @@ func TestSlowDownWithoutIntervalAddsFiveSeconds(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"error":"slow_down"}`)}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	session := &loginSession{clientID: defaultClientID, githubHost: "github.com", deviceCode: "device", interval: 5 * time.Second}
-	complete, failure := service.pollGitHubToken(hostClient{bridge: bridge}, session)
+	complete, failure := service.pollGitHubToken(testHostClient(bridge), session)
 	if complete || failure != nil {
 		t.Fatalf("complete=%v failure=%v", complete, failure)
 	}
@@ -285,7 +284,7 @@ func TestConcurrentLoginPollIsDeduplicated(t *testing.T) {
 		<-release
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"error":"authorization_pending"}`)}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	state := "deduplicated-state"
 	service.sessions[state] = &loginSession{
@@ -303,7 +302,7 @@ func TestConcurrentLoginPollIsDeduplicated(t *testing.T) {
 		t.Fatal("first poll did not enter host bridge")
 	}
 	raw, errSecond := service.pollLogin(mustJSON(t, localAuthLoginPollRequest{AuthLoginPollRequest: contract.AuthLoginPollRequest{State: state}}))
-	if errSecond != nil || decodePluginResult[contract.AuthLoginPollResponse](t, raw).Status != contract.AuthLoginStatusPending {
+	if errSecond != nil || decodeEnvelopeResult[contract.AuthLoginPollResponse](t, raw).Status != contract.AuthLoginStatusPending {
 		t.Fatalf("second poll error=%v raw=%s", errSecond, raw)
 	}
 	if len(bridge.snapshot()) != 1 {
@@ -327,7 +326,7 @@ func TestLoginPollExpiryClearsTemporarySecrets(t *testing.T) {
 	if errPoll != nil {
 		t.Fatal(errPoll)
 	}
-	result := decodePluginResult[contract.AuthLoginPollResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthLoginPollResponse](t, raw)
 	if result.Status != contract.AuthLoginStatusError || !strings.Contains(strings.ToLower(result.Message), "expired") {
 		t.Fatalf("poll result = %#v", result)
 	}
@@ -344,7 +343,7 @@ func TestLoginPollDenialIsTerminal(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"error":"access_denied","error_description":"private detail"}`)}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	service.sessions["denied"] = &loginSession{
 		clientID: defaultClientID, githubHost: "github.com", deviceCode: "device",
@@ -354,7 +353,7 @@ func TestLoginPollDenialIsTerminal(t *testing.T) {
 	if errPoll != nil {
 		t.Fatal(errPoll)
 	}
-	result := decodePluginResult[contract.AuthLoginPollResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthLoginPollResponse](t, raw)
 	if result.Status != contract.AuthLoginStatusError || !strings.Contains(strings.ToLower(result.Message), "denied") || strings.Contains(result.Message, "private detail") {
 		t.Fatalf("poll result = %#v", result)
 	}
@@ -371,7 +370,7 @@ func TestLoginPollRetriesHostBridgeFailure(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return nil, fmt.Errorf("temporary transport failure")
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	service.sessions["retry"] = &loginSession{
 		clientID: defaultClientID, githubHost: "github.com", deviceCode: "device",
@@ -381,7 +380,7 @@ func TestLoginPollRetriesHostBridgeFailure(t *testing.T) {
 	if errPoll != nil {
 		t.Fatal(errPoll)
 	}
-	result := decodePluginResult[contract.AuthLoginPollResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthLoginPollResponse](t, raw)
 	if result.Status != contract.AuthLoginStatusPending || strings.Contains(result.Message, "transport") {
 		t.Fatalf("poll result = %#v", result)
 	}
@@ -402,7 +401,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 			return nil, nil
 		}
 	}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	previous := copilotStorage{
 		Type: providerIdentifier, Priority: 7, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "old", GitHubHost: "github.com", Account: "octocat",
@@ -418,7 +417,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	if errRefresh != nil {
 		t.Fatal(errRefresh)
 	}
-	result := decodePluginResult[contract.AuthRefreshResponse](t, raw)
+	result := decodeEnvelopeResult[contract.AuthRefreshResponse](t, raw)
 	next, errStorage := decodeCopilotStorage(result.Auth.StorageJSON)
 	if errStorage != nil || !strings.Contains(next.CopilotSessionToken, "NEW_SESSION") || next.Account != "octocat" || len(next.Models) != 1 {
 		t.Fatalf("refreshed storage = %#v, %v", next, errStorage)
@@ -448,7 +447,7 @@ func TestRefreshAuthKeepsNewSessionAndCachedModelsWhenDiscoveryFails(t *testing.
 			return nil, fmt.Errorf("unexpected URL")
 		}
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	previous := copilotStorage{
 		Type: providerIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "tid=OLD",
@@ -462,7 +461,7 @@ func TestRefreshAuthKeepsNewSessionAndCachedModelsWhenDiscoveryFails(t *testing.
 	if failure != nil {
 		t.Fatalf("response=%s failure=%v", response, failure)
 	}
-	result := decodePluginResult[contract.AuthRefreshResponse](t, response)
+	result := decodeEnvelopeResult[contract.AuthRefreshResponse](t, response)
 	next, errStorage := decodeCopilotStorage(result.Auth.StorageJSON)
 	if errStorage != nil || !strings.HasPrefix(next.CopilotSessionToken, "tid=NEW;") || next.ExpiresAt != time.Unix(25000, 0).UnixMilli() {
 		t.Fatalf("refreshed session = %#v, %v", next, errStorage)
@@ -483,12 +482,12 @@ func TestExchangeSessionExpiryMarginAndMissingFields(t *testing.T) {
 		responses = responses[1:]
 		return contract.HTTPResponse{StatusCode: 200, Body: body}, nil
 	}}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
-	if _, failure := service.exchangeSession(hostClient{bridge: bridge}, "ghu", "github.com"); failure == nil || strings.Contains(failure.Error(), "ghu") {
+	if _, failure := service.exchangeSession(testHostClient(bridge), "ghu", "github.com"); failure == nil || strings.Contains(failure.Error(), "ghu") {
 		t.Fatalf("missing-token failure = %v", failure)
 	}
-	storage, failure := service.exchangeSession(hostClient{bridge: bridge}, "ghu", "github.com")
+	storage, failure := service.exchangeSession(testHostClient(bridge), "ghu", "github.com")
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -503,8 +502,8 @@ func TestTokenErrorsDoNotContainResponseBodyOrCredentials(t *testing.T) {
 	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusUnauthorized, Body: []byte(`{"token":"` + sentinel + `"}`)}, nil
 	}}
-	service := newService(bridge)
-	_, failure := service.exchangeSession(hostClient{bridge: bridge}, "ghu_"+sentinel, "github.com")
+	service := newService(newLegacyRuntime(bridge))
+	_, failure := service.exchangeSession(testHostClient(bridge), "ghu_"+sentinel, "github.com")
 	if failure == nil || strings.Contains(failure.Error(), sentinel) {
 		t.Fatalf("failure = %v", failure)
 	}

@@ -1,13 +1,10 @@
 package copilot
 
 import (
-	"encoding/json"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
-func defaultPluginConfig() settings {
+func defaultSettings() settings {
 	return settings{
 		ClientID:                         defaultClientID,
 		GitHubHost:                       defaultGitHubHost,
@@ -19,19 +16,7 @@ func defaultPluginConfig() settings {
 	}
 }
 
-func (s *service) configure(raw []byte) error {
-	var req lifecycleRequest
-	if len(raw) > 0 {
-		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
-			return &serviceError{code: "invalid_config", message: "decode plugin configuration envelope"}
-		}
-	}
-	cfg := defaultPluginConfig()
-	if len(req.ConfigYAML) > 0 {
-		if errUnmarshal := yaml.Unmarshal(req.ConfigYAML, &cfg); errUnmarshal != nil {
-			return &serviceError{code: "invalid_config", message: "decode plugin configuration"}
-		}
-	}
+func (s *service) configureSettings(cfg settings) error {
 	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
 	cfg.WebSearchModel = normalizeModelID(cfg.WebSearchModel)
 	if cfg.ClientID == "" {

@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-
-	operation "github.com/1oo1/cpa-github-copilot/internal/operation"
 )
 
 type recordedHostCall struct {
@@ -23,7 +21,7 @@ type fakeBridge struct {
 
 func (f *fakeBridge) Call(method string, payload any) (json.RawMessage, error) {
 	f.mu.Lock()
-	if method == operation.MethodHostLog {
+	if method == legacyMethodHostLog {
 		request, ok := payload.(localHostLogRequest)
 		if ok {
 			f.logs = append(f.logs, request)
@@ -57,14 +55,14 @@ func (f *fakeBridge) snapshotLogs() []localHostLogRequest {
 	return append([]localHostLogRequest(nil), f.logs...)
 }
 
-func decodePluginResult[T any](t *testing.T, raw []byte) T {
+func decodeEnvelopeResult[T any](t *testing.T, raw []byte) T {
 	t.Helper()
 	var env envelope
 	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
 		t.Fatalf("decode envelope: %v", errUnmarshal)
 	}
 	if !env.OK {
-		t.Fatalf("unexpected plugin error: %#v", env.Error)
+		t.Fatalf("unexpected legacy envelope error: %#v", env.Error)
 	}
 	var result T
 	if errUnmarshal := json.Unmarshal(env.Result, &result); errUnmarshal != nil {

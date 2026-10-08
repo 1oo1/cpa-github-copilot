@@ -14,7 +14,7 @@ import (
 func TestAuthParseLogsExpiredCredentialStateWithoutSecrets(t *testing.T) {
 	now := time.Unix(210_000, 0).UTC()
 	bridge := &fakeBridge{}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	storage := copilotStorage{
 		Type:                providerIdentifier,
@@ -41,7 +41,7 @@ func TestAuthParseLogsExpiredCredentialStateWithoutSecrets(t *testing.T) {
 func TestExpiredInferenceLogsStableFailureWithoutSecrets(t *testing.T) {
 	now := time.Unix(220_000, 0).UTC()
 	bridge := &fakeBridge{}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.now = func() time.Time { return now }
 	storage := copilotStorage{
 		Type:                providerIdentifier,
@@ -72,7 +72,7 @@ func TestExpiredInferenceLogsStableFailureWithoutSecrets(t *testing.T) {
 
 func TestLogEventFiltersSensitiveKeysAndValues(t *testing.T) {
 	bridge := &fakeBridge{}
-	service := newService(bridge)
+	service := newService(newLegacyRuntime(bridge))
 	service.logEvent("callback", "info", "test.security", map[string]any{
 		"model":         "gpt-5.6-sol",
 		"authorization": "Bearer AUTH_LOG_SENTINEL",

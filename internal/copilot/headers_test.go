@@ -84,7 +84,7 @@ func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
 		"Authorization": []string{"Bearer attacker"},
 	}, formatOpenAI)
 	if headers.Get("User-Agent") != copilotUserAgent || headers.Get("Editor-Version") != copilotEditorVersion ||
-		headers.Get("Editor-Plugin-Version") != copilotPluginVersion || headers.Get("Copilot-Integration-Id") != copilotIntegrationID {
+		headers.Get("Editor-Plugin-Version") != copilotChatVersion || headers.Get("Copilot-Integration-Id") != copilotIntegrationID {
 		t.Fatalf("identity headers = %#v, want canonical versioned identity", headers)
 	}
 	if headers.Get("Authorization") != "Bearer real-session" || headers.Get("Openai-Intent") != "conversation-other" {
