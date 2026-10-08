@@ -78,6 +78,12 @@ func New(cfg Config, path string, network copilot.Transport, ui []byte) (*Server
 			return nil, fmt.Errorf("API keys must have at least 16 characters")
 		}
 	}
+	if cfg.SessionAffinityTTL < 0 {
+		return nil, fmt.Errorf("session-affinity-ttl must not be negative")
+	}
+	if cfg.SessionAffinityTTL == 0 {
+		cfg.SessionAffinityTTL = sessionAffinityTTL
+	}
 	trusted, err := parseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
 		return nil, err

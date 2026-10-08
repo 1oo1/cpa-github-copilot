@@ -28,7 +28,17 @@ func DeriveClaudeUserID(rawJSON []byte) string {
 			return raw
 		}
 	}
+	return DeriveClaudeUserIDHash(rawJSON)
+}
 
+// DeriveClaudeUserIDHash returns only the stable derived hash. Unlike
+// DeriveClaudeUserID, it never returns caller-supplied identity strings, which
+// makes it suitable for local scheduling keys.
+func DeriveClaudeUserIDHash(rawJSON []byte) string {
+	return deriveClaudeUserIDHash(gjson.ParseBytes(rawJSON))
+}
+
+func deriveClaudeUserIDHash(root gjson.Result) string {
 	var seed strings.Builder
 
 	if v := root.Get("prompt_cache_key"); v.Exists() {

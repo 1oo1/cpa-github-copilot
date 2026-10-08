@@ -55,13 +55,19 @@ proxy-url: ""
 routing-strategy: "round-robin"
 
 # 会话亲和，默认 false；Claude Code + 多账号轮询建议开启。
-# 按 API Key + 会话标识绑定账号，优先 X-Session-Id；/v1/messages 也识别
-# Claude Code metadata.user_id 内的 session_id（兼容旧式 user_…_session_<UUID>）。
-# 成功请求续期 30 分钟；没有有效会话标识则普通调度。已绑定账号仍必须通过
-# 预算/禁用/冷却检查。高优先级账号不会强行抢走仍可用的已绑定会话。
+# 按 API Key + 请求会话信号绑定账号；/v1/messages 识别 Claude Code
+# metadata.user_id 内的 session_id（兼容旧式 user_…_session_<UUID>），
+# /v1/responses 识别 prompt_cache_key。
+# 没有可识别的会话标识时，使用跨轮次稳定的请求 hash 作为 fallback；该值只用于本地
+# 调度，不会持久化请求体。已绑定账号仍必须通过预算/禁用/冷却检查。
+# 高优先级账号不会强行抢走仍可用的已绑定会话。
 # 绑定仅驻留内存，重启不保留；最多 4096 项，淘汰过期/最早到期项。
 # 此项可在面板修改。
 session-affinity: false
+
+# 会话亲和绑定有效期，使用 Go duration 格式；省略或为 0 时默认 2h。
+# 每次成功请求都会将当前绑定续期该时长；修改后用于后续绑定和续期。
+session-affinity-ttl: 2h
 
 # 公开模型别名，格式为「客户端模型名: 当前账户的 Copilot 原始模型 ID」。
 # 默认空映射。别名目标必须真实存在于该账号模型目录中，不会虚构模型能力。

@@ -9,24 +9,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/1oo1/cpa-github-copilot/internal/copilot"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	ProxyRedacted   bool              `yaml:"-" json:"proxy_redacted,omitempty"`
-	Listen          string            `yaml:"listen" json:"listen"`
-	AuthDir         string            `yaml:"auth-dir,omitempty" json:"-"`
-	APIKeys         []string          `yaml:"api-keys" json:"-"`
-	ManagementKey   string            `yaml:"management-key" json:"-"`
-	ProxyURL        string            `yaml:"proxy-url,omitempty" json:"proxy_url"`
-	Routing         string            `yaml:"routing-strategy" json:"routing"`
-	SessionAffinity bool              `yaml:"session-affinity" json:"session_affinity"`
-	ModelAliases    map[string]string `yaml:"model-aliases,omitempty" json:"model_aliases"`
-	ExcludedModels  []string          `yaml:"excluded-models,omitempty" json:"excluded_models"`
-	TrustedProxies  []string          `yaml:"trusted-proxies,omitempty" json:"-"`
-	Copilot         copilot.Settings  `yaml:"copilot" json:"-"`
+	ProxyRedacted      bool              `yaml:"-" json:"proxy_redacted,omitempty"`
+	Listen             string            `yaml:"listen" json:"listen"`
+	AuthDir            string            `yaml:"auth-dir,omitempty" json:"-"`
+	APIKeys            []string          `yaml:"api-keys" json:"-"`
+	ManagementKey      string            `yaml:"management-key" json:"-"`
+	ProxyURL           string            `yaml:"proxy-url,omitempty" json:"proxy_url"`
+	Routing            string            `yaml:"routing-strategy" json:"routing"`
+	SessionAffinity    bool              `yaml:"session-affinity" json:"session_affinity"`
+	SessionAffinityTTL time.Duration     `yaml:"session-affinity-ttl" json:"session_affinity_ttl"`
+	ModelAliases       map[string]string `yaml:"model-aliases,omitempty" json:"model_aliases"`
+	ExcludedModels     []string          `yaml:"excluded-models,omitempty" json:"excluded_models"`
+	TrustedProxies     []string          `yaml:"trusted-proxies,omitempty" json:"-"`
+	Copilot            copilot.Settings  `yaml:"copilot" json:"-"`
 }
 
 func secret() string {
@@ -37,7 +39,7 @@ func secret() string {
 	return hex.EncodeToString(b)
 }
 func LoadConfig(path string) (Config, error) {
-	cfg := Config{Listen: "127.0.0.1:8317", Routing: "round-robin", Copilot: copilot.DefaultSettings()}
+	cfg := Config{Listen: "127.0.0.1:8317", Routing: "round-robin", SessionAffinityTTL: sessionAffinityTTL, Copilot: copilot.DefaultSettings()}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		cfg.ManagementKey = secret()
@@ -73,6 +75,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Routing != "round-robin" && cfg.Routing != "fill-first" {
 		return cfg, fmt.Errorf("routing-strategy must be round-robin or fill-first")
+	}
+	if cfg.SessionAffinityTTL < 0 {
+		return cfg, fmt.Errorf("session-affinity-ttl must not be negative")
+	}
+	if cfg.SessionAffinityTTL == 0 {
+		cfg.SessionAffinityTTL = sessionAffinityTTL
 	}
 	if _, err = parseTrustedProxies(cfg.TrustedProxies); err != nil {
 		return cfg, err

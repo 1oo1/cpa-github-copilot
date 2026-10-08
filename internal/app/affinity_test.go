@@ -105,21 +105,22 @@ func TestRequestSessionKeyIsolationAndPrecedence(t *testing.T) {
 	if requestSessionKey(req, []byte(claudeSessionBody(t, "66666666-7777-4888-8999-000000000000", false)), "claude") == first {
 		t.Fatal("distinct sessions share a binding")
 	}
-	if requestSessionKey(req, body, "openai") != "" || requestSessionKey(req, body, "openai-response") != "" {
-		t.Fatal("Claude fallback applied to unrelated protocols")
+	for _, format := range []string{"openai", "openai-response"} {
+		fallback := requestSessionKey(req, body, format)
+		if fallback == "" || fallback == first {
+			t.Fatal("missing isolated request-hash fallback")
+		}
+		if fallback != requestSessionKey(req, body, format) {
+			t.Fatal("request-hash fallback is not deterministic")
+		}
 	}
-	req.Header.Set("X-Session-Id", claudeSession)
-	if requestSessionKey(req, []byte(`{}`), "claude") != first {
-		t.Fatal("explicit session and Claude metadata disagree")
-	}
-	req.Header.Set("X-Session-Id", "explicit-session")
-	explicit := requestSessionKey(req, body, "claude")
-	if explicit == first || explicit != requestSessionKey(req, []byte(`{}`), "openai") {
-		t.Fatal("explicit session did not take precedence")
+	req.Header.Set("X-Session-Id", "ignored-session")
+	if requestSessionKey(req, body, "claude") != first {
+		t.Fatal("X-Session-Id changed the affinity key")
 	}
 	req.Header.Set("X-Session-Id", strings.Repeat("x", 129))
-	if requestSessionKey(req, body, "claude") != "" {
-		t.Fatal("invalid explicit header fell back to metadata")
+	if requestSessionKey(req, body, "claude") != first {
+		t.Fatal("oversized X-Session-Id changed the affinity key")
 	}
 	req.Header.Del("X-Session-Id")
 	req.Header.Del("Authorization")
@@ -286,5 +287,79 @@ func TestStandaloneClaudeSessionRebindsAfterUpstreamFailure(t *testing.T) {
 	}
 	if got := s.candidates(key); len(got) != 1 || got[0].id != "b.json" {
 		t.Fatal("failed account cooldown bypassed")
+	}
+}
+
+func TestRequestSessionKeyHashFallback(t *testing.T) {
+	body := []byte(`{"model":"test-model","messages":[{"role":"user","content":"synthetic"}]}`)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Api-Key", "synthetic-key-a")
+	key := requestSessionKey(req, body, "openai")
+	if len(key) != 64 || key == requestSessionKey(req, []byte(`{"model":"test-model"}`), "openai") {
+		t.Fatal("stable request signals were not hashed into the fallback key")
+	}
+	req.Header.Set("X-Api-Key", "synthetic-key-b")
+	if requestSessionKey(req, body, "openai") == key {
+		t.Fatal("fallback affinity leaked across API keys")
+	}
+	req.Header.Set("X-Api-Key", "synthetic-key-a")
+	firstTurn := []byte(`{"model":"test-model","messages":[{"role":"user","content":"first prompt"}]}`)
+	laterTurn := []byte(`{"model":"test-model","messages":[{"role":"user","content":"first prompt"},{"role":"assistant","content":"hi"},{"role":"user","content":"follow up"}]}`)
+	if requestSessionKey(req, firstTurn, "openai") != requestSessionKey(req, laterTurn, "openai") {
+		t.Fatal("stable request hash changed across conversation turns")
+	}
+	req.Header.Del("X-Api-Key")
+	if requestSessionKey(req, body, "openai") != "" {
+		t.Fatal("unauthenticated request received fallback affinity")
+	}
+}
+
+func TestSessionBindingUsesConfiguredTTL(t *testing.T) {
+	s, _, _, _ := testServer(t)
+	s.cfg.SessionAffinity = true
+	s.cfg.SessionAffinityTTL = 30 * time.Minute
+	now := time.Now()
+	s.mu.Lock()
+	s.bindSessionLocked("configured-ttl", "account", now)
+	bound := s.affinity["configured-ttl"]
+	s.mu.Unlock()
+	if !bound.expires.Equal(now.Add(30 * time.Minute)) {
+		t.Fatalf("configured TTL not used: expires=%s", bound.expires)
+	}
+	s.cfg.SessionAffinityTTL = 0
+	s.mu.Lock()
+	s.bindSessionLocked("default-ttl", "account", now)
+	bound = s.affinity["default-ttl"]
+	s.mu.Unlock()
+	if !bound.expires.Equal(now.Add(2 * time.Hour)) {
+		t.Fatalf("default TTL mismatch: expires=%s", bound.expires)
+	}
+}
+
+func TestSessionAffinityTTLConfiguration(t *testing.T) {
+	s, _, cfg, path := testServer(t)
+	if s.cfg.SessionAffinityTTL != 2*time.Hour {
+		t.Fatalf("default TTL=%s", s.cfg.SessionAffinityTTL)
+	}
+	out := request(s, "PATCH", "/v0/management/config", cfg.ManagementKey, `{"session_affinity_ttl":"30m"}`)
+	if out.Code != 200 || s.cfg.SessionAffinityTTL != 30*time.Minute {
+		t.Fatalf("PATCH status=%d ttl=%s", out.Code, s.cfg.SessionAffinityTTL)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SessionAffinityTTL != 30*time.Minute {
+		t.Fatalf("persisted TTL=%s", loaded.SessionAffinityTTL)
+	}
+	for _, body := range []string{
+		`{"session_affinity_ttl":"0s"}`,
+		`{"session_affinity_ttl_seconds":0}`,
+		`{"session_affinity_ttl_seconds":-1}`,
+		`{"session_affinity_ttl":"30m","session_affinity_ttl_seconds":1800}`,
+	} {
+		if out := request(s, "PATCH", "/v0/management/config", cfg.ManagementKey, body); out.Code != 400 {
+			t.Fatalf("%s status=%d", body, out.Code)
+		}
 	}
 }

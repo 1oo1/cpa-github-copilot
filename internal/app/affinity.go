@@ -9,11 +9,12 @@ import (
 	"strings"
 	"time"
 
+	conversioncommon "github.com/1oo1/cpa-github-copilot/internal/conversion/common"
 	"github.com/tidwall/gjson"
 )
 
 const (
-	sessionAffinityTTL   = 30 * time.Minute
+	sessionAffinityTTL   = 2 * time.Hour
 	maxSessionBindings   = 4096
 	maxClaudeUserIDBytes = 4096
 )
@@ -33,24 +34,37 @@ func apiRequestKey(r *http.Request) string {
 }
 
 // requestSessionKey is local scheduling state, never an upstream identity. It
-// hashes the authenticated key and session as separate fields; no raw API key,
-// user/device/account metadata or session ID is retained in the affinity map.
+// hashes the authenticated key and session as separate fields. When no
+// protocol-level conversation identifier is present it hashes stable request
+// signals, so no raw API key, request body or user/device/account metadata is
+// retained.
 func requestSessionKey(r *http.Request, body []byte, format string) string {
-	session := r.Header.Get("X-Session-Id")
-	if session != "" {
-		if len(session) > 128 {
-			return ""
+	session := ""
+	if format == "openai-response" {
+		promptCacheKey := gjson.GetBytes(body, "prompt_cache_key")
+		if promptCacheKey.Type == gjson.String {
+			session = promptCacheKey.String()
 		}
 	} else if format == "claude" {
 		userID := gjson.GetBytes(body, "metadata.user_id")
-		if userID.Type != gjson.String {
-			return ""
+		if userID.Type == gjson.String {
+			session = claudeCodeSessionID(userID.String())
 		}
-		session = claudeCodeSessionID(userID.String())
 	}
 	key := apiRequestKey(r)
-	if session == "" || key == "" {
+	if key == "" {
 		return ""
+	}
+	if session == "" {
+		// Harnesses that do not expose a conversation ID still get stable
+		// scheduling through the derived request hash. This follows stable
+		// conversation signals and first-user-content across turns; the raw body
+		// and caller identity strings are never retained in the affinity map.
+		session = conversioncommon.DeriveClaudeUserIDHash(body)
+		if session == "" || session == "unknown" {
+			sum := sha256.Sum256(body)
+			session = hex.EncodeToString(sum[:])
+		}
 	}
 	raw, _ := json.Marshal([2]string{key, session})
 	sum := sha256.Sum256(raw)
@@ -71,7 +85,8 @@ func claudeCodeSessionID(userID string) string {
 		session = matches[1]
 	}
 	// Do not bind all requests by user_id/device/account or guess from arbitrary
-	// strings. Only the explicit Claude Code conversation UUID is a fallback.
+	// strings. This helper only accepts the explicit Claude Code conversation
+	// UUID; the caller handles the stable request-hash fallback.
 	if !sessionUUID.MatchString(session) {
 		return ""
 	}
@@ -107,5 +122,9 @@ func (s *Server) bindSessionLocked(session, id string, now time.Time) {
 			delete(s.affinity, oldest)
 		}
 	}
-	s.affinity[session] = binding{id, now.Add(sessionAffinityTTL)}
+	ttl := s.cfg.SessionAffinityTTL
+	if ttl <= 0 {
+		ttl = sessionAffinityTTL
+	}
+	s.affinity[session] = binding{id, now.Add(ttl)}
 }

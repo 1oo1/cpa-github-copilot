@@ -166,7 +166,8 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 | `auth-dir` | 可选，默认配置文件旁的 `auths/`；相对路径以配置文件目录为基准 |
 | `proxy-url` | 全局 HTTP/HTTPS/SOCKS5 代理；账号的 `proxy_url` 优先 |
 | `routing-strategy` | `round-robin` 或 `fill-first`；先按账号 `priority` 排序 |
-| `session-affinity` | 开启后按 API Key + 会话标识绑定账号；优先 `X-Session-Id`，Messages 也识别 Claude Code 的 `metadata.user_id` 中的会话 ID。成功请求续期 30 分钟 |
+| `session-affinity` | 开启后按 API Key + 请求会话信号绑定账号；Messages 识别 Claude Code 的 `metadata.user_id` 中的会话 ID，Responses 识别 `prompt_cache_key`，缺少会话标识时使用跨轮次稳定的请求 hash fallback |
+| `session-affinity-ttl` | 会话绑定有效期，Go duration 格式；省略或为 0 时默认 `2h`，成功请求会续期 |
 | `model-aliases` | `{公开别名: Copilot 模型 ID}` |
 | `excluded-models` | 排除模型的 glob 列表 |
 | `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流。部署场景的详细填法见 [TRUSTED_PROXIES.md](TRUSTED_PROXIES.md) |
@@ -181,14 +182,14 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 ```yaml
 routing-strategy: round-robin
 session-affinity: true
+session-affinity-ttl: 2h
 ```
 
-Claude Code 通常不发送 `X-Session-Id`，而是在 `metadata.user_id` 的 JSON 字符串中携带
-`session_id`；服务会读取该会话 UUID，也兼容旧式 `user_…_account_…_session_<UUID>`。
-显式 `X-Session-Id` 优先。缺少或无效的会话标识仍正常轮询，不会按设备或用户 ID 把不同
-会话合并。不同 API Key 的绑定相互隔离，仅存内存中的哈希，不记录原始会话 metadata。
+Claude Code 在 `metadata.user_id` 的 JSON 字符串中携带 `session_id`；服务会读取该会话
+UUID，也兼容旧式 `user_…_account_…_session_<UUID>`。Responses 请求优先识别 `prompt_cache_key`。
+其他 harness 未提供会话标识时，服务使用由 `prompt_cache_key`、会话/对话 ID、首条用户消息等稳定信号生成的请求 hash 作为 fallback；同一对话跨轮次保持绑定，不同 API Key 的绑定相互隔离。仅存内存中的哈希，不记录原始请求体或会话 metadata。
 
-同一会话的并发首次请求会优先选择同一账号；成功请求续期 30 分钟，服务重启后绑定重建。
+同一会话的并发首次请求会优先选择同一账号；成功请求按 `session-affinity-ttl` 续期（默认 2 小时），服务重启后绑定重建。
 绑定数量上限为 4096，达到上限时先回收过期项，再淘汰最早到期项，不清空其他活跃会话。
 预算保护、手动禁用、删除、冷却和模型可用性优先于亲和；需要换号时仍正常重试，成功后
 绑定到新账号。亲和关闭时保持逐请求轮询，不会因为识别到 Claude Code 而自动开启。

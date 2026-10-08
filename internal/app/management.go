@@ -13,6 +13,22 @@ import (
 	"github.com/1oo1/cpa-github-copilot/internal/contract"
 )
 
+func parseAffinityTTL(raw json.RawMessage) (time.Duration, error) {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		ttl, err := time.ParseDuration(text)
+		if err != nil || ttl <= 0 {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		return ttl, nil
+	}
+	var seconds float64
+	if json.Unmarshal(raw, &seconds) != nil || seconds <= 0 || seconds > float64((1<<63-1)/time.Second) {
+		return 0, fmt.Errorf("invalid duration")
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
+}
+
 func (s *Server) managementRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/management/accounts", func(w http.ResponseWriter, r *http.Request) { respond(w, 200, s.listAccounts()) })
@@ -180,9 +196,11 @@ func (s *Server) managementRoutes() http.Handler {
 	})
 	mux.HandleFunc("PATCH /v0/management/config", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Proxy    *string `json:"proxy_url"`
-			Routing  *string `json:"routing"`
-			Affinity *bool   `json:"session_affinity"`
+			Proxy              *string         `json:"proxy_url"`
+			Routing            *string         `json:"routing"`
+			Affinity           *bool           `json:"session_affinity"`
+			AffinityTTL        json.RawMessage `json:"session_affinity_ttl"`
+			AffinityTTLSeconds *int64          `json:"session_affinity_ttl_seconds"`
 		}
 		if !readJSON(w, r, &req) {
 			return
@@ -190,6 +208,26 @@ func (s *Server) managementRoutes() http.Handler {
 		if req.Routing != nil && *req.Routing != "round-robin" && *req.Routing != "fill-first" {
 			apiError(w, 400, "invalid_config", "invalid routing strategy")
 			return
+		}
+		ttl := time.Duration(0)
+		if len(req.AffinityTTL) > 0 && string(req.AffinityTTL) != "null" {
+			var err error
+			ttl, err = parseAffinityTTL(req.AffinityTTL)
+			if err != nil {
+				apiError(w, 400, "invalid_config", "invalid session affinity TTL")
+				return
+			}
+		}
+		if req.AffinityTTLSeconds != nil {
+			if ttl != 0 {
+				apiError(w, 400, "invalid_config", "session affinity TTL must be specified once")
+				return
+			}
+			if *req.AffinityTTLSeconds <= 0 || *req.AffinityTTLSeconds > int64((1<<63-1)/time.Second) {
+				apiError(w, 400, "invalid_config", "session affinity TTL must be positive")
+				return
+			}
+			ttl = time.Duration(*req.AffinityTTLSeconds) * time.Second
 		}
 		if req.Proxy != nil && *req.Proxy != "" {
 			u, err := url.Parse(*req.Proxy)
@@ -208,6 +246,9 @@ func (s *Server) managementRoutes() http.Handler {
 		}
 		if req.Affinity != nil {
 			s.cfg.SessionAffinity = *req.Affinity
+		}
+		if ttl != 0 {
+			s.cfg.SessionAffinityTTL = ttl
 		}
 		err := s.saveConfigLocked()
 		if err != nil {

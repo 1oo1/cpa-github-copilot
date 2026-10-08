@@ -37,6 +37,7 @@ type Settings = {
   proxy_url: string;
   routing: string;
   session_affinity: boolean;
+  session_affinity_ttl: number;
 };
 type APIKey = { id: string; preview: string };
 const navigation = [
@@ -584,7 +585,7 @@ function App() {
               协议选项和管理密钥通过配置文件维护，修改这些项后重启服务。
             </p>
             <form
-              key={`${settings.routing}-${settings.proxy_url}-${settings.session_affinity}`}
+              key={`${settings.routing}-${settings.proxy_url}-${settings.session_affinity}-${settings.session_affinity_ttl}`}
               onSubmit={(e) => {
                 e.preventDefault();
                 const data = new FormData(e.currentTarget);
@@ -595,6 +596,7 @@ function App() {
                       : { proxy_url: String(data.get("proxy")) }),
                     routing: String(data.get("routing")),
                     session_affinity: data.get("affinity") === "on",
+                    session_affinity_ttl_seconds: Number(data.get("affinity_ttl")),
                   });
                   setNotice("设置已保存");
                 });
@@ -624,7 +626,20 @@ function App() {
                   type="checkbox"
                   defaultChecked={settings.session_affinity}
                 />
-                按 X-Session-Id 保持会话账号
+                按请求会话信号或 hash 保持会话账号
+              </label>
+              <label>
+                会话亲和时长（秒）
+                <input
+                  name="affinity_ttl"
+                  type="number"
+                  min="1"
+                  step="1"
+                  defaultValue={Math.max(
+                    1,
+                    Math.round(settings.session_affinity_ttl / 1_000_000_000),
+                  )}
+                />
               </label>
               <button className="primary" disabled={busy}>
                 保存设置
