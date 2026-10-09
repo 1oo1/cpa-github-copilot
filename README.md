@@ -214,6 +214,7 @@ UUID，也兼容旧式 `user_…_account_…_session_<UUID>`。Responses 请求�
 ## 协议边界
 
 - HTTP 兼容基线为 VS Code `1.139.1` / Copilot Chat `0.67.0`，模型和能力仍由当前账户 `/models` 决定。
+- 跨协议转换使用当前模型的输出 token 上限和 thinking 能力；超出上限的 `max_tokens`/`max_output_tokens` 会裁剪，reasoning effort 会按模型声明的级别映射或降级。
 - 流式和非流式请求均支持；Responses 必须出现真实终态，不会把 EOF 伪造成成功。JSON/SSE 响应保留上游 `X-Copilot-Service-Request-Id`，便于关联故障请求。
 - 会话历史、Responses continuation 和 compaction 重放由客户端负责。原生 Responses 保留包括非 `rs` 前缀 ID 在内的加密推理状态；无法安全转换的 opaque state 仍拒绝跨协议转换。
 - 不提供独立 `/v1/responses/compact` 或 token counting。

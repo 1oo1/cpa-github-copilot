@@ -61,7 +61,7 @@ func (s *service) executeRequest(ctx context.Context, callbackID string, req con
 		s.logFailure(callbackID, "inference.failed", failure, preparedInferenceLogFields(prepared, false))
 		return contract.ExecutorResponse{}, failure
 	}
-	payload := append([]byte(nil), resp.Body...)
+	payload := resp.Body
 	if normalizer := newGrokResponsesResponseNormalizer(prepared.grokToolRefs); normalizer != nil {
 		payload = normalizer.normalizeJSON(payload)
 	}
@@ -199,7 +199,7 @@ func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (p
 	if route.Path == "" || route.Format == "" {
 		return preparedInference{}, &serviceError{code: "model_not_supported", message: "GitHub Copilot model has no supported endpoint", httpStatus: http.StatusBadRequest}
 	}
-	payload := append([]byte(nil), req.Payload...)
+	payload := req.Payload
 	if len(payload) == 0 || !json.Valid(payload) {
 		return preparedInference{}, &serviceError{code: "invalid_request", message: "GitHub Copilot request payload must be a JSON object", httpStatus: http.StatusBadRequest}
 	}
@@ -243,6 +243,11 @@ func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (p
 			sdktranslator.Format(inputFormat),
 			sdktranslator.Format(translationTarget),
 			model,
+			sdktranslator.ModelCapabilities{
+				MaxOutputTokens:  route.MaxOutputTokens,
+				AdaptiveThinking: route.AdaptiveThinking,
+				ThinkingLevels:   route.ReasoningLevels,
+			},
 			payload,
 			stream,
 		)
@@ -1267,7 +1272,7 @@ func (s *service) executeProviderHTTPRequest(ctx context.Context, callbackID str
 		format = inferModelFormat(model)
 		route.Format = format
 	}
-	body := append([]byte(nil), req.Body...)
+	body := req.Body
 	requestedStream := false
 	if endpointFormat != "" {
 		if model == "" {
@@ -1329,7 +1334,7 @@ func (s *service) executeProviderHTTPRequest(ctx context.Context, callbackID str
 	return contract.ExecutorHTTPResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    cloneResponseHeaders(resp.Headers, "application/json"),
-		Body:       append([]byte(nil), resp.Body...),
+		Body:       resp.Body,
 	}, nil
 }
 

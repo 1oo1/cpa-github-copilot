@@ -1,9 +1,11 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -12,225 +14,278 @@ import (
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
 )
 
-type streamBridgeFake struct {
+// streamFakeHost is a hostRuntime that replays scripted upstream stream reads and
+// records everything the service sends to the upstream and downstream sides.
+type streamFakeHost struct {
 	mu sync.Mutex
 
-	readChunks     []localHostHTTPStreamReadResponse
-	upstream       []localHostHTTPRequest
-	emitted        [][]byte
-	upstreamClosed bool
-	pluginClosed   bool
-	pluginError    string
-	emitError      bool
-	logs           []localHostLogRequest
-	done           chan struct{}
-	doneOnce       sync.Once
+	readChunks         []hostHTTPStreamReadResponse
+	upstream           []hostHTTPCall
+	readStreamIDs      []string
+	closedUpstreamIDs  []string
+	emitted            [][]byte
+	emitStreamIDs      []string
+	downstreamClosedID string
+	downstreamError    string
+	upstreamClosed     bool
+	downstreamClosed   bool
+	emitError          bool
+	logs               []hostLogEntry
+	done               chan struct{}
+	doneOnce           sync.Once
 }
 
-type shutdownStreamBridgeFake struct {
+// shutdownStreamFakeHost blocks inside emit and upstream reads so a test can
+// observe how shutdown cancels and joins an in-flight forwarding task.
+type shutdownStreamFakeHost struct {
 	mu sync.Mutex
 
-	readCount      int
-	emitStarted    chan struct{}
-	emitRelease    chan struct{}
-	upstreamClosed chan struct{}
-	pluginClosed   chan struct{}
-	emitOnce       sync.Once
-	upstreamOnce   sync.Once
-	pluginOnce     sync.Once
+	readCount        int
+	emitStarted      chan struct{}
+	emitRelease      chan struct{}
+	upstreamClosed   chan struct{}
+	downstreamClosed chan struct{}
+	emitOnce         sync.Once
+	upstreamOnce     sync.Once
+	downstreamOnce   sync.Once
 }
 
-func newShutdownStreamBridgeFake() *shutdownStreamBridgeFake {
-	return &shutdownStreamBridgeFake{
-		emitStarted:    make(chan struct{}),
-		emitRelease:    make(chan struct{}),
-		upstreamClosed: make(chan struct{}),
-		pluginClosed:   make(chan struct{}),
+func newShutdownStreamHost() *shutdownStreamFakeHost {
+	return &shutdownStreamFakeHost{
+		emitStarted:      make(chan struct{}),
+		emitRelease:      make(chan struct{}),
+		upstreamClosed:   make(chan struct{}),
+		downstreamClosed: make(chan struct{}),
 	}
 }
 
-func (f *shutdownStreamBridgeFake) Call(method string, _ any) (json.RawMessage, error) {
-	var result any = map[string]any{}
-	switch method {
-	case legacyMethodHostLog:
-	case legacyMethodHostHTTPDoStream:
-		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-shutdown"}
-	case legacyMethodHostHTTPStreamRead:
-		f.mu.Lock()
-		f.readCount++
-		readCount := f.readCount
-		f.mu.Unlock()
-		if readCount == 1 {
-			result = localHostHTTPStreamReadResponse{Payload: []byte("data: {\"id\":\"chatcmpl-shutdown\",\"choices\":[]}\n\n")}
-		} else {
-			<-f.upstreamClosed
-			result = localHostHTTPStreamReadResponse{Done: true}
-		}
-	case legacyMethodHostHTTPStreamClose:
-		f.upstreamOnce.Do(func() { close(f.upstreamClosed) })
-	case legacyMethodHostStreamEmit:
-		f.emitOnce.Do(func() { close(f.emitStarted) })
-		<-f.emitRelease
-	case legacyMethodHostStreamClose:
-		f.pluginOnce.Do(func() { close(f.pluginClosed) })
-	default:
-		return nil, fmt.Errorf("unexpected method %s", method)
+func (f *shutdownStreamFakeHost) do(context.Context, string, contract.HTTPRequest) (contract.HTTPResponse, error) {
+	return contract.HTTPResponse{}, fmt.Errorf("unexpected host HTTP call")
+}
+
+func (f *shutdownStreamFakeHost) openStream(context.Context, string, contract.HTTPRequest) (hostHTTPStreamResponse, error) {
+	return hostHTTPStreamResponse{StatusCode: 200, Headers: http.Header{"Content-Type": []string{"text/event-stream"}}, StreamID: "upstream-shutdown"}, nil
+}
+
+func (f *shutdownStreamFakeHost) readStream(string) (hostHTTPStreamReadResponse, error) {
+	f.mu.Lock()
+	f.readCount++
+	readCount := f.readCount
+	f.mu.Unlock()
+	if readCount == 1 {
+		return hostHTTPStreamReadResponse{Payload: []byte("data: {\"id\":\"chatcmpl-shutdown\",\"choices\":[]}\n\n")}, nil
 	}
-	raw, errMarshal := json.Marshal(result)
-	return raw, errMarshal
+	<-f.upstreamClosed
+	return hostHTTPStreamReadResponse{Done: true}, nil
 }
 
-func newStreamBridgeFake(chunks ...localHostHTTPStreamReadResponse) *streamBridgeFake {
-	return &streamBridgeFake{readChunks: chunks, done: make(chan struct{})}
+func (f *shutdownStreamFakeHost) closeStream(string) {
+	f.upstreamOnce.Do(func() { close(f.upstreamClosed) })
 }
 
-func (f *streamBridgeFake) Call(method string, payload any) (json.RawMessage, error) {
+func (f *shutdownStreamFakeHost) emit(string, []byte) error {
+	f.emitOnce.Do(func() { close(f.emitStarted) })
+	<-f.emitRelease
+	return nil
+}
+
+func (f *shutdownStreamFakeHost) closeOutput(string, string) {
+	f.downstreamOnce.Do(func() { close(f.downstreamClosed) })
+}
+
+func (f *shutdownStreamFakeHost) log(string, string, string, map[string]any) {}
+
+func newStreamHost(chunks ...hostHTTPStreamReadResponse) *streamFakeHost {
+	return &streamFakeHost{readChunks: chunks, done: make(chan struct{})}
+}
+
+func (f *streamFakeHost) do(context.Context, string, contract.HTTPRequest) (contract.HTTPResponse, error) {
+	return contract.HTTPResponse{}, fmt.Errorf("unexpected host HTTP call")
+}
+
+func (f *streamFakeHost) openStream(_ context.Context, callbackID string, req contract.HTTPRequest) (hostHTTPStreamResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var result any = map[string]any{}
-	switch method {
-	case legacyMethodHostLog:
-		if request, ok := payload.(localHostLogRequest); ok {
-			f.logs = append(f.logs, request)
-		}
-	case legacyMethodHostHTTPDoStream:
-		f.upstream = append(f.upstream, payload.(localHostHTTPRequest))
-		result = localHostHTTPStreamResponse{StatusCode: 200, Headers: httpHeaders{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}}, StreamID: "upstream-1"}
-	case legacyMethodHostHTTPStreamRead:
-		if len(f.readChunks) == 0 {
-			return nil, fmt.Errorf("unexpected stream read")
-		}
-		result = f.readChunks[0]
-		f.readChunks = f.readChunks[1:]
-	case legacyMethodHostHTTPStreamClose:
-		f.upstreamClosed = true
-	case legacyMethodHostStreamEmit:
-		if f.emitError {
-			return nil, fmt.Errorf("downstream closed")
-		}
-		req := payload.(localHostStreamEmitRequest)
-		f.emitted = append(f.emitted, append([]byte(nil), req.Payload...))
-	case legacyMethodHostStreamClose:
-		req := payload.(localHostStreamCloseRequest)
-		f.pluginClosed = true
-		f.pluginError = req.Error
-		f.doneOnce.Do(func() { close(f.done) })
-	default:
-		return nil, fmt.Errorf("unexpected method %s", method)
-	}
-	raw, errMarshal := json.Marshal(result)
-	return raw, errMarshal
+	f.upstream = append(f.upstream, newHostHTTPCall(callbackID, req))
+	return hostHTTPStreamResponse{
+		StatusCode: 200,
+		Headers:    http.Header{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}},
+		StreamID:   "upstream-1",
+	}, nil
 }
 
-func (f *streamBridgeFake) wait(t *testing.T) {
+func (f *streamFakeHost) readStream(streamID string) (hostHTTPStreamReadResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readStreamIDs = append(f.readStreamIDs, streamID)
+	if len(f.readChunks) == 0 {
+		return hostHTTPStreamReadResponse{}, fmt.Errorf("unexpected stream read")
+	}
+	chunk := f.readChunks[0]
+	f.readChunks = f.readChunks[1:]
+	return chunk, nil
+}
+
+func (f *streamFakeHost) closeStream(streamID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upstreamClosed = true
+	f.closedUpstreamIDs = append(f.closedUpstreamIDs, streamID)
+}
+
+func (f *streamFakeHost) emit(streamID string, payload []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.emitError {
+		return fmt.Errorf("downstream closed")
+	}
+	f.emitted = append(f.emitted, append([]byte(nil), payload...))
+	f.emitStreamIDs = append(f.emitStreamIDs, streamID)
+	return nil
+}
+
+func (f *streamFakeHost) closeOutput(streamID, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downstreamClosed = true
+	f.downstreamClosedID = streamID
+	f.downstreamError = message
+	f.doneOnce.Do(func() { close(f.done) })
+}
+
+func (f *streamFakeHost) log(callbackID, level, event string, fields map[string]any) {
+	entry := newHostLogEntry(callbackID, level, event, fields)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs = append(f.logs, entry)
+}
+
+func (f *streamFakeHost) wait(t *testing.T) {
 	t.Helper()
 	select {
 	case <-f.done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for plugin stream close")
+		t.Fatal("timed out waiting for downstream stream close")
 	}
 }
 
-func (f *streamBridgeFake) snapshotLogs() []localHostLogRequest {
+func (f *streamFakeHost) snapshotLogs() []hostLogEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]localHostLogRequest(nil), f.logs...)
+	return append([]hostLogEntry(nil), f.logs...)
 }
 
 func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.T) {
 	chatChunk := `{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n\n")},
-		localHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n")},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n\n")},
+		hostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n")},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(100_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	raw, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-1", HostCallbackID: "callback-stream",
-	}))
+	headers, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-1", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	result := decodeEnvelopeResult[localExecutorStreamResponse](t, raw)
-	if result.Headers.Get("Content-Type") != "text/event-stream" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" {
-		t.Fatalf("stream headers = %#v", result.Headers)
+	if headers.Get("Content-Type") != "text/event-stream" || headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" {
+		t.Fatalf("stream headers = %#v", headers)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	if !bridge.upstreamClosed || !bridge.pluginClosed || bridge.pluginError != "" {
-		t.Fatalf("close state: upstream=%v plugin=%v error=%q", bridge.upstreamClosed, bridge.pluginClosed, bridge.pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !fake.upstreamClosed || !fake.downstreamClosed || fake.downstreamError != "" {
+		t.Fatalf("close state: upstream=%v downstream=%v error=%q", fake.upstreamClosed, fake.downstreamClosed, fake.downstreamError)
 	}
-	if got := string(bytesJoin(bridge.emitted)); got != chatChunk || !json.Valid([]byte(got)) {
+	if got := string(bytesJoin(fake.emitted)); got != chatChunk || !json.Valid([]byte(got)) {
 		t.Fatalf("emitted = %q", got)
+	}
+	if len(fake.upstream) != 1 || fake.upstream[0].CallbackID != "callback-stream" || fake.upstream[0].Method != http.MethodPost ||
+		fake.upstream[0].URL != "https://api.individual.githubcopilot.com/chat/completions" {
+		t.Fatalf("upstream stream request = %#v", fake.upstream)
+	}
+	var upstreamBody map[string]any
+	if json.Unmarshal(fake.upstream[0].Body, &upstreamBody) != nil || upstreamBody["model"] != "gpt-4.1" || upstreamBody["stream"] != true {
+		t.Fatalf("upstream stream body = %s", fake.upstream[0].Body)
+	}
+	if got := fake.upstream[0].Headers.Get("Authorization"); got != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
+		t.Fatalf("upstream stream Authorization = %q", got)
+	}
+	for _, id := range fake.readStreamIDs {
+		if id != "upstream-1" {
+			t.Fatalf("read stream ids = %v, want only upstream-1", fake.readStreamIDs)
+		}
+	}
+	if len(fake.closedUpstreamIDs) == 0 || fake.closedUpstreamIDs[0] != "upstream-1" {
+		t.Fatalf("closed upstream ids = %v", fake.closedUpstreamIDs)
+	}
+	for _, id := range fake.emitStreamIDs {
+		if id != "downstream-1" {
+			t.Fatalf("emit stream ids = %v, want only downstream-1", fake.emitStreamIDs)
+		}
+	}
+	if fake.downstreamClosedID != "downstream-1" {
+		t.Fatalf("downstream closed id = %q", fake.downstreamClosedID)
 	}
 }
 
 func TestExecuteStreamPassThroughAcceptsSingleNewlineChatEvents(t *testing.T) {
 	chatChunk := `{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n")},
-		localHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n")},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + chatChunk + "\n")},
+		hostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n")},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(102_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-single-newline-chat", HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-single-newline-chat", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" || emitted != chatChunk {
-		t.Fatalf("single-newline stream: error=%q emitted=%q", pluginError, emitted)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" || emitted != chatChunk {
+		t.Fatalf("single-newline stream: error=%q emitted=%q", downstreamError, emitted)
 	}
 }
 
 func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
-		localHostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.created","response":{"id":"resp`)},
+		hostHTTPStreamReadResponse{Payload: []byte("-1\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(105_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.6-sol","input":"hi","stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.6-sol", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.6-sol", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-split-sse", HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-split-sse", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.6-sol", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.6-sol", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := append([][]byte(nil), bridge.emitted...)
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("plugin stream error = %q", pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := append([][]byte(nil), fake.emitted...)
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("downstream stream error = %q", downstreamError)
 	}
 	want := []string{
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
@@ -257,8 +312,8 @@ func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.
 		`data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_shell","arguments":"{\"input\":\"pwd\"}"}` + "\n\n" +
 		`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}","status":"completed"}}` + "\n\n" +
 		`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[{"id":"fc_shell","type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"input\":\"pwd\"}"}]}}` + "\n\n"
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(stream)})
-	service := newService(newLegacyRuntime(bridge))
+	fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(stream)})
+	service := newService(fake)
 	now := time.Unix(106_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
@@ -268,25 +323,22 @@ func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.
 			{"type":"custom","name":"shell","format":{"type":"grammar"}}
 		]
 	}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "grok-4.6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "grok-4.6", Family: "grok-4.6", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-grok-custom-tools",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-grok-custom-tools", contract.ExecutorRequest{
+		AuthID: "auth", Model: "grok-4.6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "grok-4.6", Family: "grok-4.6", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	if bridge.pluginError != "" || len(bridge.upstream) != 1 {
-		t.Fatalf("stream state: error=%q upstream=%d", bridge.pluginError, len(bridge.upstream))
+	fake.wait(t)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.downstreamError != "" || len(fake.upstream) != 1 {
+		t.Fatalf("stream state: error=%q upstream=%d", fake.downstreamError, len(fake.upstream))
 	}
 	var upstream map[string]any
-	if errDecode := json.Unmarshal(bridge.upstream[0].Body, &upstream); errDecode != nil {
+	if errDecode := json.Unmarshal(fake.upstream[0].Body, &upstream); errDecode != nil {
 		t.Fatal(errDecode)
 	}
 	if _, exists := upstream["service_tier"]; exists {
@@ -296,7 +348,7 @@ func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.
 	if len(tools) != 1 || tools[0].(map[string]any)["type"] != "function" || tools[0].(map[string]any)["name"] != "shell" {
 		t.Fatalf("upstream tools = %#v", tools)
 	}
-	emitted := string(bytesJoin(bridge.emitted))
+	emitted := string(bytesJoin(fake.emitted))
 	for _, want := range []string{"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", `"type":"custom_tool_call"`, `"input":"pwd"`} {
 		if !strings.Contains(emitted, want) {
 			t.Fatalf("restored stream missing %q: %s", want, emitted)
@@ -308,32 +360,29 @@ func TestExecuteStreamGrokNormalizesCodexToolsAndRestoresCustomCalls(t *testing.
 }
 
 func TestExecuteStreamNativeClaudeClosesAtMessageStop(t *testing.T) {
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_start","message":{"id":"msg-1"}}` + "\n\n")},
-		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_stop"}` + "\n\n")},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_start","message":{"id":"msg-1"}}` + "\n\n")},
+		hostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"message_stop"}` + "\n\n")},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(107_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"claude-sonnet-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "claude-sonnet-4.6", Format: formatClaude, SourceFormat: formatClaude,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "claude-sonnet-4.6", Format: formatClaude})),
-		},
-		StreamID: "plugin-native-claude", HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-native-claude", contract.ExecutorRequest{
+		AuthID: "auth", Model: "claude-sonnet-4.6", Format: formatClaude, SourceFormat: formatClaude,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "claude-sonnet-4.6", Format: formatClaude})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" || !strings.Contains(emitted, `"type":"message_stop"`) {
-		t.Fatalf("native Claude terminal state: error=%q emitted=%q", pluginError, emitted)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" || !strings.Contains(emitted, `"type":"message_stop"`) {
+		t.Fatalf("native Claude terminal state: error=%q emitted=%q", downstreamError, emitted)
 	}
 }
 
@@ -341,32 +390,29 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 	first := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
 	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte(first[:31])},
-		localHostHTTPStreamReadResponse{Payload: []byte(first[31:] + finish + done)},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte(first[:31])},
+		hostHTTPStreamReadResponse{Payload: []byte(first[31:] + finish + done)},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(110_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatClaude, SourceFormat: formatClaude,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-2", HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-2", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatClaude, SourceFormat: formatClaude,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	upstreamClosed, pluginError := bridge.upstreamClosed, bridge.pluginError
-	bridge.mu.Unlock()
-	if !upstreamClosed || pluginError != "" {
-		t.Fatalf("close state: upstream=%v error=%q", upstreamClosed, pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	upstreamClosed, downstreamError := fake.upstreamClosed, fake.downstreamError
+	fake.mu.Unlock()
+	if !upstreamClosed || downstreamError != "" {
+		t.Fatalf("close state: upstream=%v error=%q", upstreamClosed, downstreamError)
 	}
 	if !strings.Contains(emitted, "event: message_start") || !strings.Contains(emitted, "hello") || !strings.Contains(emitted, "event: message_stop") {
 		t.Fatalf("translated stream = %q", emitted)
@@ -382,12 +428,12 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 		`data: {"type":"response.output_item.done","item":{"id":"ws_123","type":"web_search_call","status":"completed","action":{"type":"search","query":"HarmonyOS command-line tools"}}}` + "\n\n",
 		`data: {"type":"response.completed","response":{"id":"resp-search","status":"completed","stop_reason":"stop","error":null,"usage":{"input_tokens":3,"output_tokens":2}}}` + "\n\n",
 	}
-	chunks := make([]localHostHTTPStreamReadResponse, 0, len(frames))
+	chunks := make([]hostHTTPStreamReadResponse, 0, len(frames))
 	for _, frame := range frames {
-		chunks = append(chunks, localHostHTTPStreamReadResponse{Payload: []byte(frame)})
+		chunks = append(chunks, hostHTTPStreamReadResponse{Payload: []byte(frame)})
 	}
-	bridge := newStreamBridgeFake(chunks...)
-	service := newService(newLegacyRuntime(bridge))
+	fake := newStreamHost(chunks...)
+	service := newService(fake)
 	now := time.Unix(115_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
@@ -397,27 +443,24 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
 		"tool_choice":{"type":"tool","name":"web_search"}
 	}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now,
-				storedModel{ID: "claude-sonnet-5", Format: formatClaude},
-				storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse},
-			)),
-		},
-		StreamID: "plugin-web-search", HostCallbackID: "callback-web-search",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-web-search", "downstream-web-search", contract.ExecutorRequest{
+		AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now,
+			storedModel{ID: "claude-sonnet-5", Format: formatClaude},
+			storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse},
+		)),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("plugin stream error = %q", pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("downstream stream error = %q", downstreamError)
 	}
 	for _, needle := range []string{`"type":"server_tool_use"`, `"type":"web_search_tool_result"`, "HarmonyOS command-line tools", `"type":"message_stop"`} {
 		if !strings.Contains(emitted, needle) {
@@ -430,49 +473,43 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 }
 
 func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
-	bridge.emitError = true
-	service := newService(newLegacyRuntime(bridge))
+	fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
+	fake.emitError = true
+	service := newService(fake)
 	now := time.Unix(120_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-3",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-3", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	if !bridge.upstreamClosed || bridge.pluginError == "" || strings.Contains(bridge.pluginError, "chunk") {
-		t.Fatalf("close state: upstream=%v error=%q", bridge.upstreamClosed, bridge.pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !fake.upstreamClosed || fake.downstreamError == "" || strings.Contains(fake.downstreamError, "chunk") {
+		t.Fatalf("close state: upstream=%v error=%q", fake.upstreamClosed, fake.downstreamError)
 	}
 }
 
 func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
-	bridge := newShutdownStreamBridgeFake()
-	service := newService(newLegacyRuntime(bridge))
+	fake := newShutdownStreamHost()
+	service := newService(fake)
 	now := time.Unix(122_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-shutdown-wait", HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-shutdown-wait", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
 	select {
-	case <-bridge.emitStarted:
+	case <-fake.emitStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("forwarder did not enter host emit")
 	}
@@ -483,27 +520,27 @@ func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
 		close(shutdownDone)
 	}()
 	select {
-	case <-bridge.upstreamClosed:
+	case <-fake.upstreamClosed:
 	case <-time.After(5 * time.Second):
-		close(bridge.emitRelease)
+		close(fake.emitRelease)
 		t.Fatal("shutdown did not cancel the upstream stream")
 	}
 	select {
 	case <-shutdownDone:
-		close(bridge.emitRelease)
+		close(fake.emitRelease)
 		t.Fatal("shutdown returned while a forwarding task was still using host callbacks")
 	case <-time.After(50 * time.Millisecond):
 	}
-	close(bridge.emitRelease)
+	close(fake.emitRelease)
 	select {
 	case <-shutdownDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown did not join the forwarding task")
 	}
 	select {
-	case <-bridge.pluginClosed:
+	case <-fake.downstreamClosed:
 	default:
-		t.Fatal("forwarder did not close the plugin stream before shutdown returned")
+		t.Fatal("forwarder did not close the downstream stream before shutdown returned")
 	}
 	service.streamMu.Lock()
 	remaining := len(service.streamTasks)
@@ -514,26 +551,23 @@ func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
 }
 
 func TestExecuteStreamUpstreamErrorStillClosesBothStreams(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
-	service := newService(newLegacyRuntime(bridge))
+	fake := newStreamHost(hostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
+	service := newService(fake)
 	now := time.Unix(125_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-upstream-error",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-upstream-error", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	if !bridge.upstreamClosed || !bridge.pluginClosed || bridge.pluginError == "" || strings.Contains(bridge.pluginError, "private upstream detail") {
-		t.Fatalf("close state: upstream=%v plugin=%v error=%q", bridge.upstreamClosed, bridge.pluginClosed, bridge.pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !fake.upstreamClosed || !fake.downstreamClosed || fake.downstreamError == "" || strings.Contains(fake.downstreamError, "private upstream detail") {
+		t.Fatalf("close state: upstream=%v downstream=%v error=%q", fake.upstreamClosed, fake.downstreamClosed, fake.downstreamError)
 	}
 }
 
@@ -607,7 +641,7 @@ func bytesJoin(chunks [][]byte) []byte {
 	return out
 }
 
-func hasLogEvent(logs []localHostLogRequest, event string) bool {
+func hasLogEvent(logs []hostLogEntry, event string) bool {
 	for _, entry := range logs {
 		if entry.Fields["event"] == event {
 			return true
@@ -616,31 +650,28 @@ func hasLogEvent(logs []localHostLogRequest, event string) bool {
 	return false
 }
 
-func executeOpenAIStream(t *testing.T, bridge *streamBridgeFake, streamID string, at time.Time) {
+func executeOpenAIStream(t *testing.T, fake *streamFakeHost, streamID string, at time.Time) {
 	t.Helper()
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	service.now = func() time.Time { return at }
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, StorageJSON: mustJSON(t, executorStorage(at, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: streamID, HostCallbackID: "callback-stream",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", streamID, contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(at, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
+	fake.wait(t)
 }
 
 func TestForwardStreamSuccessLogsCompletedDebug(t *testing.T) {
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: first\n\n")},
-		localHostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n"), Done: true},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: first\n\n")},
+		hostHTTPStreamReadResponse{Payload: []byte("data: [DONE]\n\n"), Done: true},
 	)
-	executeOpenAIStream(t, bridge, "plugin-success-log", time.Unix(135_000, 0).UTC())
-	logs := bridge.snapshotLogs()
+	executeOpenAIStream(t, fake, "downstream-success-log", time.Unix(135_000, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.forward_failed") {
 		t.Fatal("successful stream must not log inference.stream.forward_failed")
 	}
@@ -657,10 +688,10 @@ func TestForwardStreamSuccessLogsCompletedDebug(t *testing.T) {
 }
 
 func TestForwardStreamBenignDownstreamCloseLogsDebug(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
-	bridge.emitError = true
-	executeOpenAIStream(t, bridge, "plugin-benign-emit", time.Unix(130_000, 0).UTC())
-	logs := bridge.snapshotLogs()
+	fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte("data: chunk\n\n"), Done: true})
+	fake.emitError = true
+	executeOpenAIStream(t, fake, "downstream-benign-emit", time.Unix(130_000, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.forward_failed") {
 		t.Fatal("benign downstream close must not log inference.stream.forward_failed")
 	}
@@ -677,9 +708,9 @@ func TestForwardStreamBenignDownstreamCloseLogsDebug(t *testing.T) {
 }
 
 func TestForwardStreamReadFailureLogsWarn(t *testing.T) {
-	bridge := newStreamBridgeFake() // no chunks: the host stream read call fails
-	executeOpenAIStream(t, bridge, "plugin-read-failure", time.Unix(131_000, 0).UTC())
-	logs := bridge.snapshotLogs()
+	fake := newStreamHost() // no chunks: the host stream read call fails
+	executeOpenAIStream(t, fake, "downstream-read-failure", time.Unix(131_000, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.client_disconnected") {
 		t.Fatal("a host read failure must not be logged as a benign client disconnect")
 	}
@@ -693,9 +724,9 @@ func TestForwardStreamReadFailureLogsWarn(t *testing.T) {
 }
 
 func TestForwardStreamUpstreamErrorLogsWarn(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
-	executeOpenAIStream(t, bridge, "plugin-upstream-warn", time.Unix(132_000, 0).UTC())
-	logs := bridge.snapshotLogs()
+	fake := newStreamHost(hostHTTPStreamReadResponse{Error: "private upstream detail", Done: true})
+	executeOpenAIStream(t, fake, "downstream-upstream-warn", time.Unix(132_000, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.client_disconnected") {
 		t.Fatal("upstream error must not be logged as client_disconnected")
 	}
@@ -719,9 +750,9 @@ func TestForwardStreamUpstreamErrorLogsWarn(t *testing.T) {
 }
 
 func TestForwardStreamUpstreamCancelLogsDebug(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Error: "context canceled", Done: true})
-	executeOpenAIStream(t, bridge, "plugin-upstream-cancel", time.Unix(133_000, 0).UTC())
-	logs := bridge.snapshotLogs()
+	fake := newStreamHost(hostHTTPStreamReadResponse{Error: "context canceled", Done: true})
+	executeOpenAIStream(t, fake, "downstream-upstream-cancel", time.Unix(133_000, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.forward_failed") {
 		t.Fatal("a cancelled upstream read must not be logged as a forwarding failure")
 	}
@@ -735,20 +766,20 @@ func TestForwardStreamUpstreamCancelLogsDebug(t *testing.T) {
 	if entry.Fields["upstream_cause"] != upstreamCauseCanceled {
 		t.Fatalf("upstream_cause = %v, want %q", entry.Fields["upstream_cause"], upstreamCauseCanceled)
 	}
-	bridge.mu.Lock()
-	defer bridge.mu.Unlock()
-	if !bridge.upstreamClosed || !bridge.pluginClosed {
-		t.Fatalf("close state: upstream=%v plugin=%v", bridge.upstreamClosed, bridge.pluginClosed)
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if !fake.upstreamClosed || !fake.downstreamClosed {
+		t.Fatalf("close state: upstream=%v downstream=%v", fake.upstreamClosed, fake.downstreamClosed)
 	}
-	if bridge.pluginError != "GitHub Copilot upstream stream canceled" {
-		t.Fatalf("plugin stream error = %q", bridge.pluginError)
+	if fake.downstreamError != "GitHub Copilot upstream stream canceled" {
+		t.Fatalf("downstream stream error = %q", fake.downstreamError)
 	}
 }
 
 func TestForwardStreamRemoteHTTP2CancelLogsWarn(t *testing.T) {
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Error: "stream error: stream ID 3; CANCEL", Done: true})
-	executeOpenAIStream(t, bridge, "plugin-upstream-remote-cancel", time.Unix(133_500, 0).UTC())
-	logs := bridge.snapshotLogs()
+	fake := newStreamHost(hostHTTPStreamReadResponse{Error: "stream error: stream ID 3; CANCEL", Done: true})
+	executeOpenAIStream(t, fake, "downstream-upstream-remote-cancel", time.Unix(133_500, 0).UTC())
+	logs := fake.snapshotLogs()
 	if hasLogEvent(logs, "inference.stream.client_disconnected") {
 		t.Fatal("a remote HTTP/2 CANCEL must not be logged as a client disconnect")
 	}
@@ -762,9 +793,9 @@ func TestForwardStreamRemoteHTTP2CancelLogsWarn(t *testing.T) {
 }
 
 func TestForwardStreamNonUpstreamFailureOmitsUpstreamCause(t *testing.T) {
-	bridge := newStreamBridgeFake() // no chunks: the host stream read call fails
-	executeOpenAIStream(t, bridge, "plugin-no-cause", time.Unix(134_000, 0).UTC())
-	entry := findLogEvent(t, bridge.snapshotLogs(), "inference.stream.forward_failed")
+	fake := newStreamHost() // no chunks: the host stream read call fails
+	executeOpenAIStream(t, fake, "downstream-no-cause", time.Unix(134_000, 0).UTC())
+	entry := findLogEvent(t, fake.snapshotLogs(), "inference.stream.forward_failed")
 	if _, hasCause := entry.Fields["upstream_cause"]; hasCause {
 		t.Fatalf("read failure should not carry an upstream_cause: %v", entry.Fields["upstream_cause"])
 	}
@@ -864,35 +895,32 @@ func TestSSEFramerBufferExceededReturnsTypedError(t *testing.T) {
 }
 
 func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"), Done: true},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n"), Done: true},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(190_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-missing-terminal",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-missing-terminal", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	logs := append([]localHostLogRequest(nil), bridge.logs...)
-	bridge.mu.Unlock()
-	if pluginError == "" {
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	logs := append([]hostLogEntry(nil), fake.logs...)
+	fake.mu.Unlock()
+	if downstreamError == "" {
 		t.Fatalf("stream without a terminal Responses event unexpectedly closed cleanly; emitted=%q", emitted)
 	}
-	if !strings.Contains(strings.ToLower(pluginError), "unexpected eof") {
-		t.Fatalf("missing-terminal stream error must be classified as a connection-lifecycle failure: %q", pluginError)
+	if !strings.Contains(strings.ToLower(downstreamError), "unexpected eof") {
+		t.Fatalf("missing-terminal stream error must be classified as a connection-lifecycle failure: %q", downstreamError)
 	}
 	if !strings.Contains(emitted, "response.output_text.delta") {
 		t.Fatalf("non-terminal event was not preserved byte-for-byte: %q", emitted)
@@ -914,58 +942,52 @@ func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
 		`{"type":"error","error":{"message":"boom"}}`,
 	} {
 		t.Run(terminal, func(t *testing.T) {
-			bridge := newStreamBridgeFake(
-				localHostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n")},
+			fake := newStreamHost(
+				hostHTTPStreamReadResponse{Payload: []byte("data: " + terminal + "\n\n")},
 			)
-			service := newService(newLegacyRuntime(bridge))
+			service := newService(fake)
 			now := time.Unix(191_000, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
-			_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-				ExecutorRequest: contract.ExecutorRequest{
-					AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-					Payload: payload, OriginalRequest: payload,
-					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-				},
-				StreamID: "plugin-terminal-ok",
-			}))
+			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-terminal-ok", contract.ExecutorRequest{
+				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				Payload: payload, OriginalRequest: payload,
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+			})
 			if errStream != nil {
 				t.Fatal(errStream)
 			}
-			bridge.wait(t)
-			bridge.mu.Lock()
-			pluginError := bridge.pluginError
-			bridge.mu.Unlock()
-			if pluginError != "" {
-				t.Fatalf("unexpected error = %q", pluginError)
+			fake.wait(t)
+			fake.mu.Lock()
+			downstreamError := fake.downstreamError
+			fake.mu.Unlock()
+			if downstreamError != "" {
+				t.Fatalf("unexpected error = %q", downstreamError)
 			}
 		})
 	}
 }
 
 func TestResponsesStreamLogsTerminalStatus(t *testing.T) {
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n")},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte(`data: {"type":"response.completed","response":{"id":"resp_1"}}` + "\n\n")},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(196_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-terminal-status-log",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-terminal-status-log", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	logs := append([]localHostLogRequest(nil), bridge.logs...)
-	bridge.mu.Unlock()
+	fake.wait(t)
+	fake.mu.Lock()
+	logs := append([]hostLogEntry(nil), fake.logs...)
+	fake.mu.Unlock()
 	entry := findLogEvent(t, logs, "inference.stream.completed")
 	if entry.Fields["responses_terminal_status"] != "response.completed" {
 		t.Fatalf("responses_terminal_status = %#v", entry.Fields["responses_terminal_status"])
@@ -977,29 +999,26 @@ func TestResponsesStreamLogsNeverContainCompactionOrPromptContent(t *testing.T) 
 	const promptSentinel = "SENTINEL_USER_PROMPT_TEXT"
 	compaction := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"` + encryptedSentinel + `"}}`
 	completed := `{"type":"response.completed","response":{"id":"resp_1"}}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(197_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"` + promptSentinel + `"}]}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-log-content-sentinel",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-log-content-sentinel", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	logs := append([]localHostLogRequest(nil), bridge.logs...)
-	bridge.mu.Unlock()
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	logs := append([]hostLogEntry(nil), fake.logs...)
+	fake.mu.Unlock()
 	// The client-facing stream must carry the real content...
 	if !strings.Contains(emitted, encryptedSentinel) {
 		t.Fatalf("compaction content was not forwarded to the client: %q", emitted)
@@ -1011,31 +1030,28 @@ func TestResponsesStreamLogsNeverContainCompactionOrPromptContent(t *testing.T) 
 func TestResponsesPassthroughPreservesCompactionEventsBeforeTerminal(t *testing.T) {
 	compaction := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc"}}`
 	completed := `{"type":"response.completed","response":{"id":"resp_1"}}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + compaction + "\n\ndata: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(192_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-compaction-before-terminal",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-compaction-before-terminal", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", downstreamError, emitted)
 	}
 	if !strings.Contains(emitted, "cmp_1") || !strings.Contains(emitted, "response.completed") {
 		t.Fatalf("compaction or terminal event missing: %q", emitted)
@@ -1059,37 +1075,34 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 		{name: "finish then error then done", frames: chunk + finish + errorFrame + done},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
-			service := newService(newLegacyRuntime(bridge))
+			fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(test.frames)})
+			service := newService(fake)
 			now := time.Unix(193_000, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
-			_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-				ExecutorRequest: contract.ExecutorRequest{
-					AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-					Payload: payload, OriginalRequest: payload,
-					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-				},
-				StreamID: "plugin-translated-missing-terminal",
-			}))
+			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-translated-missing-terminal", contract.ExecutorRequest{
+				AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				Payload: payload, OriginalRequest: payload,
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+			})
 			if errStream != nil {
 				t.Fatal(errStream)
 			}
-			bridge.wait(t)
-			bridge.mu.Lock()
-			emitted := string(bytesJoin(bridge.emitted))
-			pluginError := bridge.pluginError
-			bridge.mu.Unlock()
-			if pluginError == "" {
+			fake.wait(t)
+			fake.mu.Lock()
+			emitted := string(bytesJoin(fake.emitted))
+			downstreamError := fake.downstreamError
+			fake.mu.Unlock()
+			if downstreamError == "" {
 				t.Fatalf("translated stream without a terminal Responses event unexpectedly closed cleanly; emitted=%q", emitted)
 			}
 			if strings.Contains(emitted, "response.completed") {
 				t.Fatalf("must never synthesize response.completed: emitted=%q", emitted)
 			}
-			if strings.Contains(pluginError, sentinel) {
-				t.Fatalf("stream error leaked upstream body: %q", pluginError)
+			if strings.Contains(downstreamError, sentinel) {
+				t.Fatalf("stream error leaked upstream body: %q", downstreamError)
 			}
-			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+			assertLogsExclude(t, fake.snapshotLogs(), sentinel)
 		})
 	}
 }
@@ -1098,29 +1111,26 @@ func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
 	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
 	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
-	bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done)})
-	service := newService(newLegacyRuntime(bridge))
+	fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done)})
+	service := newService(fake)
 	now := time.Unix(194_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
-		},
-		StreamID: "plugin-translated-terminal",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-translated-terminal", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", downstreamError, emitted)
 	}
 	if !strings.Contains(emitted, "response.completed") {
 		t.Fatalf("terminal response.completed event missing: emitted=%q", emitted)
@@ -1159,29 +1169,26 @@ func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T
 		{name: "claude refusal", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("refusal"), wantStatus: "response.completed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frames)})
-			service := newService(newLegacyRuntime(bridge))
+			fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(test.frames)})
+			service := newService(fake)
 			now := time.Unix(194_250, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"` + test.model + `","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}`)
-			_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-				ExecutorRequest: contract.ExecutorRequest{
-					AuthID: "auth", Model: test.model, Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-					Payload: payload, OriginalRequest: payload,
-					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: test.model, Format: test.upstreamFormat})),
-				},
-				StreamID: "plugin-translated-terminal-reason",
-			}))
+			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-translated-terminal-reason", contract.ExecutorRequest{
+				AuthID: "auth", Model: test.model, Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				Payload: payload, OriginalRequest: payload,
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: test.model, Format: test.upstreamFormat})),
+			})
 			if errStream != nil {
 				t.Fatal(errStream)
 			}
-			bridge.wait(t)
-			bridge.mu.Lock()
-			emitted := string(bytesJoin(bridge.emitted))
-			pluginError := bridge.pluginError
-			bridge.mu.Unlock()
-			if pluginError != "" {
-				t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+			fake.wait(t)
+			fake.mu.Lock()
+			emitted := string(bytesJoin(fake.emitted))
+			downstreamError := fake.downstreamError
+			fake.mu.Unlock()
+			if downstreamError != "" {
+				t.Fatalf("unexpected error = %q; emitted=%q", downstreamError, emitted)
 			}
 			if !strings.Contains(emitted, test.wantStatus) {
 				t.Fatalf("terminal %s missing: emitted=%q", test.wantStatus, emitted)
@@ -1212,34 +1219,31 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			bridge := newStreamBridgeFake(localHostHTTPStreamReadResponse{Payload: []byte(test.frame), Done: true})
-			service := newService(newLegacyRuntime(bridge))
+			fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(test.frame), Done: true})
+			service := newService(fake)
 			now := time.Unix(194_500, 0).UTC()
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-			_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-				ExecutorRequest: contract.ExecutorRequest{
-					AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
-					Payload: payload, OriginalRequest: payload,
-					StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-				},
-				StreamID: "plugin-responses-to-chat-failure",
-			}))
+			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-responses-to-chat-failure", contract.ExecutorRequest{
+				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+				Payload: payload, OriginalRequest: payload,
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+			})
 			if errStream != nil {
 				t.Fatal(errStream)
 			}
-			bridge.wait(t)
-			bridge.mu.Lock()
-			pluginError := bridge.pluginError
-			emitted := string(bytesJoin(bridge.emitted))
-			bridge.mu.Unlock()
-			if pluginError == "" {
+			fake.wait(t)
+			fake.mu.Lock()
+			downstreamError := fake.downstreamError
+			emitted := string(bytesJoin(fake.emitted))
+			fake.mu.Unlock()
+			if downstreamError == "" {
 				t.Fatalf("Responses-to-Chat stream closed cleanly; emitted=%q", emitted)
 			}
-			if strings.Contains(pluginError, sentinel) {
-				t.Fatalf("stream error leaked upstream body: %q", pluginError)
+			if strings.Contains(downstreamError, sentinel) {
+				t.Fatalf("stream error leaked upstream body: %q", downstreamError)
 			}
-			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+			assertLogsExclude(t, fake.snapshotLogs(), sentinel)
 		})
 	}
 }
@@ -1247,74 +1251,68 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 func TestExecuteStreamResponsesToChatAcceptsEventsWithoutSSESeparators(t *testing.T) {
 	delta := `{"type":"response.output_text.delta","response_id":"resp_1","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}`
 	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + delta)},
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + completed)},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + delta)},
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + completed)},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(194_750, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			Payload: payload, OriginalRequest: payload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-responses-to-chat-no-separator",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-responses-to-chat-no-separator", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, OriginalRequest: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	pluginError := bridge.pluginError
-	emitted := string(bytesJoin(bridge.emitted))
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("unexpected error = %q; emitted=%q", pluginError, emitted)
+	fake.wait(t)
+	fake.mu.Lock()
+	downstreamError := fake.downstreamError
+	emitted := string(bytesJoin(fake.emitted))
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("unexpected error = %q; emitted=%q", downstreamError, emitted)
 	}
 	if !strings.Contains(emitted, "hello") || !strings.Contains(emitted, `"finish_reason":"stop"`) {
 		t.Fatalf("translated Chat terminal chunks missing: %q", emitted)
 	}
 }
 
-// TestResponsesCompactionRoundTripPreservesClientManagedState proves the plugin performs no
+// TestResponsesCompactionRoundTripPreservesClientManagedState proves the service performs no
 // selection or history management of its own: request 1 streams multiple compaction items and
 // a terminal response.completed; this TEST (playing the role of the VS Code client) selects the
-// item at the highest output_index and builds request 2. The plugin must send that second
+// item at the highest output_index and builds request 2. The service must send that second
 // request with the selected compaction item, previous_response_id, and input ordering preserved,
 // only adding the documented Responses defaults.
 func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 	item1 := `{"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp_1","encrypted_content":"enc-old"}}`
 	item2 := `{"type":"response.output_item.done","output_index":1,"item":{"type":"compaction","id":"cmp_2","encrypted_content":"enc-new"}}`
 	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}`
-	bridge := newStreamBridgeFake(
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + item1 + "\n\ndata: " + item2 + "\n\n")},
-		localHostHTTPStreamReadResponse{Payload: []byte("data: " + completed + "\n\n"), Done: true},
+	fake := newStreamHost(
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + item1 + "\n\ndata: " + item2 + "\n\n")},
+		hostHTTPStreamReadResponse{Payload: []byte("data: " + completed + "\n\n"), Done: true},
 	)
-	service := newService(newLegacyRuntime(bridge))
+	service := newService(fake)
 	now := time.Unix(195_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	firstPayload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
-	_, errStream := service.executeStream(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: firstPayload, OriginalRequest: firstPayload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-		StreamID: "plugin-compaction-1",
-	}))
+	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-compaction-1", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: firstPayload, OriginalRequest: firstPayload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	bridge.wait(t)
-	bridge.mu.Lock()
-	emitted := string(bytesJoin(bridge.emitted))
-	pluginError := bridge.pluginError
-	bridge.mu.Unlock()
-	if pluginError != "" {
-		t.Fatalf("unexpected stream error = %q", pluginError)
+	fake.wait(t)
+	fake.mu.Lock()
+	emitted := string(bytesJoin(fake.emitted))
+	downstreamError := fake.downstreamError
+	fake.mu.Unlock()
+	if downstreamError != "" {
+		t.Fatalf("unexpected stream error = %q", downstreamError)
 	}
 
 	latestID, latestEncrypted, responseID := selectLatestCompactionForTest(t, emitted)
@@ -1331,20 +1329,17 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 		},
 	})
 	var capturedBody []byte
-	bridge2 := &fakeBridge{handler: func(_ string, payload any) (any, error) {
-		req := payload.(localHostHTTPRequest)
+	fake2 := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		capturedBody = req.Body
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp_2","object":"response","status":"completed","output":[]}`)}, nil
-	}}
-	service2 := newService(newLegacyRuntime(bridge2))
+	})
+	service2 := newService(fake2)
 	service2.now = func() time.Time { return now }
-	_, errExecute := service2.execute(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
-			Payload: secondPayload, OriginalRequest: secondPayload,
-			StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-		},
-	}))
+	_, errExecute := service2.executeRequest(context.Background(), "", contract.ExecutorRequest{
+		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		Payload: secondPayload, OriginalRequest: secondPayload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+	})
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}

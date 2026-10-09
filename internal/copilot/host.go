@@ -88,7 +88,7 @@ func (c hostClient) emit(streamID string, payload []byte) error {
 	if c.host == nil {
 		return fmt.Errorf("downstream stream is unavailable")
 	}
-	return c.host.emit(streamID, append([]byte(nil), payload...))
+	return c.host.emit(streamID, payload)
 }
 
 func (c hostClient) closeDownstreamStream(streamID, message string) {

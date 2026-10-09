@@ -135,17 +135,19 @@ func (s *Server) importAccount(name string, body []byte) (string, error) {
 		}
 	}
 	a.timeRefresh = auth.NextRefreshAfter
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	previous := s.accounts[name]
+	s.mu.Unlock()
 	if previous != nil {
 		previous.mu.Lock()
-		defer previous.mu.Unlock()
 		a.epoch = previous.epoch + 1
 		if a.identity == previous.identity {
 			a.guard = previous.guard
 			a.quota = previous.quota
 		}
+		previous.mu.Unlock()
 	} else if rawState, readErr := os.ReadFile(s.statePath(name)); readErr == nil {
 		var state accountState
 		if json.Unmarshal(rawState, &state) != nil || len(state.Identity) != 64 {
@@ -162,20 +164,30 @@ func (s *Server) importAccount(name string, body []byte) (string, error) {
 	if err = atomicWrite(filepath.Join(s.authDir, name), body); err != nil {
 		return "", err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.accounts[name] != previous {
+		return "", fmt.Errorf("account changed during import")
+	}
 	if previous != nil {
+		previous.mu.Lock()
 		previous.deleted = true
+		previous.epoch++
+		previous.mu.Unlock()
 	}
 
 	s.accounts[name] = a
 	return name, nil
 }
 func (s *Server) statePath(id string) string { return filepath.Join(s.dataDir, "state", id) }
-func (s *Server) saveState(a *account) error {
-	raw, err := json.Marshal(accountState{a.identity, a.guard, a.quota})
+func (s *Server) saveStateSnapshot(id string, state accountState) error {
+	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return atomicWrite(s.statePath(a.auth.ID), raw)
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	return atomicWrite(s.statePath(id), raw)
 }
 func (s *Server) listAccounts() []accountView {
 	s.mu.Lock()
@@ -251,19 +263,19 @@ func (s *Server) refresh(ctx context.Context, a *account, force bool) error {
 		refreshCtx, cancel := context.WithTimeout(s.upstreamContext(ctx, a), 60*time.Second)
 		next, err := s.engine.Refresh(refreshCtx, auth)
 		cancel()
+		if err == nil {
+			err = s.persistAuth(a, next)
+		}
 		a.mu.Lock()
 		if !a.deleted && a.epoch == epoch {
 			if err == nil {
-				err = s.persistAuthLocked(a, next)
-				if err == nil {
-					a.timeRefresh = next.NextRefreshAfter
-					if a.timeRefresh.IsZero() {
-						a.timeRefresh = time.Now().Add(15 * time.Minute)
-					}
-					if a.cooldownKind == "auth" {
-						a.cooldown = time.Time{}
-						a.cooldownKind = ""
-					}
+				a.timeRefresh = next.NextRefreshAfter
+				if a.timeRefresh.IsZero() {
+					a.timeRefresh = time.Now().Add(15 * time.Minute)
+				}
+				if a.cooldownKind == "auth" {
+					a.cooldown = time.Time{}
+					a.cooldownKind = ""
 				}
 			}
 			if err != nil {
@@ -312,6 +324,8 @@ func (s *Server) checkQuota(ctx context.Context, a *account) error {
 		quota, err := s.engine.Quota(quotaCtx, auth)
 		cancel()
 		now := time.Now().UTC()
+		var state accountState
+		save := false
 		a.mu.Lock()
 		if !a.deleted && a.epoch == epoch {
 			a.nextQuota = now.Add(time.Minute)
@@ -337,15 +351,25 @@ func (s *Server) checkQuota(ctx context.Context, a *account) error {
 				}
 				quota.ObservedAt = now
 				a.quota = quota
-				if saveErr := s.saveState(a); saveErr != nil {
-					err = saveErr
-					a.guard.Blocked = true
-					a.guard.Reason = "budget_state_write_failed"
-				}
+				state = accountState{Identity: a.identity, Guard: a.guard, Quota: a.quota}
+				save = true
 			} else {
 				a.quota.Stale = true
 			}
 		}
+		a.mu.Unlock()
+		if save {
+			if saveErr := s.saveStateSnapshot(a.id, state); saveErr != nil {
+				a.mu.Lock()
+				if !a.deleted && a.epoch == epoch {
+					a.guard.Blocked = true
+					a.guard.Reason = "budget_state_write_failed"
+				}
+				a.mu.Unlock()
+				err = saveErr
+			}
+		}
+		a.mu.Lock()
 		a.quotaFlight = nil
 		close(done)
 		a.mu.Unlock()
@@ -407,28 +431,43 @@ func (s *Server) updateAccount(id string, disabled *bool, priority *int) error {
 		return fmt.Errorf("account not found")
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.deleted {
+		a.mu.Unlock()
 		return fmt.Errorf("account removed")
 	}
-	oldDisabled, oldPriority := a.disabled, a.priority
-	oldDisabledRaw, oldPriorityRaw := a.raw["disabled"], a.raw["priority"]
+	epoch := a.epoch
+	nextRaw := make(map[string]any, len(a.raw)+2)
+	for key, value := range a.raw {
+		nextRaw[key] = value
+	}
+	nextDisabled := a.disabled
+	nextPriority := a.priority
 	if disabled != nil {
-		a.disabled = *disabled
-		a.raw["disabled"] = *disabled
+		nextDisabled = *disabled
+		nextRaw["disabled"] = *disabled
 	}
 	if priority != nil {
-		a.priority = *priority
-		a.raw["priority"] = *priority
+		nextPriority = *priority
+		nextRaw["priority"] = *priority
 	}
-	body, _ := json.Marshal(a.raw)
-	if err := atomicWrite(filepath.Join(s.authDir, id), body); err != nil {
-		a.disabled = oldDisabled
-		a.priority = oldPriority
-		a.raw["disabled"] = oldDisabledRaw
-		a.raw["priority"] = oldPriorityRaw
+	a.mu.Unlock()
+	body, err := json.Marshal(nextRaw)
+	if err != nil {
+		return fmt.Errorf("cannot encode account update")
+	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	if err = atomicWrite(filepath.Join(s.authDir, id), body); err != nil {
 		return err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deleted || a.epoch != epoch {
+		return fmt.Errorf("account changed during update")
+	}
+	a.disabled = nextDisabled
+	a.priority = nextPriority
+	a.raw = nextRaw
 	return nil
 }
 func (s *Server) deleteAccount(id string) error {
@@ -436,15 +475,29 @@ func (s *Server) deleteAccount(id string) error {
 		return fmt.Errorf("invalid account")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	a := s.accounts[id]
+	s.mu.Unlock()
 	if a == nil {
 		return fmt.Errorf("account not found")
 	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	if a.deleted {
+		a.mu.Unlock()
+		return fmt.Errorf("account removed")
+	}
+	epoch := a.epoch
+	a.mu.Unlock()
 	if err := os.Remove(filepath.Join(s.authDir, id)); err != nil {
 		return fmt.Errorf("cannot delete credential")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if s.accounts[id] != a || a.deleted || a.epoch != epoch {
+		return fmt.Errorf("account changed during delete")
 	}
 	a.deleted = true
 	a.epoch++
@@ -484,13 +537,22 @@ func (s *Server) loadAccounts() error {
 	return nil
 }
 
-// persistAuthLocked commits provider updates while preserving user-owned controls.
-func (s *Server) persistAuthLocked(a *account, next contract.AuthData) error {
+// persistAuth commits provider updates outside account locks while preserving
+// user-owned controls and rejecting credential replacement races.
+func (s *Server) persistAuth(a *account, next contract.AuthData) error {
+	a.mu.Lock()
+	if a.deleted {
+		a.mu.Unlock()
+		return fmt.Errorf("account removed")
+	}
+	epoch := a.epoch
 	raw := map[string]any{}
 	if json.Unmarshal(next.StorageJSON, &raw) != nil {
+		a.mu.Unlock()
 		return fmt.Errorf("invalid credential update")
 	}
 	if identity(raw) != a.identity {
+		a.mu.Unlock()
 		return fmt.Errorf("credential identity changed unexpectedly")
 	}
 	for _, key := range []string{"priority", "disabled", "proxy_url", "budget_guard_migration"} {
@@ -498,13 +560,26 @@ func (s *Server) persistAuthLocked(a *account, next contract.AuthData) error {
 			raw[key] = value
 		}
 	}
-	body, _ := json.Marshal(raw)
+	fileName := a.auth.FileName
+	disabled := a.disabled
+	a.mu.Unlock()
+	body, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("cannot encode credential update")
+	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	if err := atomicWrite(filepath.Join(s.authDir, a.id), body); err != nil {
 		return err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deleted || a.epoch != epoch {
+		return fmt.Errorf("account changed during credential update")
+	}
 	next.ID = a.id
-	next.FileName = a.auth.FileName
-	next.Disabled = a.disabled
+	next.FileName = fileName
+	next.Disabled = disabled
 	a.auth = next
 	a.raw = raw
 	if fetched, ok := raw["models_fetched_at"].(float64); ok && fetched > 0 {
@@ -551,12 +626,12 @@ func (s *Server) catalog(ctx context.Context, a *account, force bool) error {
 		queryCtx, cancel := context.WithTimeout(s.upstreamContext(ctx, a), 30*time.Second)
 		result, err := s.engine.Catalog(queryCtx, auth)
 		cancel()
+		if err == nil && len(result.AuthUpdate.StorageJSON) > 0 {
+			err = s.persistAuth(a, result.AuthUpdate)
+		}
 		a.mu.Lock()
 		if !a.deleted && a.epoch == epoch {
 			a.nextModels = time.Now().Add(max(time.Minute, s.modelTTL))
-			if err == nil && len(result.AuthUpdate.StorageJSON) > 0 {
-				err = s.persistAuthLocked(a, result.AuthUpdate)
-			}
 		}
 		a.refreshFlight = nil
 		close(done)

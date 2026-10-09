@@ -1,11 +1,12 @@
-// Package translator converts the three supported client protocols. It has no
-// provider registration, credential handling, or dynamic extension mechanism.
+// Package translator converts the supported client protocols. Its transform
+// table contains compile-time builtins only and has no dynamic extension path.
 package translator
 
 import (
 	"context"
+	"sync/atomic"
+
 	"github.com/tidwall/sjson"
-	"sync"
 )
 
 type Format string
@@ -20,7 +21,14 @@ const (
 	FormatCodex          Format = "codex"
 )
 
-type RequestTransform func(string, []byte, bool) []byte
+type ModelCapabilities struct {
+	MaxOutputTokens  int64
+	AdaptiveThinking bool
+	ThinkingLevels   []string
+}
+
+type RequestTransform func(string, ModelCapabilities, []byte, bool) []byte
+type RequestTransformWithoutCapabilities func(string, []byte, bool) []byte
 type ResponseStreamTransform func(context.Context, string, []byte, []byte, []byte, *any) [][]byte
 type ResponseNonStreamTransform func(context.Context, string, []byte, []byte, []byte, *any) []byte
 type ResponseTokenCountTransform func(context.Context, int64) []byte
@@ -35,19 +43,31 @@ type transform struct {
 	response ResponseTransform
 }
 
-var mu sync.RWMutex
-var transforms = map[pair]transform{}
-
-func Register(from, to Format, request RequestTransform, response ResponseTransform) {
-	mu.Lock()
-	defer mu.Unlock()
-	transforms[pair{from, to}] = transform{request, response}
+func AdaptRequestTransform(fn RequestTransformWithoutCapabilities) RequestTransform {
+	return func(model string, _ ModelCapabilities, body []byte, stream bool) []byte {
+		return fn(model, body, stream)
+	}
 }
-func Unregister(from, to Format) { mu.Lock(); defer mu.Unlock(); delete(transforms, pair{from, to}) }
+
+var transforms atomic.Pointer[map[pair]transform]
+
+func RegisterBuiltin(from, to Format, request RequestTransform, response ResponseTransform) {
+	previous := transforms.Load()
+	next := make(map[pair]transform)
+	if previous != nil {
+		for key, value := range *previous {
+			next[key] = value
+		}
+	}
+	next[pair{from, to}] = transform{request, response}
+	transforms.Store(&next)
+}
 func lookup(from, to Format) transform {
-	mu.RLock()
-	defer mu.RUnlock()
-	return transforms[pair{from, to}]
+	table := transforms.Load()
+	if table == nil {
+		return transform{}
+	}
+	return (*table)[pair{from, to}]
 }
 func HasRequestTransformer(from, to Format) bool { return lookup(from, to).request != nil }
 func HasResponseTransformer(from, to Format) bool {
@@ -59,9 +79,9 @@ func HasStreamResponseTransformer(from, to Format) bool {
 func HasNonStreamResponseTransformer(from, to Format) bool {
 	return lookup(from, to).response.NonStream != nil
 }
-func TranslateRequest(from, to Format, model string, body []byte, stream bool) []byte {
+func TranslateRequest(from, to Format, model string, capabilities ModelCapabilities, body []byte, stream bool) []byte {
 	if f := lookup(from, to).request; f != nil {
-		return f(model, body, stream)
+		return f(model, capabilities, body, stream)
 	}
 	out, err := sjson.SetBytes(body, "model", model)
 	if err != nil {

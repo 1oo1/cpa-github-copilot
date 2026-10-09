@@ -147,7 +147,7 @@ func (s *service) modelsForAuthRequest(ctx context.Context, callbackID string, r
 		"model_count":    len(models),
 		"model_ids":      storedModelIDs(models),
 	})
-	response := contract.ModelResponse{Provider: providerIdentifier, Models: modelInfos(models)}
+	response := contract.ModelResponse{Models: modelInfos(models)}
 	if storageChanged {
 		response.AuthUpdate = authDataFromStorage(storage, authDataDefaults{
 			ID:         req.AuthID,

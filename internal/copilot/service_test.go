@@ -1,10 +1,14 @@
 package copilot
 
-import "testing"
+import (
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 	service := newService(nil)
-	if errConfigure := service.configure(mustJSON(t, lifecycleRequest{ConfigYAML: []byte("enabled: true\npriority: 1\n")})); errConfigure != nil {
+	if errConfigure := service.configureSettings(defaultSettings()); errConfigure != nil {
 		t.Fatal(errConfigure)
 	}
 	config := service.loadedConfig()
@@ -13,9 +17,39 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 		t.Fatalf("default config = %#v", config)
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {
-		errConfigure := service.configure(mustJSON(t, lifecycleRequest{ConfigYAML: []byte("github_host: \"" + host + "\"\n")}))
+		cfg := defaultSettings()
+		cfg.GitHubHost = host
+		errConfigure := service.configureSettings(cfg)
 		if errConfigure == nil {
 			t.Fatalf("unsafe host %q was accepted", host)
 		}
+	}
+}
+
+func TestSettingsYAMLKeysDecodeOverDefaults(t *testing.T) {
+	cfg := defaultSettings()
+	raw := "client_id: synthetic-client\n" +
+		"github_host: ghe.example.com\n" +
+		"enable_models: false\n" +
+		"model_cache_ttl_seconds: 42\n" +
+		"max_stream_buffer_bytes: 131072\n" +
+		"web_search_model: \"\"\n" +
+		"enable_responses_context_management: true\n"
+	if errDecode := yaml.Unmarshal([]byte(raw), &cfg); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	want := settings{
+		ClientID: "synthetic-client", GitHubHost: "ghe.example.com", EnableModels: false, ModelCacheTTL: 42,
+		MaxStreamBytes: 131072, WebSearchModel: "", EnableResponsesContextManagement: true,
+	}
+	if cfg != want {
+		t.Fatalf("decoded settings = %#v, want %#v", cfg, want)
+	}
+	service := newService(nil)
+	if errConfigure := service.configureSettings(cfg); errConfigure != nil {
+		t.Fatal(errConfigure)
+	}
+	if got := service.loadedConfig(); got.WebSearchModel != "" || got.GitHubHost != "ghe.example.com" || got.ModelCacheTTL != 42 {
+		t.Fatalf("configured settings = %#v", got)
 	}
 }

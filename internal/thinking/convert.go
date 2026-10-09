@@ -2,8 +2,6 @@ package thinking
 
 import (
 	"strings"
-
-	"github.com/1oo1/cpa-github-copilot/internal/registry"
 )
 
 // levelToBudgetMap defines the standard Level → Budget mapping.
@@ -130,54 +128,5 @@ func MapToClaudeEffort(level string, supportsMax bool) (string, bool) {
 		return "high", true
 	default:
 		return "", false
-	}
-}
-
-// ModelCapability describes the thinking format support of a model.
-type ModelCapability int
-
-const (
-	// CapabilityUnknown indicates modelInfo is nil (passthrough behavior, internal use).
-	CapabilityUnknown ModelCapability = iota - 1
-	// CapabilityNone indicates model doesn't support thinking (Thinking is nil).
-	CapabilityNone
-	// CapabilityBudgetOnly indicates the model supports numeric budgets only.
-	CapabilityBudgetOnly
-	// CapabilityLevelOnly indicates the model supports discrete levels only.
-	CapabilityLevelOnly
-	// CapabilityHybrid indicates the model supports both budgets and levels.
-	CapabilityHybrid
-)
-
-// detectModelCapability determines the thinking format capability of a model.
-//
-// This is an internal function used by validation and conversion helpers.
-// It analyzes the model's ThinkingSupport configuration to classify the model:
-//   - CapabilityNone: modelInfo.Thinking is nil (model doesn't support thinking)
-//   - CapabilityBudgetOnly: Has Min/Max but no Levels (Claude, Gemini 2.5)
-//   - CapabilityLevelOnly: Has Levels but no Min/Max (OpenAI, Codex, Kimi)
-//   - CapabilityHybrid: Has both Min/Max and Levels (Gemini 3)
-//
-// Note: Returns a special sentinel value when modelInfo itself is nil (unknown model).
-func detectModelCapability(modelInfo *registry.ModelInfo) ModelCapability {
-	if modelInfo == nil {
-		return CapabilityUnknown // sentinel for "passthrough" behavior
-	}
-	if modelInfo.Thinking == nil {
-		return CapabilityNone
-	}
-	support := modelInfo.Thinking
-	hasBudget := support.Min > 0 || support.Max > 0
-	hasLevels := len(support.Levels) > 0
-
-	switch {
-	case hasBudget && hasLevels:
-		return CapabilityHybrid
-	case hasBudget:
-		return CapabilityBudgetOnly
-	case hasLevels:
-		return CapabilityLevelOnly
-	default:
-		return CapabilityNone
 	}
 }

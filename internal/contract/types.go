@@ -3,7 +3,6 @@ package contract
 import (
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -65,18 +64,12 @@ type ThinkingSupport struct {
 
 // AuthData describes a Copilot provider auth record exchanged with the service.
 type AuthData struct {
-	// Provider is the provider key associated with the auth.
-	Provider string
 	// ID is the stable service auth identifier.
 	ID string
 	// FileName is the source or persisted auth file name.
 	FileName string
 	// Label is the user-facing auth label.
 	Label string
-	// Prefix is the configured model prefix for this auth.
-	Prefix string
-	// ProxyURL is the auth-specific proxy URL when configured.
-	ProxyURL string
 	// Disabled reports whether the auth should be skipped.
 	Disabled bool
 	// StorageJSON contains provider-owned persisted auth data.
@@ -91,10 +84,6 @@ type AuthData struct {
 
 // AuthParseRequest describes auth material offered to a provider parser.
 type AuthParseRequest struct {
-	// Provider is the provider key being parsed.
-	Provider string
-	// Path is the source path of the auth material when available.
-	Path string
 	// FileName is the auth file name.
 	FileName string
 	// RawJSON contains the raw auth file payload.
@@ -107,25 +96,13 @@ type AuthParseResponse struct {
 	Handled bool
 	// Auth is the parsed auth record when Handled is true.
 	Auth AuthData
-	// Auths contains multiple parsed auth records when one auth material expands into several runtime auths.
-	Auths []AuthData
 }
 
 // AuthLoginStartRequest asks a provider to start a provider login flow.
-type AuthLoginStartRequest struct {
-	// Provider is the provider key for the login flow.
-	Provider string
-	// BaseURL is the service callback or login base URL.
-	BaseURL string
-
-	// Metadata carries provider-defined login context.
-	Metadata map[string]any
-}
+type AuthLoginStartRequest struct{}
 
 // AuthLoginStartResponse returns login flow state for polling.
 type AuthLoginStartResponse struct {
-	// Provider is the provider key for the login flow.
-	Provider string
 	// URL is the user-facing login URL.
 	URL string
 	// State is the opaque provider login state used for polling.
@@ -138,13 +115,8 @@ type AuthLoginStartResponse struct {
 
 // AuthLoginPollRequest asks a provider to poll a provider login flow.
 type AuthLoginPollRequest struct {
-	// Provider is the provider key for the login flow.
-	Provider string
 	// State is the opaque provider login state returned by StartLogin.
 	State string
-
-	// Metadata carries provider-defined polling context.
-	Metadata map[string]any
 }
 
 // AuthLoginStatus describes the current provider login state.
@@ -167,16 +139,12 @@ type AuthLoginPollResponse struct {
 	Message string
 	// Auth is the completed auth record when Status is success.
 	Auth AuthData
-	// Auths contains multiple completed auth records when one login flow expands into several runtime auths.
-	Auths []AuthData
 }
 
 // AuthRefreshRequest asks a provider to refresh provider auth data.
 type AuthRefreshRequest struct {
 	// AuthID identifies the auth record to refresh.
 	AuthID string
-	// AuthProvider identifies the credential provider.
-	AuthProvider string
 	// StorageJSON contains provider-owned persisted auth data.
 	StorageJSON []byte
 	// Metadata contains mutable service-managed auth metadata.
@@ -195,11 +163,8 @@ type AuthRefreshResponse struct {
 
 // AuthModelRequest carries auth context for provider model discovery.
 type AuthModelRequest struct {
-
 	// AuthID identifies the auth record used for discovery.
 	AuthID string
-	// AuthProvider identifies the credential provider.
-	AuthProvider string
 	// StorageJSON contains provider-owned persisted auth data.
 	StorageJSON []byte
 	// Metadata contains mutable service-managed auth metadata.
@@ -210,8 +175,6 @@ type AuthModelRequest struct {
 
 // ModelResponse returns provider and model metadata discovered by a provider.
 type ModelResponse struct {
-	// Provider is the provider key associated with the returned models.
-	Provider string
 	// Models is the complete set of discovered provider models.
 	Models []ModelInfo
 	// AuthUpdate contains updated auth data from model discovery when needed.
@@ -256,8 +219,6 @@ type HTTPResponse struct {
 type ExecutorHTTPRequest struct {
 	// AuthID identifies the selected credential.
 	AuthID string
-	// AuthProvider identifies the credential provider.
-	AuthProvider string
 	// Method is the HTTP method.
 	Method string
 	// URL is the absolute upstream URL.
@@ -268,10 +229,6 @@ type ExecutorHTTPRequest struct {
 	Body []byte
 	// StorageJSON contains provider-owned auth storage for this concrete auth.
 	StorageJSON []byte
-	// Metadata contains mutable service-managed auth metadata.
-	Metadata map[string]any
-	// Attributes contains immutable routing and provider attributes.
-	Attributes map[string]string
 }
 
 // ExecutorHTTPResponse describes an executor-owned HTTP response.
@@ -288,8 +245,6 @@ type ExecutorHTTPResponse struct {
 type ExecutorRequest struct {
 	// AuthID identifies the selected credential.
 	AuthID string
-	// AuthProvider identifies the credential provider.
-	AuthProvider string
 	// Model is the requested model identifier.
 	Model string
 	// Format is the target request or response protocol format.
@@ -300,22 +255,14 @@ type ExecutorRequest struct {
 	Alt string
 	// Headers contains request headers passed to the executor.
 	Headers http.Header
-	// Query contains request query parameters passed to the executor.
-	Query url.Values
 	// OriginalRequest contains the raw client request body.
 	OriginalRequest []byte
 	// SourceFormat is the original client protocol format.
 	SourceFormat string
 	// Payload contains the translated provider payload.
 	Payload []byte
-	// Metadata is an extension bag for service and provider coordination data.
-	Metadata map[string]any
 	// StorageJSON contains provider-owned auth storage for this concrete auth.
 	StorageJSON []byte
-	// AuthMetadata contains mutable service-managed auth metadata.
-	AuthMetadata map[string]any
-	// AuthAttributes contains immutable routing and provider attributes.
-	AuthAttributes map[string]string
 }
 
 // ExecutorResponse returns a non-streaming executor result.
@@ -330,18 +277,12 @@ type ExecutorResponse struct {
 
 // QuotaFetchRequest carries credential context for querying quota.
 type QuotaFetchRequest struct {
-	// AuthIndex identifies the credential index.
-	AuthIndex string `json:"auth_index"`
 	// AuthID identifies the credential ID.
 	AuthID string `json:"auth_id"`
 	// Provider identifies the credential provider.
 	Provider string `json:"provider"`
 	// StorageJSON contains provider-owned persisted auth data.
 	StorageJSON []byte `json:"storage_json,omitempty"`
-	// Metadata contains mutable service-managed auth metadata.
-	Metadata map[string]any `json:"metadata,omitempty"`
-	// Attributes contains immutable routing and provider attributes.
-	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 // QuotaSubscription describes plan and tier information in normalized quota.

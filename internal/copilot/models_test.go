@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -51,21 +52,17 @@ func TestKnownCopilotModelsMatchPolicyEnableCatalog(t *testing.T) {
 
 func TestEnableKnownModelsUsesCurrentAPIIdentity(t *testing.T) {
 	var calls atomic.Int64
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Errorf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
-		headers := http.Header(req.Headers)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
+		headers := req.Headers
 		if !strings.HasSuffix(req.URL, "/policy") || headers.Get("Authorization") != "Bearer session" ||
 			headers.Get("X-GitHub-Api-Version") != copilotAPIVersion {
 			t.Errorf("policy request = %#v", req)
 		}
 		calls.Add(1)
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
-	service.enableKnownModels(testHostClient(bridge), copilotStorage{
+	})
+	service := newService(fake)
+	service.enableKnownModels(testHostClient(fake), copilotStorage{
 		CopilotSessionToken: "session",
 		GitHubHost:          "github.com",
 	})
@@ -182,11 +179,11 @@ func TestCachedRouteUsesStoredMetadataWithoutModelNameOverrides(t *testing.T) {
 }
 
 func TestModelsForAuthUsesFreshCredentialCache(t *testing.T) {
-	bridge := &fakeBridge{handler: func(method string, _ any) (any, error) {
-		t.Fatalf("unexpected host call %s", method)
-		return nil, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
+	fake := newFakeHost(t, func(call hostHTTPCall) (contract.HTTPResponse, error) {
+		t.Fatalf("unexpected host HTTP call %s %s", call.Method, call.URL)
+		return contract.HTTPResponse{}, nil
+	})
+	service := newService(fake)
 	service.now = func() time.Time { return time.Unix(30_000, 0).UTC() }
 	storage := copilotStorage{
 		Type:                providerIdentifier,
@@ -196,11 +193,10 @@ func TestModelsForAuthUsesFreshCredentialCache(t *testing.T) {
 		ModelsFetchedAt:     service.now().UnixMilli(),
 		Models:              []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
 	}
-	raw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)}}))
+	result, errModels := service.modelsForAuthRequest(context.Background(), "", contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)})
 	if errModels != nil {
 		t.Fatal(errModels)
 	}
-	result := decodeEnvelopeResult[contract.ModelResponse](t, raw)
 	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" || len(result.AuthUpdate.StorageJSON) != 0 {
 		t.Fatalf("model response = %#v", result)
 	}
@@ -210,44 +206,39 @@ func TestModelsForAuthUsesFreshCredentialCache(t *testing.T) {
 }
 
 func TestModelsForAuthFallsBackToStaleNonEmptyCache(t *testing.T) {
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if !strings.HasSuffix(req.URL, "/models") {
 			t.Fatalf("URL = %s", req.URL)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusServiceUnavailable}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
+	})
+	service := newService(fake)
 	service.now = func() time.Time { return time.Unix(40_000, 0).UTC() }
 	storage := copilotStorage{
 		Type: providerIdentifier, GitHubAccessToken: "ghu", CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost: "github.com", ModelsFetchedAt: service.now().Add(-time.Hour).UnixMilli(),
 		Models: []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
 	}
-	raw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)}, HostCallbackID: "models"}))
+	result, errModels := service.modelsForAuthRequest(context.Background(), "models", contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)})
 	if errModels != nil {
 		t.Fatal(errModels)
 	}
-	result := decodeEnvelopeResult[contract.ModelResponse](t, raw)
 	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" {
 		t.Fatalf("fallback response = %#v", result)
 	}
-	logEntry := findLogEvent(t, bridge.snapshotLogs(), "models.discovery.fallback")
+	logEntry := findLogEvent(t, fake.snapshotLogs(), "models.discovery.fallback")
 	if logEntry.Fields["failure_code"] != "model_discovery_http_error" || logEntry.Fields["cached_model_count"] != 1 {
 		t.Fatalf("fallback log fields = %#v", logEntry.Fields)
 	}
-	assertLogsExclude(t, bridge.snapshotLogs(), storage.GitHubAccessToken, storage.CopilotSessionToken)
+	assertLogsExclude(t, fake.snapshotLogs(), storage.GitHubAccessToken, storage.CopilotSessionToken)
 }
 
 func TestDiscoverModelsAcceptsValidEmptyCatalog(t *testing.T) {
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"data":[]}`)}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
-	models, failure := service.discoverModels(testHostClient(bridge), copilotStorage{
+	})
+	service := newService(fake)
+	models, failure := service.discoverModels(testHostClient(fake), copilotStorage{
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
@@ -262,11 +253,11 @@ func TestDiscoverModelsFallsBackToEnabledPoliciesForIndividualAccounts(t *testin
 		remoteModelFixture("disabled", false, "disabled", true, []string{"/chat/completions"}),
 		remoteModelFixture("no-tools", false, "enabled", false, []string{"/chat/completions"}),
 	}})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
-	models, failure := service.discoverModels(testHostClient(bridge), copilotStorage{
+	})
+	service := newService(fake)
+	models, failure := service.discoverModels(testHostClient(fake), copilotStorage{
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
@@ -280,11 +271,11 @@ func TestDiscoverModelsIncludesEnabledPoliciesAlongsidePickerCatalogForIndividua
 		remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"}),
 		remoteModelFixture("gpt-5.6-terra", false, "enabled", true, []string{"/responses"}),
 	}})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
-	models, failure := service.discoverModels(testHostClient(bridge), copilotStorage{
+	})
+	service := newService(fake)
+	models, failure := service.discoverModels(testHostClient(fake), copilotStorage{
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
@@ -297,11 +288,11 @@ func TestDiscoverModelsKeepsStrictPickerSemanticsForBusinessAccounts(t *testing.
 	raw := mustJSON(t, map[string]any{"data": []any{
 		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
 	}})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
-	models, failure := service.discoverModels(testHostClient(bridge), copilotStorage{
+	})
+	service := newService(fake)
+	models, failure := service.discoverModels(testHostClient(fake), copilotStorage{
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.business.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
@@ -454,21 +445,20 @@ func TestModelsForAuthPropagatesCapabilitiesFromDiscoveryToRoute(t *testing.T) {
 		models = append(models, model)
 	}
 	raw := mustJSON(t, map[string]any{"data": models})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
+	})
+	service := newService(fake)
 	service.now = func() time.Time { return time.Unix(120_000, 0).UTC() }
 	storage := copilotStorage{
 		Type:                providerIdentifier,
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	}
-	responseRaw, errModels := service.modelsForAuth(mustJSON(t, localAuthModelRequest{AuthModelRequest: contract.AuthModelRequest{AuthID: "auth-caps", StorageJSON: mustJSON(t, storage)}}))
+	result, errModels := service.modelsForAuthRequest(context.Background(), "", contract.AuthModelRequest{AuthID: "auth-caps", StorageJSON: mustJSON(t, storage)})
 	if errModels != nil {
 		t.Fatal(errModels)
 	}
-	result := decodeEnvelopeResult[contract.ModelResponse](t, responseRaw)
 	if len(result.AuthUpdate.StorageJSON) == 0 {
 		t.Fatal("model discovery did not return persisted storage")
 	}

@@ -236,29 +236,30 @@ func (s *Server) managementRoutes() http.Handler {
 				return
 			}
 		}
+		s.persistMu.Lock()
+		defer s.persistMu.Unlock()
 		s.mu.Lock()
-		old := s.cfg
+		next := s.cfg
+		s.mu.Unlock()
 		if req.Proxy != nil {
-			s.cfg.ProxyURL = *req.Proxy
+			next.ProxyURL = *req.Proxy
 		}
 		if req.Routing != nil {
-			s.cfg.Routing = *req.Routing
+			next.Routing = *req.Routing
 		}
 		if req.Affinity != nil {
-			s.cfg.SessionAffinity = *req.Affinity
+			next.SessionAffinity = *req.Affinity
 		}
 		if ttl != 0 {
-			s.cfg.SessionAffinityTTL = ttl
+			next.SessionAffinityTTL = ttl
 		}
-		err := s.saveConfigLocked()
-		if err != nil {
-			s.cfg = old
-		}
-		s.mu.Unlock()
-		if err != nil {
+		if err := s.saveConfigSnapshot(next); err != nil {
 			apiError(w, 500, "save_failed", "cannot save configuration")
 			return
 		}
+		s.mu.Lock()
+		s.cfg = next
+		s.mu.Unlock()
 		respond(w, 200, map[string]bool{"ok": true})
 	})
 	mux.HandleFunc("GET /v0/management/api-keys", func(w http.ResponseWriter, r *http.Request) {
@@ -273,26 +274,28 @@ func (s *Server) managementRoutes() http.Handler {
 	})
 	mux.HandleFunc("POST /v0/management/api-keys", func(w http.ResponseWriter, r *http.Request) {
 		key := secret()
+		s.persistMu.Lock()
+		defer s.persistMu.Unlock()
 		s.mu.Lock()
-		old := append([]string(nil), s.cfg.APIKeys...)
-		s.cfg.APIKeys = append(s.cfg.APIKeys, key)
-		err := s.saveConfigLocked()
-		if err != nil {
-			s.cfg.APIKeys = old
-		}
+		next := append(append([]string(nil), s.cfg.APIKeys...), key)
 		s.mu.Unlock()
-		if err != nil {
+		cfg := s.configSnapshotWithAPIKeys(next)
+		if err := s.saveConfigSnapshot(cfg); err != nil {
 			apiError(w, 500, "save_failed", "cannot save API key")
 			return
 		}
+		s.mu.Lock()
+		s.cfg = cfg
+		s.mu.Unlock()
 		respond(w, 200, map[string]string{"key": key})
 	})
 	mux.HandleFunc("DELETE /v0/management/api-keys", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
+		s.persistMu.Lock()
+		defer s.persistMu.Unlock()
 		s.mu.Lock()
-		old := s.cfg.APIKeys
 		next := []string{}
-		for _, key := range old {
+		for _, key := range s.cfg.APIKeys {
 			if identity(map[string]any{"github_access_token": key}) != id {
 				next = append(next, key)
 			}
@@ -302,16 +305,15 @@ func (s *Server) managementRoutes() http.Handler {
 			apiError(w, 400, "last_key", "cannot delete the last API key")
 			return
 		}
-		s.cfg.APIKeys = next
-		err := s.saveConfigLocked()
-		if err != nil {
-			s.cfg.APIKeys = old
-		}
 		s.mu.Unlock()
-		if err != nil {
+		cfg := s.configSnapshotWithAPIKeys(next)
+		if err := s.saveConfigSnapshot(cfg); err != nil {
 			apiError(w, 500, "save_failed", "cannot save API keys")
 			return
 		}
+		s.mu.Lock()
+		s.cfg = cfg
+		s.mu.Unlock()
 		respond(w, 200, map[string]bool{"ok": true})
 	})
 	return mux
@@ -366,8 +368,9 @@ func (s *Server) ImportDirectory(dir string) (int, error) {
 			a := s.account(entry.Name())
 			a.mu.Lock()
 			a.guard = guard
-			err = s.saveState(a)
+			state := accountState{Identity: a.identity, Guard: a.guard, Quota: a.quota}
 			a.mu.Unlock()
+			err = s.saveStateSnapshot(entry.Name(), state)
 			if err != nil {
 				return count, err
 			}

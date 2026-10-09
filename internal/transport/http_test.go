@@ -39,7 +39,7 @@ func TestTransportPreservesHeadersAndRejectsRedirects(t *testing.T) {
 	defer client.Close()
 	httpClient := server.Client()
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	client.clients[""] = httpClient
+	client.defaultClient = httpClient
 	headers := http.Header{"Authorization": {"Bearer synthetic-token"}}
 	response, err := client.Do(context.Background(), contract.HTTPRequest{Method: "GET", URL: server.URL, Headers: headers})
 	if err != nil {

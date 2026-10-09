@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/1oo1/cpa-github-copilot/internal/conversion/common"
-	"github.com/1oo1/cpa-github-copilot/internal/registry"
+	translator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 	"github.com/1oo1/cpa-github-copilot/internal/thinking"
 	"github.com/1oo1/cpa-github-copilot/internal/util"
 	"github.com/tidwall/gjson"
@@ -34,16 +34,20 @@ import (
 // Returns:
 //   - []byte: The transformed request data in Claude Code API format
 func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
-	return convertOpenAIRequestToClaude(modelName, inputRawJSON, stream, false)
+	return convertOpenAIRequestToClaude(modelName, translator.ModelCapabilities{}, inputRawJSON, stream, false)
+}
+
+func ConvertOpenAIRequestToClaudeWithCapabilities(modelName string, capabilities translator.ModelCapabilities, inputRawJSON []byte, stream bool) []byte {
+	return convertOpenAIRequestToClaude(modelName, capabilities, inputRawJSON, stream, false)
 }
 
 // ConvertOpenAIRequestToClaudeWithCompat preserves assistant reasoning content
 // as an unsigned thinking block for configured compatibility endpoints.
 func ConvertOpenAIRequestToClaudeWithCompat(modelName string, inputRawJSON []byte, stream bool) []byte {
-	return convertOpenAIRequestToClaude(modelName, inputRawJSON, stream, true)
+	return convertOpenAIRequestToClaude(modelName, translator.ModelCapabilities{}, inputRawJSON, stream, true)
 }
 
-func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
+func convertOpenAIRequestToClaude(modelName string, capabilities translator.ModelCapabilities, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
 	rawJSON := inputRawJSON
 
 	userID := common.DeriveClaudeUserID(rawJSON)
@@ -58,9 +62,8 @@ func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream,
 	if v := root.Get("reasoning_effort"); v.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(v.String()))
 		if effort != "" {
-			mi := registry.LookupModelInfo(modelName, "claude")
-			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
-			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
+			supportsAdaptive := capabilities.AdaptiveThinking && len(capabilities.ThinkingLevels) > 0
+			supportsMax := supportsAdaptive && thinking.HasLevel(capabilities.ThinkingLevels, string(thinking.LevelMax))
 
 			// Claude 4.6 supports adaptive thinking with output_config.effort.
 			// MapToClaudeEffort normalizes levels (e.g. minimal→low, xhigh→high) to avoid
@@ -110,7 +113,11 @@ func convertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream,
 	// OpenAI Chat Completions deprecated max_tokens in favor of
 	// max_completion_tokens, so accept either spelling.
 	if maxTokens := firstExisting(root.Get("max_tokens"), root.Get("max_completion_tokens")); maxTokens.Exists() {
-		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
+		value := maxTokens.Int()
+		if capabilities.MaxOutputTokens > 0 && value > capabilities.MaxOutputTokens {
+			value = capabilities.MaxOutputTokens
+		}
+		out, _ = sjson.SetBytes(out, "max_tokens", value)
 	}
 
 	// Top P setting for nucleus sampling.

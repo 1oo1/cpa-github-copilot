@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,26 +13,21 @@ import (
 	sdktranslator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 )
 
-func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
+func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(50_000, 0).UTC() }
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-4.1", Format: formatOpenAI})
-	bridge := &fakeBridge{}
-	bridge.handler = func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
-		if req.HostCallbackID != "callback-execute" || req.URL != "https://api.individual.githubcopilot.com/chat/completions" {
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
+		if req.CallbackID != "callback-execute" || req.URL != "https://api.individual.githubcopilot.com/chat/completions" {
 			t.Fatalf("upstream request = %#v", req)
 		}
-		if got := http.Header(req.Headers).Get("Authorization"); got != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
+		if got := req.Headers.Get("Authorization"); got != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
 			t.Fatalf("Authorization = %q", got)
 		}
-		if got := http.Header(req.Headers).Get("X-Initiator"); got != "user" {
+		if got := req.Headers.Get("X-Initiator"); got != "user" {
 			t.Fatalf("X-Initiator = %q", got)
 		}
-		if headers := http.Header(req.Headers); headers.Get("User-Agent") != copilotUserAgent || headers.Get("Editor-Version") != copilotEditorVersion {
+		if headers := req.Headers; headers.Get("User-Agent") != copilotUserAgent || headers.Get("Editor-Version") != copilotEditorVersion {
 			t.Fatalf("versioned identity headers = %#v", headers)
 		}
 		var body map[string]any
@@ -43,26 +39,22 @@ func TestExecuteUsesHostBridgeAndCopilotHeaders(t *testing.T) {
 			Headers:    http.Header{"Content-Type": []string{"application/json"}, "X-GitHub-Request-Id": []string{"request-1"}, "x-copilot-service-request-id": []string{"synthetic-service-1"}},
 			Body:       []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`),
 		}, nil
-	}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	payload := []byte(`{"model":"github-copilot/gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
-	raw, errExecute := service.execute(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID:          "auth-1",
-			Model:           "github-copilot/gpt-4.1",
-			Format:          formatOpenAI,
-			SourceFormat:    formatOpenAI,
-			OriginalRequest: payload,
-			Payload:         payload,
-			StorageJSON:     mustJSON(t, storage),
-			Headers:         http.Header{"Authorization": []string{"Bearer frontend-secret"}},
-		},
-		HostCallbackID: "callback-execute",
-	}))
+	result, errExecute := service.executeRequest(context.Background(), "callback-execute", contract.ExecutorRequest{
+		AuthID:          "auth-1",
+		Model:           "github-copilot/gpt-4.1",
+		Format:          formatOpenAI,
+		SourceFormat:    formatOpenAI,
+		OriginalRequest: payload,
+		Payload:         payload,
+		StorageJSON:     mustJSON(t, storage),
+		Headers:         http.Header{"Authorization": []string{"Bearer frontend-secret"}},
+	})
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
-	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-1" {
 		t.Fatalf("executor result = %#v", result)
 	}
@@ -72,12 +64,7 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(60_000, 0).UTC() }
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
-	bridge := &fakeBridge{}
-	bridge.handler = func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if !strings.HasSuffix(req.URL, "/responses") {
 			t.Fatalf("URL = %s", req.URL)
 		}
@@ -97,20 +84,16 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 			"output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"translated hello","annotations":[]}]}],
 			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
 		}`)}, nil
-	}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
-	raw, errExecute := service.execute(mustJSON(t, localExecutorRequest{
-		ExecutorRequest: contract.ExecutorRequest{
-			AuthID: "auth-1", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
-			OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
-		},
-		HostCallbackID: "callback-responses",
-	}))
+	result, errExecute := service.executeRequest(context.Background(), "callback-responses", contract.ExecutorRequest{
+		AuthID: "auth-1", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
+	})
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
-	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	var completion map[string]any
 	if errDecode := json.Unmarshal(result.Payload, &completion); errDecode != nil {
 		t.Fatalf("decode translated completion: %v; payload=%s", errDecode, result.Payload)
@@ -125,25 +108,25 @@ func TestExecuteRejectsFailedResponsesBeforeChatTranslation(t *testing.T) {
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(65_000, 0).UTC() }
 	storage := executorStorage(service.now(), storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{
 			"id":"resp_failed","object":"response","status":"failed",
 			"error":{"code":"server_error","message":"` + sentinel + `"}
 		}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
-	_, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
+	_, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
 		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || failure.(*serviceError).code != "upstream_response_failed" {
 		t.Fatalf("failure = %#v", failure)
 	}
 	if strings.Contains(failure.Error(), sentinel) {
 		t.Fatalf("failure leaked upstream body: %v", failure)
 	}
-	assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+	assertLogsExclude(t, fake.snapshotLogs(), sentinel)
 }
 
 func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) {
@@ -175,17 +158,17 @@ func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Unix(66_000, 0).UTC()
-			bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+			fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 				return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(test.body)}, nil
-			}}
-			service := newService(newLegacyRuntime(bridge))
+			})
+			service := newService(fake)
 			service.now = func() time.Time { return now }
 			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`)
-			raw, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
+			result, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
 				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 				OriginalRequest: payload, Payload: payload,
 				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
-			}}))
+			})
 			if test.wantFailure != "" {
 				if failure == nil || failure.(*serviceError).code != test.wantFailure {
 					t.Fatalf("failure = %#v", failure)
@@ -195,7 +178,6 @@ func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) 
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 			if string(result.Payload) != test.body {
 				t.Fatalf("native terminal payload changed: got=%s want=%s", result.Payload, test.body)
 			}
@@ -262,14 +244,14 @@ func TestExecuteRejectsTranslatedSourceErrorsBeforeResponsesConversion(t *testin
 		{name: "claude", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, body: `{"type":"error","error":{"type":"api_error","message":"` + sentinel + `"}}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, failure, bridge := executeSourceResponseAsResponses(t, test.model, test.upstreamFormat, []byte(test.body))
+			_, failure, fake := executeSourceResponseAsResponses(t, test.model, test.upstreamFormat, []byte(test.body))
 			if failure == nil || failure.(*serviceError).code != "upstream_response_failed" {
 				t.Fatalf("failure = %#v", failure)
 			}
 			if strings.Contains(failure.Error(), sentinel) {
 				t.Fatalf("failure leaked upstream body: %v", failure)
 			}
-			assertLogsExclude(t, bridge.snapshotLogs(), sentinel)
+			assertLogsExclude(t, fake.snapshotLogs(), sentinel)
 		})
 	}
 }
@@ -310,11 +292,10 @@ func TestExecuteTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, failure, _ := executeSourceResponseAsResponses(t, test.model, test.upstreamFormat, []byte(test.body))
+			result, failure, _ := executeSourceResponseAsResponses(t, test.model, test.upstreamFormat, []byte(test.body))
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 			var response map[string]any
 			if errDecode := json.Unmarshal(result.Payload, &response); errDecode != nil {
 				t.Fatalf("decode translated response: %v; payload=%s", errDecode, result.Payload)
@@ -344,11 +325,10 @@ func TestExecuteTranslatedClaudeNonStreamPreservesStructuredContent(t *testing.T
 		"stop_reason":"tool_use","stop_sequence":null,
 		"usage":{"input_tokens":7,"output_tokens":5}
 	}`)
-	raw, failure, _ := executeSourceResponseAsResponses(t, "claude-sonnet-4.6", formatClaude, body)
+	result, failure, _ := executeSourceResponseAsResponses(t, "claude-sonnet-4.6", formatClaude, body)
 	if failure != nil {
 		t.Fatal(failure)
 	}
-	result := decodeEnvelopeResult[contract.ExecutorResponse](t, raw)
 	var response struct {
 		Status string `json:"status"`
 		Output []struct {
@@ -379,21 +359,21 @@ func TestExecuteTranslatedClaudeNonStreamPreservesStructuredContent(t *testing.T
 	}
 }
 
-func executeSourceResponseAsResponses(t *testing.T, model, upstreamFormat string, upstreamBody []byte) ([]byte, error, *fakeBridge) {
+func executeSourceResponseAsResponses(t *testing.T, model, upstreamFormat string, upstreamBody []byte) (contract.ExecutorResponse, error, *fakeHost) {
 	t.Helper()
 	now := time.Unix(67_000, 0).UTC()
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: upstreamBody}, nil
-	}}
-	service := newService(newLegacyRuntime(bridge))
+	})
+	service := newService(fake)
 	service.now = func() time.Time { return now }
 	payload := []byte(`{"model":"` + model + `","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
-	raw, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
+	result, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
 		AuthID: "auth", Model: model, Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		OriginalRequest: payload, Payload: payload,
 		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: model, Format: upstreamFormat})),
-	}}))
-	return raw, failure, bridge
+	})
+	return result, failure, fake
 }
 
 func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
@@ -475,7 +455,7 @@ func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 	standalone := `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
 	for _, test := range []struct {
 		name       string
-		config     string
+		configure  func(*settings)
 		models     []storedModel
 		payload    string
 		wantCode   string
@@ -493,7 +473,7 @@ func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 			wantCode: "unsupported_feature",
 		},
 		{
-			name: "disabled route fails closed", config: `web_search_model: ""`, models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			name: "disabled route fails closed", configure: func(cfg *settings) { cfg.WebSearchModel = "" }, models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
 			payload: standalone, wantCode: "unsupported_feature",
 		},
 		{
@@ -508,8 +488,10 @@ func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			service := newService(nil)
 			service.now = func() time.Time { return now }
-			if test.config != "" {
-				if errConfigure := service.configure(mustJSON(t, lifecycleRequest{ConfigYAML: []byte(test.config)})); errConfigure != nil {
+			if test.configure != nil {
+				cfg := defaultSettings()
+				test.configure(&cfg)
+				if errConfigure := service.configureSettings(cfg); errConfigure != nil {
 					t.Fatal(errConfigure)
 				}
 			}
@@ -581,8 +563,106 @@ func TestPrepareInferencePreservesNativeAnthropicXHighEffort(t *testing.T) {
 	}
 	thinking, _ := upstream["thinking"].(map[string]any)
 	outputConfig, _ := upstream["output_config"].(map[string]any)
-	if thinking["type"] != "adaptive" || outputConfig["effort"] != "xhigh" {
+	if thinking["type"] != "adaptive" || outputConfig["effort"] != "max" {
 		t.Fatalf("upstream payload = %s", prepared.upstreamPayload)
+	}
+}
+
+func TestPrepareInferenceForwardsCatalogCapabilitiesToRequestTranslation(t *testing.T) {
+	service := newService(nil)
+	now := time.Unix(72_500, 0).UTC()
+	service.now = func() time.Time { return now }
+	prepare := func(t *testing.T, payload string, model storedModel) map[string]any {
+		t.Helper()
+		prepared, failure := service.prepareInference(contract.ExecutorRequest{
+			AuthID: "auth", Model: model.ID, Format: formatOpenAI, SourceFormat: formatOpenAI,
+			OriginalRequest: []byte(payload), Payload: []byte(payload),
+			StorageJSON: mustJSON(t, executorStorage(now, model)),
+		}, false)
+		if failure != nil {
+			t.Fatal(failure)
+		}
+		var upstream map[string]any
+		if errDecode := json.Unmarshal(prepared.upstreamPayload, &upstream); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		return upstream
+	}
+
+	t.Run("max output tokens clamps translated max_tokens", func(t *testing.T) {
+		upstream := prepare(t, `{
+			"model":"claude-opus-4.8",
+			"max_tokens":100000,
+			"messages":[{"role":"user","content":"hi"}]
+		}`, storedModel{ID: "claude-opus-4.8", Format: formatClaude, MaxOutputTokens: 32_000})
+		if upstream["max_tokens"] != float64(32_000) {
+			t.Fatalf("max_tokens = %#v, want 32000", upstream["max_tokens"])
+		}
+	})
+
+	t.Run("max level maps xhigh to adaptive max effort", func(t *testing.T) {
+		upstream := prepare(t, `{
+			"model":"claude-opus-4.8",
+			"reasoning_effort":"xhigh",
+			"messages":[{"role":"user","content":"hi"}]
+		}`, storedModel{
+			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
+		})
+		thinking, _ := upstream["thinking"].(map[string]any)
+		outputConfig, _ := upstream["output_config"].(map[string]any)
+		if thinking["type"] != "adaptive" || outputConfig["effort"] != "max" {
+			t.Fatalf("upstream thinking = %#v output_config = %#v", upstream["thinking"], upstream["output_config"])
+		}
+	})
+
+	t.Run("without max level xhigh downgrades to high", func(t *testing.T) {
+		upstream := prepare(t, `{
+			"model":"claude-opus-4.8",
+			"reasoning_effort":"xhigh",
+			"messages":[{"role":"user","content":"hi"}]
+		}`, storedModel{
+			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ReasoningLevels: []string{"low", "medium", "high", "xhigh"}, ReasoningLevelsDeclared: true,
+		})
+		thinking, _ := upstream["thinking"].(map[string]any)
+		outputConfig, _ := upstream["output_config"].(map[string]any)
+		if thinking["type"] != "adaptive" || outputConfig["effort"] != "high" {
+			t.Fatalf("upstream thinking = %#v output_config = %#v", upstream["thinking"], upstream["output_config"])
+		}
+	})
+}
+
+func TestPrepareInferenceKeepsNativeClaudeXHighEffort(t *testing.T) {
+	service := newService(nil)
+	now := time.Unix(72_800, 0).UTC()
+	service.now = func() time.Time { return now }
+	payload := []byte(`{
+		"model":"claude-opus-4.8",
+		"max_tokens":64000,
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"xhigh"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	prepared, failure := service.prepareInference(contract.ExecutorRequest{
+		AuthID: "auth", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
+		OriginalRequest: payload, Payload: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
+		})),
+	}, false)
+	if failure != nil {
+		t.Fatal(failure)
+	}
+	var upstream map[string]any
+	if errDecode := json.Unmarshal(prepared.upstreamPayload, &upstream); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	thinking, _ := upstream["thinking"].(map[string]any)
+	outputConfig, _ := upstream["output_config"].(map[string]any)
+	if thinking["type"] != "adaptive" || outputConfig["effort"] != "xhigh" {
+		t.Fatalf("native Claude effort was rewritten: %s", prepared.upstreamPayload)
 	}
 }
 
@@ -999,23 +1079,23 @@ func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	now := time.Unix(80_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(sentinel)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
-	_, failure := service.execute(mustJSON(t, localExecutorRequest{ExecutorRequest: contract.ExecutorRequest{
+	_, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
 		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || strings.Contains(failure.Error(), sentinel) || strings.Contains(failure.Error(), storage.CopilotSessionToken) {
 		t.Fatalf("failure = %v", failure)
 	}
-	pluginErr := failure.(*serviceError)
-	if pluginErr.httpStatus != http.StatusForbidden {
-		t.Fatalf("HTTP status = %d", pluginErr.httpStatus)
+	serviceErr := failure.(*serviceError)
+	if serviceErr.httpStatus != http.StatusForbidden {
+		t.Fatalf("HTTP status = %d", serviceErr.httpStatus)
 	}
-	assertLogsExclude(t, bridge.snapshotLogs(), sentinel, storage.CopilotSessionToken)
+	assertLogsExclude(t, fake.snapshotLogs(), sentinel, storage.CopilotSessionToken)
 }
 
 func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {
@@ -1023,18 +1103,18 @@ func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {
 	now := time.Unix(90_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL: "https://attacker.example/collect", Method: http.MethodPost, Body: []byte(`{"model":"gpt-4.1"}`), StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || failure.(*serviceError).httpStatus != http.StatusBadRequest {
 		t.Fatalf("failure = %#v", failure)
 	}
-	if len(bridge.snapshot()) != 0 {
-		t.Fatal("blocked cross-origin request reached host bridge")
+	if len(fake.snapshot()) != 0 {
+		t.Fatal("blocked cross-origin request reached host runtime")
 	}
 }
 
@@ -1043,21 +1123,21 @@ func TestExecuteHTTPRequestRejectsResponsesCompactWithoutHostCall(t *testing.T) 
 	now := time.Unix(91_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/responses/compact",
 		Method:      http.MethodPost,
 		Body:        []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || failure.(*serviceError).code != "unsupported_feature" {
 		t.Fatalf("failure = %#v", failure)
 	}
-	if len(bridge.snapshot()) != 0 {
-		t.Fatal("unsupported compact request reached host bridge")
+	if len(fake.snapshot()) != 0 {
+		t.Fatal("unsupported compact request reached host runtime")
 	}
 }
 
@@ -1066,25 +1146,25 @@ func TestExecuteHTTPRequestRejectsInferenceNonPOSTWithoutHostCall(t *testing.T) 
 	now := time.Unix(91_500, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	for _, method := range []string{http.MethodGet, "post", " POST ", ""} {
 		t.Run(method, func(t *testing.T) {
-			_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+			_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				URL:         "https://api.individual.githubcopilot.com/responses",
 				Method:      method,
 				Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
 				StorageJSON: mustJSON(t, storage),
-			}}))
+			})
 			if failure == nil || failure.(*serviceError).code != "invalid_request" {
 				t.Fatalf("failure = %#v", failure)
 			}
 		})
 	}
-	if len(bridge.snapshot()) != 0 {
-		t.Fatal("non-POST inference request reached host bridge")
+	if len(fake.snapshot()) != 0 {
+		t.Fatal("non-POST inference request reached host runtime")
 	}
 }
 
@@ -1093,10 +1173,10 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 	now := time.Unix(91_750, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
-	bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	for _, endpoint := range []string{
 		"/responses/.",
 		"/responses/",
@@ -1110,28 +1190,28 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 		"/messages",
 	} {
 		t.Run(endpoint, func(t *testing.T) {
-			_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+			_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				URL:         "https://api.individual.githubcopilot.com" + endpoint,
 				Method:      http.MethodPost,
 				Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
 				StorageJSON: mustJSON(t, storage),
-			}}))
+			})
 			if failure == nil || failure.(*serviceError).code != "invalid_request" {
 				t.Fatalf("failure = %#v", failure)
 			}
 		})
 	}
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://API.INDIVIDUAL.GITHUBCOPILOT.COM/responses",
 		Method:      http.MethodPost,
 		Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || failure.(*serviceError).code != "invalid_request" {
 		t.Fatalf("equivalent but non-exact inference URL failure = %#v", failure)
 	}
-	if len(bridge.snapshot()) != 0 {
-		t.Fatal("noncanonical inference request reached host bridge")
+	if len(fake.snapshot()) != 0 {
+		t.Fatal("noncanonical inference request reached host runtime")
 	}
 }
 
@@ -1144,24 +1224,20 @@ func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 		ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4", MaxPromptTokens: 100_000,
 	})
 	var upstreamBody map[string]any
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if errDecode := json.Unmarshal(req.Body, &upstreamBody); errDecode != nil {
 			t.Fatalf("decode upstream body: %v", errDecode)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"resp-1","object":"response","status":"completed","output":[]}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		AuthID:      "auth",
 		URL:         "https://api.individual.githubcopilot.com/responses",
 		Method:      http.MethodPost,
 		Body:        []byte(`{"model":"gpt-5.4","store":true,"input":[{"role":"user","content":"hi"}]}`),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1207,17 +1283,17 @@ func TestExecuteHTTPRequestNativeResponsesRequiresTerminalStatus(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Unix(92_500, 0).UTC()
 			storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
-			bridge := &fakeBridge{handler: func(_ string, _ any) (any, error) {
+			fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 				return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(test.body)}, nil
-			}}
-			service := newService(newLegacyRuntime(bridge))
+			})
+			service := newService(fake)
 			service.now = func() time.Time { return now }
 			requestBody := fmt.Sprintf(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}],"stream":%t}`, test.stream)
-			raw, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+			result, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				AuthID: "auth", URL: individualCopilotAPIURL + "/responses", Method: http.MethodPost,
 				Body:        []byte(requestBody),
 				StorageJSON: mustJSON(t, storage),
-			}}))
+			})
 			if test.wantFailure != "" {
 				if failure == nil || failure.(*serviceError).code != test.wantFailure {
 					t.Fatalf("failure = %#v", failure)
@@ -1227,7 +1303,6 @@ func TestExecuteHTTPRequestNativeResponsesRequiresTerminalStatus(t *testing.T) {
 			if failure != nil {
 				t.Fatal(failure)
 			}
-			result := decodeEnvelopeResult[contract.ExecutorHTTPResponse](t, raw)
 			if string(result.Body) != test.body {
 				t.Fatalf("native HTTP terminal payload changed: got=%s want=%s", result.Body, test.body)
 			}
@@ -1241,19 +1316,18 @@ func TestExecuteHTTPRequestAppliesChatBodyPolicy(t *testing.T) {
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
 	var upstreamBody map[string]any
-	bridge := &fakeBridge{handler: func(_ string, payload any) (any, error) {
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if errDecode := json.Unmarshal(req.Body, &upstreamBody); errDecode != nil {
 			t.Fatalf("decode upstream body: %v", errDecode)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		AuthID: "auth", URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
 		Body:        []byte(`{"model":"gpt-4.1","store":true,"reasoning_effort":"high","messages":[{"role":"developer","content":"rules"}]}`),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1275,20 +1349,19 @@ func TestExecuteHTTPRequestPreservesSameOriginNonInferenceRequest(t *testing.T) 
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now)
 	const requestBody = "not-json"
-	bridge := &fakeBridge{handler: func(_ string, payload any) (any, error) {
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if req.Method != http.MethodGet || req.URL != "https://api.individual.githubcopilot.com/models?editor=vscode" || string(req.Body) != requestBody {
 			t.Fatalf("non-inference request = %#v", req)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[]}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/models?editor=vscode",
 		Method:      http.MethodGet,
 		Body:        []byte(requestBody),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1300,20 +1373,19 @@ func TestExecuteHTTPRequestPreservesClaudeBodyOnSameOriginNonInferenceRequest(t 
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
 	const requestBody = `{ "model":"claude-haiku-4.5", "max_tokens":0, "tools":[{"name":"lookup","eager_input_streaming":true}] }`
-	bridge := &fakeBridge{handler: func(_ string, payload any) (any, error) {
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if string(req.Body) != requestBody {
 			t.Fatalf("non-inference Claude body changed: got=%s want=%s", req.Body, requestBody)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/models?editor=vscode",
 		Method:      http.MethodGet,
 		Body:        []byte(requestBody),
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1324,11 +1396,7 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	now := time.Unix(95_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		var body map[string]any
 		if errDecode := json.Unmarshal(req.Body, &body); errDecode != nil {
 			t.Fatalf("decode upstream body: %v", errDecode)
@@ -1339,25 +1407,25 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 		}
 		tool := tools[0].(map[string]any)
 		if _, exists := tool["eager_input_streaming"]; exists {
-			t.Fatalf("eager_input_streaming reached HTTP bridge: %#v", tool)
+			t.Fatalf("eager_input_streaming reached HTTP fake: %#v", tool)
 		}
-		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != interleavedThinkingBeta {
+		if beta := req.Headers.Get("Anthropic-Beta"); beta != interleavedThinkingBeta {
 			t.Fatalf("Anthropic-Beta = %q", beta)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	body := []byte(`{
 		"model":"claude-haiku-4.5",
 		"messages":[{"role":"user","content":"Use the tool"}],
 		"tools":[{"name":"lookup","eager_input_streaming":true,"input_schema":{"type":"object"}}]
 	}`)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/v1/messages",
 		Method:      http.MethodPost,
 		Body:        body,
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1371,12 +1439,8 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 		ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
 		ReasoningLevels: []string{"low", "medium", "high"}, ReasoningLevelsDeclared: true,
 	})
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
-		if headers := http.Header(req.Headers); headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
+		if headers := req.Headers; headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
 			headers.Get("Authorization") != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
 			t.Fatalf("upstream headers = %#v", headers)
 		}
@@ -1389,11 +1453,11 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 			t.Fatalf("thinking = %#v", thinking)
 		}
 		if _, exists := body["temperature"]; exists {
-			t.Fatalf("temperature reached HTTP bridge: %#v", body)
+			t.Fatalf("temperature reached HTTP fake: %#v", body)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
+	})
+	service.host = fake
 	body := []byte(`{
 		"model":"claude-opus-4.8",
 		"max_tokens":32000,
@@ -1401,12 +1465,12 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 		"temperature":0.7,
 		"thinking":{"type":"enabled","budget_tokens":16384}
 	}`)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/v1/messages",
 		Method:      http.MethodPost,
 		Body:        body,
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1430,11 +1494,7 @@ func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 		"output_config":{"effort":"xhigh"},
 		"context_management":{"edits":[]}
 	}`)
-	bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-		if method != legacyMethodHostHTTPDo {
-			t.Fatalf("method = %s", method)
-		}
-		req := payload.(localHostHTTPRequest)
+	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		var upstream map[string]any
 		if errDecode := json.Unmarshal(req.Body, &upstream); errDecode != nil {
 			t.Fatalf("decode upstream body: %v", errDecode)
@@ -1452,19 +1512,19 @@ func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 			t.Fatalf("eager input streaming was invented: %#v", tool)
 		}
 		// 任意 caller beta 不透传；只按动态 context-editing capability 生成已知 beta。
-		if beta := http.Header(req.Headers).Get("Anthropic-Beta"); beta != contextManagementBeta {
+		if beta := req.Headers.Get("Anthropic-Beta"); beta != contextManagementBeta {
 			t.Fatalf("Anthropic-Beta = %q", beta)
 		}
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/v1/messages",
 		Method:      http.MethodPost,
 		Headers:     http.Header{"Anthropic-Beta": []string{"feature-one", "feature-two"}},
 		Body:        body,
 		StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -1542,20 +1602,20 @@ func TestExecuteHTTPRequestRejectsUnsupportedStreamingBody(t *testing.T) {
 	service.now = func() time.Time { return now }
 	falseValue := false
 	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI, Streaming: &falseValue})
-	bridge := &fakeBridge{handler: func(method string, _ any) (any, error) {
-		t.Fatalf("unexpected host call %s", method)
-		return nil, nil
-	}}
-	service.host = newLegacyRuntime(bridge)
-	_, failure := service.executeHTTPRequest(mustJSON(t, localExecutorHTTPRequest{ExecutorHTTPRequest: contract.ExecutorHTTPRequest{
+	fake := newFakeHost(t, func(call hostHTTPCall) (contract.HTTPResponse, error) {
+		t.Fatalf("unexpected host HTTP call %s %s", call.Method, call.URL)
+		return contract.HTTPResponse{}, nil
+	})
+	service.host = fake
+	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
 		Body: []byte(`{"model":"gpt-4.1","stream":true,"messages":[]}`), StorageJSON: mustJSON(t, storage),
-	}}))
+	})
 	if failure == nil || failure.(*serviceError).code != "unsupported_feature" {
 		t.Fatalf("failure = %#v", failure)
 	}
-	if len(bridge.snapshot()) != 0 {
-		t.Fatal("unsupported raw stream request reached host bridge")
+	if len(fake.snapshot()) != 0 {
+		t.Fatal("unsupported raw stream request reached host runtime")
 	}
 }
 

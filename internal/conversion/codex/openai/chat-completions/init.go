@@ -2,16 +2,15 @@ package chat_completions
 
 import (
 	. "github.com/1oo1/cpa-github-copilot/internal/constant"
-	"github.com/1oo1/cpa-github-copilot/internal/conversion/registry"
-	"github.com/1oo1/cpa-github-copilot/internal/interfaces"
+	"github.com/1oo1/cpa-github-copilot/internal/protocol"
 )
 
 func init() {
-	translator.Register(
+	translator.RegisterBuiltin(
 		OpenAI,
 		Codex,
-		ConvertOpenAIRequestToCodex,
-		interfaces.TranslateResponse{
+		translator.AdaptRequestTransform(ConvertOpenAIRequestToCodex),
+		translator.ResponseTransform{
 			Stream:    ConvertCodexResponseToOpenAI,
 			NonStream: ConvertCodexResponseToOpenAINonStream,
 		},

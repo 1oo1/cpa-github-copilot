@@ -3,10 +3,10 @@ package responses
 import (
 	"encoding/base64"
 	"fmt"
-	"github.com/1oo1/cpa-github-copilot/internal/registry"
 	"strings"
 	"testing"
 
+	translator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 	sigcompat "github.com/1oo1/cpa-github-copilot/internal/signature"
 	"github.com/tidwall/gjson"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -44,8 +44,7 @@ func TestConvertOpenAIResponsesRequestToClaude_SanitizesToolCallIDsForClaude(t *
 }
 
 func TestConvertOpenAIResponsesRequestToClaude_FableMaxTokens(t *testing.T) {
-	registry.SetModel(&registry.ModelInfo{ID: "claude-3-5-haiku-20241022", MaxCompletionTokens: 8192})
-	t.Cleanup(func() { registry.RemoveModel("claude-3-5-haiku-20241022") })
+	haikuCapabilities := translator.ModelCapabilities{MaxOutputTokens: 8192}
 	t.Run("defaults to 64k", func(t *testing.T) {
 		out := ConvertOpenAIResponsesRequestToClaude(
 			"claude-fable-5-1",
@@ -69,8 +68,9 @@ func TestConvertOpenAIResponsesRequestToClaude_FableMaxTokens(t *testing.T) {
 	})
 
 	t.Run("does not exceed registered model maximum", func(t *testing.T) {
-		out := ConvertOpenAIResponsesRequestToClaude(
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities(
 			"claude-3-5-haiku-20241022",
+			haikuCapabilities,
 			[]byte(`{"model":"claude-3-5-haiku-20241022","input":"hello"}`),
 			true,
 		)
@@ -80,8 +80,9 @@ func TestConvertOpenAIResponsesRequestToClaude_FableMaxTokens(t *testing.T) {
 	})
 
 	t.Run("clamps explicit limit exceeding registered model maximum", func(t *testing.T) {
-		out := ConvertOpenAIResponsesRequestToClaude(
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities(
 			"claude-3-5-haiku-20241022",
+			haikuCapabilities,
 			[]byte(`{"model":"claude-3-5-haiku-20241022","max_output_tokens":128000,"input":"hello"}`),
 			true,
 		)
@@ -100,6 +101,107 @@ func TestConvertOpenAIResponsesRequestToClaude_FableMaxTokens(t *testing.T) {
 			t.Fatalf("max_tokens = %d, want 64000; output=%s", got, out)
 		}
 	})
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeWithCapabilities_AdaptiveThinking(t *testing.T) {
+	body := func(effort string) []byte {
+		return []byte(`{"model":"claude-opus-4.8","reasoning":{"effort":"` + effort + `"},"input":"hello"}`)
+	}
+	withMax := translator.ModelCapabilities{
+		MaxOutputTokens:  64000,
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high", "xhigh", "max"},
+	}
+	withoutMax := translator.ModelCapabilities{
+		MaxOutputTokens:  64000,
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high"},
+	}
+
+	t.Run("xhigh maps to max when max level is supported", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities("claude-opus-4.8", withMax, body("xhigh"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+			t.Fatalf("thinking.type = %q, want adaptive; output=%s", got, out)
+		}
+		if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+			t.Fatalf("output_config.effort = %q, want max; output=%s", got, out)
+		}
+		if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+			t.Fatalf("adaptive thinking must not carry budget_tokens; output=%s", out)
+		}
+	})
+
+	t.Run("xhigh downgrades to high without max level", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities("claude-opus-4.8", withoutMax, body("xhigh"), false)
+		if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+			t.Fatalf("output_config.effort = %q, want high; output=%s", got, out)
+		}
+	})
+
+	t.Run("none disables thinking", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities("claude-opus-4.8", withMax, body("none"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+			t.Fatalf("thinking.type = %q, want disabled; output=%s", got, out)
+		}
+		if gjson.GetBytes(out, "output_config.effort").Exists() {
+			t.Fatalf("output_config.effort must be absent; output=%s", out)
+		}
+	})
+
+	t.Run("without adaptive capability uses budget thinking", func(t *testing.T) {
+		out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities("claude-opus-4.8", translator.ModelCapabilities{}, body("high"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+			t.Fatalf("thinking.type = %q, want enabled; output=%s", got, out)
+		}
+		if gjson.GetBytes(out, "output_config.effort").Exists() {
+			t.Fatalf("output_config.effort must be absent; output=%s", out)
+		}
+	})
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeWithCapabilities_ClampsMaxOutputTokens(t *testing.T) {
+	capabilities := translator.ModelCapabilities{MaxOutputTokens: 4096}
+	out := ConvertOpenAIResponsesRequestToClaudeWithCapabilities(
+		"claude-test", capabilities,
+		[]byte(`{"model":"claude-test","max_output_tokens":100000,"input":"hello"}`), false,
+	)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 4096 {
+		t.Fatalf("max_tokens = %d, want 4096; output=%s", got, out)
+	}
+	out = ConvertOpenAIResponsesRequestToClaudeWithCapabilities(
+		"claude-test", capabilities,
+		[]byte(`{"model":"claude-test","max_output_tokens":1000,"input":"hello"}`), false,
+	)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 1000 {
+		t.Fatalf("max_tokens = %d, want 1000; output=%s", got, out)
+	}
+}
+
+func TestTranslateRequestOpenAIResponsesToClaudeForwardsModelCapabilities(t *testing.T) {
+	capabilities := translator.ModelCapabilities{
+		MaxOutputTokens:  4096,
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high", "xhigh", "max"},
+	}
+	raw := []byte(`{"model":"claude-test","max_output_tokens":100000,"reasoning":{"effort":"xhigh"},"input":"hello"}`)
+	out := translator.TranslateRequest(translator.FormatOpenAIResponse, translator.FormatClaude, "claude-test", capabilities, raw, false)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 4096 {
+		t.Fatalf("max_tokens = %d, want 4096; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+		t.Fatalf("output_config.effort = %q, want max; output=%s", got, out)
+	}
+
+	out = translator.TranslateRequest(translator.FormatOpenAIResponse, translator.FormatClaude, "claude-test", translator.ModelCapabilities{}, raw, false)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 100000 {
+		t.Fatalf("max_tokens without capabilities = %d, want 100000; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type without capabilities = %q, want enabled; output=%s", got, out)
+	}
 }
 
 func TestConvertOpenAIResponsesRequestToClaude_ReasoningItemToThinkingBlock(t *testing.T) {

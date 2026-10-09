@@ -1,6 +1,7 @@
 package copilot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -76,19 +77,15 @@ func TestQuotaFreeAndUnlimited(t *testing.T) {
 func TestQuotaHostTransportAndRedaction(t *testing.T) {
 	for _, status := range []int{200, 401, 403, 429, 500} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
-			bridge := &fakeBridge{handler: func(method string, payload any) (any, error) {
-				if method != legacyMethodHostHTTPDo {
-					t.Fatal(method)
-				}
-				req := payload.(localHostHTTPRequest)
-				if req.URL != "https://api.github.com/copilot_internal/user" || req.Headers["Authorization"][0] != "Bearer secret-github" || req.HostCallbackID != "quota-context" {
+			fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
+				if req.URL != "https://api.github.com/copilot_internal/user" || req.Headers["Authorization"][0] != "Bearer secret-github" || req.CallbackID != "quota-context" {
 					t.Fatal("invalid quota wire")
 				}
 				return contract.HTTPResponse{StatusCode: status, Headers: http.Header{"Retry-After": {"120"}}, Body: []byte(`{"copilot_plan":"individual_max","secret":"secret-upstream"}`)}, nil
-			}}
-			service := newService(newLegacyRuntime(bridge))
-			req, _ := json.Marshal(localQuotaFetchRequest{QuotaFetchRequest: contract.QuotaFetchRequest{Provider: providerIdentifier, StorageJSON: []byte(`{"type":"github-copilot","github_access_token":"secret-github"}`)}, HostCallbackID: "quota-context"})
-			raw, err := service.fetchQuota(req)
+			})
+			service := newService(fake)
+			response, err := service.fetchQuotaRequest(context.Background(), "quota-context", contract.QuotaFetchRequest{Provider: providerIdentifier, StorageJSON: []byte(`{"type":"github-copilot","github_access_token":"secret-github"}`)})
+			raw, _ := json.Marshal(response)
 			if strings.Contains(string(raw), "secret") || err != nil && strings.Contains(err.Error(), "secret") {
 				t.Fatal("secret surfaced")
 			}
@@ -106,10 +103,9 @@ func TestQuotaHostTransportAndRedaction(t *testing.T) {
 
 func TestQuotaRejectsUnsafeHostAndMalformedResponse(t *testing.T) {
 	for _, host := range []string{"https://evil.example/path", "127.0.0.1", "github.com:8443", "unconfigured.example"} {
-		bridge := &fakeBridge{}
-		request, _ := json.Marshal(localQuotaFetchRequest{QuotaFetchRequest: contract.QuotaFetchRequest{StorageJSON: mustJSON(t, copilotStorage{Type: providerIdentifier, GitHubAccessToken: "test", GitHubHost: host})}})
-		_, err := newService(newLegacyRuntime(bridge)).fetchQuota(request)
-		if err == nil || len(bridge.calls) != 0 {
+		fake := newFakeHost(t, nil)
+		_, err := newService(fake).fetchQuotaRequest(context.Background(), "", contract.QuotaFetchRequest{StorageJSON: mustJSON(t, copilotStorage{Type: providerIdentifier, GitHubAccessToken: "test", GitHubHost: host})})
+		if err == nil || len(fake.snapshot()) != 0 {
 			t.Fatalf("unsafe host %s was dispatched", host)
 		}
 	}

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,7 @@ type Log struct {
 type Server struct {
 	modelTTL                     time.Duration
 	mu                           sync.Mutex
+	persistMu                    sync.Mutex
 	cfg                          Config
 	configPath, dataDir, authDir string
 	accounts                     map[string]*account
@@ -467,13 +469,14 @@ func (s *Server) inference(w http.ResponseWriter, r *http.Request) {
 			input = max(input, i)
 			output = max(output, o)
 			payload := chunk.Payload
-			trimmed := strings.TrimSpace(string(payload))
+			trimmed := bytes.TrimSpace(payload)
 			if format == "openai" {
-				if trimmed == "[DONE]" || trimmed == "data: [DONE]" {
+				if bytes.Equal(trimmed, []byte("[DONE]")) || bytes.Equal(trimmed, []byte("data: [DONE]")) {
 					payload = []byte("data: [DONE]\n\n")
 					sentDone = true
 				} else if json.Valid(payload) {
-					payload = append(append([]byte("data: "), payload...), []byte("\n\n")...)
+					payload = append(append(make([]byte, 0, len(payload)+7), "data: "...), payload...)
+					payload = append(payload, '\n', '\n')
 				}
 			}
 			// A client that stops reading must not pin the upstream stream and admission slot.
@@ -618,10 +621,18 @@ func (s *Server) flushUsage() {
 		s.usageMu.Unlock()
 	}
 }
-func (s *Server) saveConfigLocked() error {
-	raw, err := yaml.Marshal(s.cfg)
+func (s *Server) saveConfigSnapshot(cfg Config) error {
+	raw, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 	return atomicWrite(s.configPath, raw)
+}
+
+func (s *Server) configSnapshotWithAPIKeys(keys []string) Config {
+	s.mu.Lock()
+	cfg := s.cfg
+	s.mu.Unlock()
+	cfg.APIKeys = append([]string(nil), keys...)
+	return cfg
 }

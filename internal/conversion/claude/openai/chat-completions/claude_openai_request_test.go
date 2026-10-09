@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	translator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 	"github.com/tidwall/gjson"
 )
 
@@ -767,6 +768,134 @@ func TestConvertOpenAIRequestToClaude_MaxTokensAndMaxCompletionTokens(t *testing
 				t.Fatalf("max_tokens = %d, want %d. Output: %s", got, tc.wantLimit, string(out))
 			}
 		})
+	}
+}
+
+func TestConvertOpenAIRequestToClaudeWithCapabilities_ClampsMaxTokens(t *testing.T) {
+	tests := []struct {
+		name         string
+		capabilities translator.ModelCapabilities
+		rawJSON      string
+		want         int64
+	}{
+		{
+			name:         "max_tokens above limit is clamped",
+			capabilities: translator.ModelCapabilities{MaxOutputTokens: 4096},
+			rawJSON:      `{"messages":[{"role":"user","content":"hi"}],"max_tokens":100000}`,
+			want:         4096,
+		},
+		{
+			name:         "max_completion_tokens above limit is clamped",
+			capabilities: translator.ModelCapabilities{MaxOutputTokens: 4096},
+			rawJSON:      `{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":100000}`,
+			want:         4096,
+		},
+		{
+			name:         "max_tokens below limit is preserved",
+			capabilities: translator.ModelCapabilities{MaxOutputTokens: 4096},
+			rawJSON:      `{"messages":[{"role":"user","content":"hi"}],"max_tokens":1000}`,
+			want:         1000,
+		},
+		{
+			name:         "zero limit leaves max_tokens unchanged",
+			capabilities: translator.ModelCapabilities{},
+			rawJSON:      `{"messages":[{"role":"user","content":"hi"}],"max_tokens":100000}`,
+			want:         100000,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := ConvertOpenAIRequestToClaudeWithCapabilities("claude-test", tc.capabilities, []byte(tc.rawJSON), false)
+			if got := gjson.GetBytes(out, "max_tokens").Int(); got != tc.want {
+				t.Fatalf("max_tokens = %d, want %d. Output: %s", got, tc.want, string(out))
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIRequestToClaudeWithCapabilities_AdaptiveThinking(t *testing.T) {
+	body := func(effort string) []byte {
+		return []byte(`{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"` + effort + `"}`)
+	}
+	withMax := translator.ModelCapabilities{
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high", "xhigh", "max"},
+	}
+	withoutMax := translator.ModelCapabilities{
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high"},
+	}
+
+	t.Run("xhigh maps to max when max level is supported", func(t *testing.T) {
+		out := ConvertOpenAIRequestToClaudeWithCapabilities("claude-test", withMax, body("xhigh"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+			t.Fatalf("thinking.type = %q, want adaptive. Output: %s", got, string(out))
+		}
+		if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+			t.Fatalf("output_config.effort = %q, want max. Output: %s", got, string(out))
+		}
+		if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+			t.Fatalf("adaptive thinking must not carry budget_tokens. Output: %s", string(out))
+		}
+	})
+
+	t.Run("max downgrades to high without max level", func(t *testing.T) {
+		out := ConvertOpenAIRequestToClaudeWithCapabilities("claude-test", withoutMax, body("max"), false)
+		if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+			t.Fatalf("output_config.effort = %q, want high. Output: %s", got, string(out))
+		}
+	})
+
+	t.Run("none disables thinking", func(t *testing.T) {
+		out := ConvertOpenAIRequestToClaudeWithCapabilities("claude-test", withMax, body("none"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+			t.Fatalf("thinking.type = %q, want disabled. Output: %s", got, string(out))
+		}
+		if gjson.GetBytes(out, "output_config.effort").Exists() {
+			t.Fatalf("output_config.effort must be absent. Output: %s", string(out))
+		}
+	})
+
+	t.Run("adaptive without declared levels falls back to budget thinking", func(t *testing.T) {
+		capabilities := translator.ModelCapabilities{AdaptiveThinking: true}
+		out := ConvertOpenAIRequestToClaudeWithCapabilities("claude-test", capabilities, body("high"), false)
+		if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+			t.Fatalf("thinking.type = %q, want enabled. Output: %s", got, string(out))
+		}
+		if got := gjson.GetBytes(out, "thinking.budget_tokens").Int(); got != 24576 {
+			t.Fatalf("thinking.budget_tokens = %d, want 24576. Output: %s", got, string(out))
+		}
+		if gjson.GetBytes(out, "output_config.effort").Exists() {
+			t.Fatalf("output_config.effort must be absent. Output: %s", string(out))
+		}
+	})
+}
+
+func TestTranslateRequestOpenAIToClaudeForwardsModelCapabilities(t *testing.T) {
+	capabilities := translator.ModelCapabilities{
+		MaxOutputTokens:  4096,
+		AdaptiveThinking: true,
+		ThinkingLevels:   []string{"low", "medium", "high", "xhigh", "max"},
+	}
+	raw := []byte(`{"messages":[{"role":"user","content":"hi"}],"max_tokens":100000,"reasoning_effort":"xhigh"}`)
+	out := translator.TranslateRequest(translator.FormatOpenAI, translator.FormatClaude, "claude-test", capabilities, raw, false)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 4096 {
+		t.Fatalf("max_tokens = %d, want 4096. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+		t.Fatalf("output_config.effort = %q, want max. Output: %s", got, string(out))
+	}
+
+	out = translator.TranslateRequest(translator.FormatOpenAI, translator.FormatClaude, "claude-test", translator.ModelCapabilities{}, raw, false)
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 100000 {
+		t.Fatalf("max_tokens without capabilities = %d, want 100000. Output: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type without capabilities = %q, want enabled. Output: %s", got, string(out))
 	}
 }
 

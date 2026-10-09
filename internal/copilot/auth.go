@@ -244,7 +244,6 @@ func authDataFromStorage(storage copilotStorage, defaults authDataDefaults) cont
 	attributes["priority"] = strconv.Itoa(storage.Priority)
 	attributes[refreshCapabilityAttribute] = "true"
 	auth := contract.AuthData{
-		Provider:    providerIdentifier,
 		ID:          id,
 		FileName:    fileName,
 		Label:       label,
@@ -384,7 +383,6 @@ func (s *service) startLoginRequest(ctx context.Context, callbackID string, _ co
 		"expires_at":            expiresAt,
 	})
 	return contract.AuthLoginStartResponse{
-		Provider:  providerIdentifier,
 		URL:       verificationURLWithCode(verificationURL, strings.TrimSpace(device.UserCode)),
 		State:     state,
 		ExpiresAt: expiresAt,
