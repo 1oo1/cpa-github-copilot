@@ -30,14 +30,6 @@ type preparedInference struct {
 	grokToolRefs     map[string]grokResponsesToolRef
 }
 
-type anthropicWebSearchRequestClass uint8
-
-const (
-	anthropicWebSearchNone anthropicWebSearchRequestClass = iota
-	anthropicWebSearchOnly
-	anthropicWebSearchMixed
-)
-
 func (s *service) executeRequest(ctx context.Context, callbackID string, req contract.ExecutorRequest) (contract.ExecutorResponse, error) {
 	prepared, failure := s.prepareInference(req, false)
 	if failure != nil {
@@ -203,25 +195,6 @@ func (s *service) prepareInference(req contract.ExecutorRequest, stream bool) (p
 	if len(payload) == 0 || !json.Valid(payload) {
 		return preparedInference{}, &serviceError{code: "invalid_request", message: "GitHub Copilot request payload must be a JSON object", httpStatus: http.StatusBadRequest}
 	}
-	if inputFormat == formatClaude && route.Format == formatClaude {
-		switch classifyAnthropicServerWebSearchRequest(payload) {
-		case anthropicWebSearchMixed:
-			return preparedInference{}, &serviceError{code: "unsupported_feature", message: "GitHub Copilot can route only standalone Anthropic server web search requests", httpStatus: http.StatusBadRequest}
-		case anthropicWebSearchOnly:
-			if cfg.WebSearchModel == "" {
-				return preparedInference{}, &serviceError{code: "unsupported_feature", message: "GitHub Copilot Anthropic server web search routing is disabled", httpStatus: http.StatusBadRequest}
-			}
-			webSearchRoute := s.resolveModelRoute(req.AuthID, cfg.WebSearchModel, storage)
-			if webSearchRoute.Path == "" || webSearchRoute.Format == "" {
-				return preparedInference{}, &serviceError{code: "model_not_supported", message: "Configured GitHub Copilot web search model is unavailable", httpStatus: http.StatusBadRequest}
-			}
-			if webSearchRoute.Format != formatOpenAIResponse {
-				return preparedInference{}, &serviceError{code: "unsupported_feature", message: "Configured GitHub Copilot web search model does not use Responses", httpStatus: http.StatusBadRequest}
-			}
-			model = cfg.WebSearchModel
-			route = webSearchRoute
-		}
-	}
 	if stream && !optionalBool(route.Streaming) {
 		return preparedInference{}, &serviceError{code: "unsupported_feature", message: "GitHub Copilot model does not support streaming", httpStatus: http.StatusBadRequest}
 	}
@@ -327,7 +300,6 @@ func preparedInferenceLogFields(prepared preparedInference, stream bool) map[str
 	}
 	if requestedModel != "" && requestedModel != prepared.model {
 		fields["requested_model"] = requestedModel
-		fields["web_search_routed"] = true
 	}
 	// 只在原生 Responses 路由记录压缩诊断字段，不记录 prompt/tool 内容。
 	if prepared.upstreamFormat == formatOpenAIResponse {
@@ -878,42 +850,6 @@ func normalizeAnthropicTools(payload map[string]any) bool {
 		}
 	}
 	return changed
-}
-
-func classifyAnthropicServerWebSearchRequest(raw []byte) anthropicWebSearchRequestClass {
-	var payload struct {
-		Tools []json.RawMessage `json:"tools"`
-	}
-	if json.Unmarshal(raw, &payload) != nil || len(payload.Tools) == 0 {
-		return anthropicWebSearchNone
-	}
-	hasWebSearch := false
-	onlyWebSearch := true
-	for _, rawTool := range payload.Tools {
-		var tool struct {
-			Type string `json:"type"`
-			Name string `json:"name"`
-		}
-		if json.Unmarshal(rawTool, &tool) != nil {
-			onlyWebSearch = false
-			continue
-		}
-		if tool.Type == "web_search_20250305" || tool.Type == "web_search_20260209" {
-			hasWebSearch = true
-			if tool.Name != "web_search" {
-				onlyWebSearch = false
-			}
-			continue
-		}
-		onlyWebSearch = false
-	}
-	if !hasWebSearch {
-		return anthropicWebSearchNone
-	}
-	if onlyWebSearch {
-		return anthropicWebSearchOnly
-	}
-	return anthropicWebSearchMixed
 }
 
 func normalizeAnthropicTemperature(payload map[string]any) bool {

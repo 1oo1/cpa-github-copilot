@@ -10,19 +10,14 @@ func defaultSettings() settings {
 		GitHubHost:                       defaultGitHubHost,
 		ModelCacheTTL:                    300,
 		MaxStreamBytes:                   4 << 20,
-		WebSearchModel:                   "gpt-6-luna",
 		EnableResponsesContextManagement: false,
 	}
 }
 
 func (s *service) configureSettings(cfg settings) error {
 	cfg.ClientID = strings.TrimSpace(cfg.ClientID)
-	cfg.WebSearchModel = normalizeModelID(cfg.WebSearchModel)
 	if cfg.ClientID == "" {
 		return &serviceError{code: "invalid_config", message: "client_id is required"}
-	}
-	if cfg.WebSearchModel != "" && !IsSupportedCopilotModelID(cfg.WebSearchModel) {
-		return &serviceError{code: "invalid_config", message: "web_search_model is not supported"}
 	}
 	host, errHost := normalizeGitHubHost(cfg.GitHubHost)
 	if errHost != nil {
@@ -52,7 +47,6 @@ func (s *service) configureSettings(cfg settings) error {
 		"github_host":                         cfg.GitHubHost,
 		"model_cache_ttl_seconds":             cfg.ModelCacheTTL,
 		"max_stream_buffer_bytes":             cfg.MaxStreamBytes,
-		"web_search_model":                    cfg.WebSearchModel,
 		"enable_responses_context_management": cfg.EnableResponsesContextManagement,
 		"credential_identity_changed":         changedIdentity,
 		"discarded_login_session_count":       len(staleSessions),

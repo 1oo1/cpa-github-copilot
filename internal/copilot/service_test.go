@@ -13,13 +13,8 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 	}
 	config := service.loadedConfig()
 	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" ||
-		config.WebSearchModel != "gpt-6" || config.EnableResponsesContextManagement {
+		config.EnableResponsesContextManagement {
 		t.Fatalf("default config = %#v", config)
-	}
-	legacyWebSearch := defaultSettings()
-	legacyWebSearch.WebSearchModel = "gpt-5.6-terra"
-	if errConfigure := service.configureSettings(legacyWebSearch); errConfigure == nil {
-		t.Fatal("retired GPT web_search_model was accepted")
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {
 		cfg := defaultSettings()
@@ -37,14 +32,13 @@ func TestSettingsYAMLKeysDecodeOverDefaults(t *testing.T) {
 		"github_host: ghe.example.com\n" +
 		"model_cache_ttl_seconds: 42\n" +
 		"max_stream_buffer_bytes: 131072\n" +
-		"web_search_model: \"\"\n" +
 		"enable_responses_context_management: true\n"
 	if errDecode := yaml.Unmarshal([]byte(raw), &cfg); errDecode != nil {
 		t.Fatal(errDecode)
 	}
 	want := settings{
 		ClientID: "synthetic-client", GitHubHost: "ghe.example.com", ModelCacheTTL: 42,
-		MaxStreamBytes: 131072, WebSearchModel: "", EnableResponsesContextManagement: true,
+		MaxStreamBytes: 131072, EnableResponsesContextManagement: true,
 	}
 	if cfg != want {
 		t.Fatalf("decoded settings = %#v, want %#v", cfg, want)
@@ -53,7 +47,7 @@ func TestSettingsYAMLKeysDecodeOverDefaults(t *testing.T) {
 	if errConfigure := service.configureSettings(cfg); errConfigure != nil {
 		t.Fatal(errConfigure)
 	}
-	if got := service.loadedConfig(); got.WebSearchModel != "" || got.GitHubHost != "ghe.example.com" || got.ModelCacheTTL != 42 {
+	if got := service.loadedConfig(); got.GitHubHost != "ghe.example.com" || got.ModelCacheTTL != 42 {
 		t.Fatalf("configured settings = %#v", got)
 	}
 }

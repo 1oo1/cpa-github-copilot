@@ -10,7 +10,6 @@ import (
 	"time"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
-	sdktranslator "github.com/1oo1/cpa-github-copilot/internal/protocol"
 )
 
 func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
@@ -406,14 +405,10 @@ func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
 	}
 }
 
-func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testing.T) {
+func TestPrepareInferenceKeepsAnthropicWebSearchOnClaudeEndpoint(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(71_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now,
-		storedModel{ID: "claude-sonnet-5-1", Format: formatClaude},
-		storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6", MaxPromptTokens: 922_000},
-	)
 	payload := []byte(`{
 		"model":"claude-sonnet-5-1",
 		"max_tokens":64000,
@@ -423,14 +418,16 @@ func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testin
 	}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
 		AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
-		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
+		OriginalRequest: payload, Payload: payload,
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+			ID: "claude-sonnet-5-1", Format: formatClaude,
+		})),
 	}, true)
 	if failure != nil {
 		t.Fatal(failure)
 	}
-	if prepared.model != "gpt-6" || prepared.upstreamFormat != formatOpenAIResponse ||
-		prepared.translatorFormat != string(sdktranslator.FormatCodex) || prepared.outputFormat != formatClaude ||
-		!strings.HasSuffix(prepared.upstreamURL, "/responses") {
+	if prepared.model != "claude-sonnet-5-1" || prepared.upstreamFormat != formatClaude ||
+		prepared.outputFormat != formatClaude || !strings.HasSuffix(prepared.upstreamURL, "/v1/messages") {
 		t.Fatalf("prepared route = %#v", prepared)
 	}
 	if prepared.headers.Get("X-Interaction-Type") != "messages-proxy" {
@@ -441,98 +438,9 @@ func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testin
 		t.Fatal(errDecode)
 	}
 	tools, ok := upstream["tools"].([]any)
-	if !ok || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" || upstream["model"] != "gpt-6" {
+	if !ok || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search_20250305" ||
+		upstream["model"] != "claude-sonnet-5-1" {
 		t.Fatalf("upstream payload = %s", prepared.upstreamPayload)
-	}
-	fields := preparedInferenceLogFields(prepared, true)
-	if fields["requested_model"] != "claude-sonnet-5-1" || fields["web_search_routed"] != true {
-		t.Fatalf("prepared log fields = %#v", fields)
-	}
-}
-
-func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
-	now := time.Unix(71_500, 0).UTC()
-	standalone := `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
-	for _, test := range []struct {
-		name       string
-		configure  func(*settings)
-		models     []storedModel
-		payload    string
-		wantCode   string
-		wantModel  string
-		wantFormat string
-	}{
-		{
-			name: "ordinary Anthropic tool stays on Claude", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
-			payload:   `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`,
-			wantModel: "claude-sonnet-5-1", wantFormat: formatClaude,
-		},
-		{
-			name: "mixed tools fail closed", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
-			payload:  `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup","input_schema":{"type":"object"}}]}`,
-			wantCode: "unsupported_feature",
-		},
-		{
-			name: "disabled route fails closed", configure: func(cfg *settings) { cfg.WebSearchModel = "" }, models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
-			payload: standalone, wantCode: "unsupported_feature",
-		},
-		{
-			name: "missing configured model fails closed", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
-			payload: standalone, wantCode: "model_not_supported",
-		},
-		{
-			name: "configured model must use Responses", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}, {ID: "gpt-6", Format: formatOpenAI}},
-			payload: standalone, wantCode: "unsupported_feature",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			service := newService(nil)
-			service.now = func() time.Time { return now }
-			if test.configure != nil {
-				cfg := defaultSettings()
-				test.configure(&cfg)
-				if errConfigure := service.configureSettings(cfg); errConfigure != nil {
-					t.Fatal(errConfigure)
-				}
-			}
-			prepared, failure := service.prepareInference(contract.ExecutorRequest{
-				AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
-				Payload: []byte(test.payload), StorageJSON: mustJSON(t, executorStorage(now, test.models...)),
-			}, true)
-			if test.wantCode != "" {
-				if failure == nil || failure.code != test.wantCode {
-					t.Fatalf("failure = %#v, want code %q", failure, test.wantCode)
-				}
-				return
-			}
-			if failure != nil {
-				t.Fatal(failure)
-			}
-			if prepared.model != test.wantModel || prepared.upstreamFormat != test.wantFormat {
-				t.Fatalf("prepared route = %#v", prepared)
-			}
-		})
-	}
-}
-
-func TestClassifyAnthropicServerWebSearchRequest(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		body string
-		want anthropicWebSearchRequestClass
-	}{
-		{name: "absent", body: `{"messages":[]}`, want: anthropicWebSearchNone},
-		{name: "ordinary", body: `{"tools":[{"name":"lookup"}]}`, want: anthropicWebSearchNone},
-		{name: "20250305", body: `{"tools":[{"type":"web_search_20250305","name":"web_search"}]}`, want: anthropicWebSearchOnly},
-		{name: "20260209", body: `{"tools":[{"type":"web_search_20260209","name":"web_search"}]}`, want: anthropicWebSearchOnly},
-		{name: "mixed", body: `{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup"}]}`, want: anthropicWebSearchMixed},
-		{name: "invalid name", body: `{"tools":[{"type":"web_search_20250305","name":"browser_search"}]}`, want: anthropicWebSearchMixed},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := classifyAnthropicServerWebSearchRequest([]byte(test.body)); got != test.want {
-				t.Fatalf("class = %v, want %v", got, test.want)
-			}
-		})
 	}
 }
 

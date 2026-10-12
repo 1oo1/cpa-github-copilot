@@ -419,14 +419,13 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
+func TestExecuteStreamPassesAnthropicWebSearchToClaudeEndpoint(t *testing.T) {
 	frames := []string{
-		`data: {"type":"response.created","response":{"id":"resp-search","model":"gpt-6"}}` + "\n\n",
-		`data: {"type":"response.output_item.added","item":{"id":"ws_123","type":"web_search_call","status":"in_progress"}}` + "\n\n",
-		`data: {"type":"response.web_search_call.searching","item_id":"ws_123"}` + "\n\n",
-		`data: {"type":"response.web_search_call.completed","item_id":"ws_123"}` + "\n\n",
-		`data: {"type":"response.output_item.done","item":{"id":"ws_123","type":"web_search_call","status":"completed","action":{"type":"search","query":"HarmonyOS command-line tools"}}}` + "\n\n",
-		`data: {"type":"response.completed","response":{"id":"resp-search","status":"completed","stop_reason":"stop","error":null,"usage":{"input_tokens":3,"output_tokens":2}}}` + "\n\n",
+		`data: {"type":"message_start","message":{"id":"msg-search","model":"claude-sonnet-5-1"}}` + "\n\n",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_123","name":"web_search","input":{"query":"HarmonyOS command-line tools"}}}` + "\n\n",
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_123","content":[{"type":"web_search_result","title":"HarmonyOS","url":"https://example.com/harmonyos"}]}}` + "\n\n",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":3,"output_tokens":2}}` + "\n\n",
+		`data: {"type":"message_stop"}` + "\n\n",
 	}
 	chunks := make([]hostHTTPStreamReadResponse, 0, len(frames))
 	for _, frame := range frames {
@@ -446,10 +445,9 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-web-search", "downstream-web-search", contract.ExecutorRequest{
 		AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now,
-			storedModel{ID: "claude-sonnet-5-1", Format: formatClaude},
-			storedModel{ID: "gpt-6", Format: formatOpenAIResponse},
-		)),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
+			ID: "claude-sonnet-5-1", Format: formatClaude,
+		})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -457,18 +455,19 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 	fake.wait(t)
 	fake.mu.Lock()
 	emitted := string(bytesJoin(fake.emitted))
+	upstream := append([]hostHTTPCall(nil), fake.upstream...)
 	downstreamError := fake.downstreamError
 	fake.mu.Unlock()
 	if downstreamError != "" {
 		t.Fatalf("downstream stream error = %q", downstreamError)
 	}
+	if len(upstream) != 1 || !strings.HasSuffix(upstream[0].URL, "/v1/messages") {
+		t.Fatalf("upstream requests = %#v", upstream)
+	}
 	for _, needle := range []string{`"type":"server_tool_use"`, `"type":"web_search_tool_result"`, "HarmonyOS command-line tools", `"type":"message_stop"`} {
 		if !strings.Contains(emitted, needle) {
-			t.Fatalf("translated web search stream missing %q: %s", needle, emitted)
+			t.Fatalf("native Claude web search stream missing %q: %s", needle, emitted)
 		}
-	}
-	if strings.Index(emitted, `"type":"web_search_tool_result"`) < strings.Index(emitted, `"type":"server_tool_use"`) {
-		t.Fatalf("web search result preceded server tool use: %s", emitted)
 	}
 }
 
