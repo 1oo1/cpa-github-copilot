@@ -175,7 +175,7 @@ CPA 的配置不能直接沿用。把需要的 API Key、代理、优先级/模�
 | `trusted-proxies` | 可信反向代理 IP/CIDR；仅来自这些地址的 `X-Forwarded-For` 用于认证失败限流。部署场景的详细填法见 [TRUSTED_PROXIES.md](TRUSTED_PROXIES.md) |
 | `copilot` | 下列 Copilot 专用选项 |
 
-`copilot` 保留 `client_id`、`github_host`、`enable_models`、`model_cache_ttl_seconds`、`max_stream_buffer_bytes`、`web_search_model` 和 `enable_responses_context_management`。配置改动除面板明确支持的代理和调度设置外均需重启。GitHub Enterprise 主机必须通过 HTTPS DNS 主机校验，并配置适用的 OAuth public client ID。
+`copilot` 保留 `client_id`、`github_host`、`model_cache_ttl_seconds`、`max_stream_buffer_bytes`、`web_search_model` 和 `enable_responses_context_management`。本服务不会修改模型账户 policy，模型可用性始终以当前账户 `/models` 返回为准。配置改动除面板明确支持的代理和调度设置外均需重启。GitHub Enterprise 主机必须通过 HTTPS DNS 主机校验，并配置适用的 OAuth public client ID。
 
 ### Claude Code 多账号缓存与会话亲和
 

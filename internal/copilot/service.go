@@ -8,7 +8,6 @@ func defaultSettings() settings {
 	return settings{
 		ClientID:                         defaultClientID,
 		GitHubHost:                       defaultGitHubHost,
-		EnableModels:                     true,
 		ModelCacheTTL:                    300,
 		MaxStreamBytes:                   4 << 20,
 		WebSearchModel:                   "gpt-6-luna",
@@ -51,7 +50,6 @@ func (s *service) configureSettings(cfg settings) error {
 	}
 	s.logEvent("", "info", "copilot.configured", map[string]any{
 		"github_host":                         cfg.GitHubHost,
-		"enable_models":                       cfg.EnableModels,
 		"model_cache_ttl_seconds":             cfg.ModelCacheTTL,
 		"max_stream_buffer_bytes":             cfg.MaxStreamBytes,
 		"web_search_model":                    cfg.WebSearchModel,

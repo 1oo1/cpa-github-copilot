@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,38 +80,6 @@ func TestInferModelFormatUsesCurrentVersionGates(t *testing.T) {
 		if got := inferModelFormat(test.id); got != test.want {
 			t.Fatalf("inferModelFormat(%q) = %q, want %q", test.id, got, test.want)
 		}
-	}
-}
-
-func TestKnownCopilotModelsMatchPolicyEnableCatalog(t *testing.T) {
-	want := []string{
-		"claude-fable-5-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
-		"gemini-3.6-flash", "gpt-6", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
-		"mai-code-1-flash-picker",
-	}
-	if strings.Join(knownCopilotModels, ",") != strings.Join(want, ",") {
-		t.Fatalf("known models = %v, want %v", knownCopilotModels, want)
-	}
-}
-
-func TestEnableKnownModelsUsesCurrentAPIIdentity(t *testing.T) {
-	var calls atomic.Int64
-	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
-		headers := req.Headers
-		if !strings.HasSuffix(req.URL, "/policy") || headers.Get("Authorization") != "Bearer session" ||
-			headers.Get("X-GitHub-Api-Version") != copilotAPIVersion {
-			t.Errorf("policy request = %#v", req)
-		}
-		calls.Add(1)
-		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
-	})
-	service := newService(fake)
-	service.enableKnownModels(testHostClient(fake), copilotStorage{
-		CopilotSessionToken: "session",
-		GitHubHost:          "github.com",
-	})
-	if got := calls.Load(); got != int64(len(knownCopilotModels)) {
-		t.Fatalf("policy calls = %d, want %d", got, len(knownCopilotModels))
 	}
 }
 

@@ -12,7 +12,7 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 		t.Fatal(errConfigure)
 	}
 	config := service.loadedConfig()
-	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels ||
+	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" ||
 		config.WebSearchModel != "gpt-6" || config.EnableResponsesContextManagement {
 		t.Fatalf("default config = %#v", config)
 	}
@@ -35,7 +35,6 @@ func TestSettingsYAMLKeysDecodeOverDefaults(t *testing.T) {
 	cfg := defaultSettings()
 	raw := "client_id: synthetic-client\n" +
 		"github_host: ghe.example.com\n" +
-		"enable_models: false\n" +
 		"model_cache_ttl_seconds: 42\n" +
 		"max_stream_buffer_bytes: 131072\n" +
 		"web_search_model: \"\"\n" +
@@ -44,7 +43,7 @@ func TestSettingsYAMLKeysDecodeOverDefaults(t *testing.T) {
 		t.Fatal(errDecode)
 	}
 	want := settings{
-		ClientID: "synthetic-client", GitHubHost: "ghe.example.com", EnableModels: false, ModelCacheTTL: 42,
+		ClientID: "synthetic-client", GitHubHost: "ghe.example.com", ModelCacheTTL: 42,
 		MaxStreamBytes: 131072, WebSearchModel: "", EnableResponsesContextManagement: true,
 	}
 	if cfg != want {

@@ -613,9 +613,6 @@ func (s *service) completeLogin(client hostClient, session *loginSession) (copil
 	if failure != nil {
 		return copilotStorage{}, failure
 	}
-	if s.loadedConfig().EnableModels {
-		s.enableKnownModels(client, storage)
-	}
 	models, failure := s.discoverModels(client, storage)
 	if failure != nil {
 		return copilotStorage{}, failure

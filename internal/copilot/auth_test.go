@@ -195,9 +195,6 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 	service := newService(fake)
 	service.now = func() time.Time { return now }
 	service.random = bytes.NewReader(bytes.Repeat([]byte{9}, 32))
-	service.mu.Lock()
-	service.config.EnableModels = false
-	service.mu.Unlock()
 	started, errStart := service.startLoginRequest(context.Background(), "start", contract.AuthLoginStartRequest{})
 	if errStart != nil {
 		t.Fatal(errStart)

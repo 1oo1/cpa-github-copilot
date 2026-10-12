@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	contract "github.com/1oo1/cpa-github-copilot/internal/contract"
@@ -90,15 +88,6 @@ type remoteModel struct {
 			ContextEditing    *bool    `json:"context_editing"`
 		} `json:"supports"`
 	} `json:"capabilities"`
-}
-
-// knownCopilotModels only contains model IDs that satisfy the project's current
-// Claude/GPT eligibility rules. Account /models remains authoritative for all
-// capabilities and for models not listed here.
-var knownCopilotModels = []string{
-	"claude-fable-5-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
-	"gemini-3.6-flash", "gpt-6", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
-	"mai-code-1-flash-picker",
 }
 
 // IsSupportedCopilotModelID reports whether a model ID is eligible for this
@@ -567,55 +556,6 @@ func cloneBool(value *bool) *bool {
 	}
 	cloned := *value
 	return &cloned
-}
-
-func (s *service) enableKnownModels(client hostClient, storage copilotStorage) {
-	baseURL := apiBaseFromSessionToken(storage.CopilotSessionToken, storage.GitHubHost)
-	if baseURL == "" {
-		s.logEvent(client.callbackID, "warn", "models.policy_enable.skipped", map[string]any{"reason": "invalid_endpoint"})
-		return
-	}
-	jobs := make(chan string)
-	var wait sync.WaitGroup
-	var enabled atomic.Int64
-	for range 4 {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			for modelID := range jobs {
-				headers := copilotIdentityHeaders()
-				headers.Set("Content-Type", "application/json")
-				headers.Set("Authorization", "Bearer "+storage.CopilotSessionToken)
-				headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
-				headers.Set("Openai-Intent", "chat-policy")
-				headers.Set("X-Interaction-Type", "chat-policy")
-				resp, errHTTP := client.do(contract.HTTPRequest{
-					Method:  http.MethodPost,
-					URL:     baseURL + "/models/" + modelID + "/policy",
-					Headers: headers,
-					Body:    []byte(`{"state":"enabled"}`),
-				})
-				if errHTTP == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					enabled.Add(1)
-				}
-			}
-		}()
-	}
-	attempted := 0
-	for _, modelID := range knownCopilotModels {
-		if !IsSupportedCopilotModelID(modelID) {
-			continue
-		}
-		attempted++
-		jobs <- modelID
-	}
-	close(jobs)
-	wait.Wait()
-	s.logEvent(client.callbackID, "debug", "models.policy_enable.completed", map[string]any{
-		"attempted_count": attempted,
-		"enabled_count":   enabled.Load(),
-		"failed_count":    int64(attempted) - enabled.Load(),
-	})
 }
 
 func hasImageMediaType(values []string) bool {

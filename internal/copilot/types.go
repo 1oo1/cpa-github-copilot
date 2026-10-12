@@ -37,7 +37,6 @@ func (e *serviceError) Error() string {
 type settings struct {
 	ClientID       string `yaml:"client_id"`
 	GitHubHost     string `yaml:"github_host"`
-	EnableModels   bool   `yaml:"enable_models"`
 	ModelCacheTTL  int    `yaml:"model_cache_ttl_seconds"`
 	MaxStreamBytes int    `yaml:"max_stream_buffer_bytes"`
 	// WebSearchModel 是 Anthropic 原生 web_search 独占请求使用的同账户 Responses 模型；
