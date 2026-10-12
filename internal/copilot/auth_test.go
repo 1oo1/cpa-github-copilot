@@ -120,7 +120,7 @@ func TestDecodeLegacyPiCredential(t *testing.T) {
 		"refresh":"ghu_legacy",
 		"access":"tid=legacy;proxy-ep=proxy.business.githubcopilot.com",
 		"expires":1999999999000,
-		"availableModelIds":["gpt-5.4","claude-sonnet-4.6"]
+		"availableModelIds":["gpt-6","claude-sonnet-5-1"]
 	}`))
 	if errDecode != nil {
 		t.Fatal(errDecode)
@@ -184,7 +184,7 @@ func TestDeviceFlowPollTimingSlowDownAndSuccess(t *testing.T) {
 		case strings.Contains(req.URL, "/copilot_internal/v2/token"):
 			return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"token":"tid=SESSION_SENTINEL;proxy-ep=proxy.individual.githubcopilot.com","expires_at":20000}`)}, nil
 		case strings.HasSuffix(req.URL, "/models"):
-			return contract.HTTPResponse{StatusCode: 200, Body: selectableModelsJSON("gpt-5.4", []string{"/responses"})}, nil
+			return contract.HTTPResponse{StatusCode: 200, Body: selectableModelsJSON("gpt-6", []string{"/responses"})}, nil
 		case strings.HasSuffix(req.URL, "/user"):
 			return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"login":"octocat","id":1}`)}, nil
 		default:
@@ -374,7 +374,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 		case strings.Contains(req.URL, "/copilot_internal/v2/token"):
 			return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{"token":"tid=NEW_SESSION;proxy-ep=proxy.business.githubcopilot.com","expires_at":30000}`)}, nil
 		case strings.HasSuffix(req.URL, "/models"):
-			return contract.HTTPResponse{StatusCode: 200, Body: selectableModelsJSON("claude-sonnet-4.6", []string{"/v1/messages"})}, nil
+			return contract.HTTPResponse{StatusCode: 200, Body: selectableModelsJSON("claude-sonnet-5-1", []string{"/v1/messages"})}, nil
 		default:
 			t.Fatalf("unexpected URL %s", req.URL)
 			return contract.HTTPResponse{}, nil
@@ -397,7 +397,7 @@ func TestRefreshAuthReplacesOnlyCompleteSession(t *testing.T) {
 	if errStorage != nil || !strings.Contains(next.CopilotSessionToken, "NEW_SESSION") || next.Account != "octocat" || len(next.Models) != 1 {
 		t.Fatalf("refreshed storage = %#v, %v", next, errStorage)
 	}
-	route := service.resolveModelRoute("copilot.json", "claude-sonnet-4.6", next)
+	route := service.resolveModelRoute("copilot.json", "claude-sonnet-5-1", next)
 	if route.Format != formatClaude || route.AdaptiveThinking || len(route.ReasoningLevels) != 0 {
 		t.Fatalf("discovered route = %#v", route)
 	}
@@ -426,7 +426,7 @@ func TestRefreshAuthKeepsNewSessionAndCachedModelsWhenDiscoveryFails(t *testing.
 	previous := copilotStorage{
 		Type: providerIdentifier, GitHubAccessToken: "ghu_OLD", CopilotSessionToken: "tid=OLD",
 		GitHubHost: "github.com", ModelsFetchedAt: now.Add(-time.Hour).UnixMilli(),
-		Models: []storedModel{{ID: "gpt-4.1", Format: formatOpenAI}},
+		Models: []storedModel{{ID: "gpt-6", Format: formatOpenAI}},
 	}
 	result, failure := service.refreshAuthRequest(context.Background(), "refresh", contract.AuthRefreshRequest{AuthID: "auth", StorageJSON: mustJSON(t, previous)})
 	if failure != nil {
@@ -436,7 +436,7 @@ func TestRefreshAuthKeepsNewSessionAndCachedModelsWhenDiscoveryFails(t *testing.
 	if errStorage != nil || !strings.HasPrefix(next.CopilotSessionToken, "tid=NEW;") || next.ExpiresAt != time.Unix(25000, 0).UnixMilli() {
 		t.Fatalf("refreshed session = %#v, %v", next, errStorage)
 	}
-	if len(next.Models) != 1 || next.Models[0].ID != "gpt-4.1" || next.ModelsFetchedAt != previous.ModelsFetchedAt {
+	if len(next.Models) != 1 || next.Models[0].ID != "gpt-6" || next.ModelsFetchedAt != previous.ModelsFetchedAt {
 		t.Fatalf("cached models were not preserved: %#v", next)
 	}
 }

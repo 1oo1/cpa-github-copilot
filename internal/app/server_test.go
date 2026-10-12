@@ -74,6 +74,7 @@ func fakeResponse(body string) *http.Response {
 	return &http.Response{StatusCode: 200, Header: http.Header{
 		"Content-Type":                 {"application/json"},
 		"x-copilot-service-request-id": {"synthetic-service-request"},
+		"x-github-copilot-request-te":  {" TRUE "},
 		"Authorization":                {"Bearer synthetic-upstream-secret"},
 		"Set-Cookie":                   {"synthetic-cookie"},
 	}, Body: io.NopCloser(strings.NewReader(body))}
@@ -434,6 +435,35 @@ type runtimeTransportFunc func(context.Context, contract.HTTPRequest) (*http.Res
 func (f runtimeTransportFunc) Do(ctx context.Context, req contract.HTTPRequest) (*http.Response, error) {
 	return f(ctx, req)
 }
+func TestCatalogRefreshesRetiredOnlyModelCache(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{ManagementKey: "management-test-key", APIKeys: []string{"api-test-key-012345"}, Routing: "fill-first", Copilot: copilot.DefaultSettings()}
+	network := runtimeTransportFunc(func(ctx context.Context, req contract.HTTPRequest) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL, "/models") {
+			return nil, fmt.Errorf("unexpected test request")
+		}
+		return fakeResponse(`{"data":[{"id":"updated-model","name":"Updated","model_picker_enabled":true,"supported_endpoints":["/chat/completions"],"capabilities":{"supports":{"streaming":true,"tool_calls":true}}}]}`), nil
+	})
+	s, err := New(cfg, filepath.Join(dir, "config.yaml"), network, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	body := []byte(fmt.Sprintf(`{"type":"github-copilot","github_host":"github.com","github_access_token":"ghu_test","copilot_session_token":"tid=test;proxy-ep=proxy.individual.githubcopilot.com","refresh_after":%d,"expires_at":%d,"models_fetched_at":%d,"models":[{"id":"gpt-5.6-terra","format":"openai-response"}]}`, time.Now().Add(time.Hour).UnixMilli(), time.Now().Add(2*time.Hour).UnixMilli(), time.Now().UnixMilli()))
+	if _, err = s.importAccount("retired.json", body); err != nil {
+		t.Fatal(err)
+	}
+	a := s.account("retired.json")
+	if err = s.catalog(context.Background(), a, false); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if ids := modelIDs(a.raw); len(ids) != 1 || ids[0] != "updated-model" {
+		t.Fatalf("retired-only catalog was not refreshed: %v", ids)
+	}
+}
+
 func TestStandaloneCredentialRefreshPreservesGuardAndControls(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{ManagementKey: "management-test-key", APIKeys: []string{"api-test-key-012345"}, Routing: "fill-first", Copilot: copilot.DefaultSettings()}
@@ -511,6 +541,9 @@ func assertCopilotCorrelationHeaders(t *testing.T, headers http.Header) {
 	t.Helper()
 	if headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-request" {
 		t.Fatal("public API dropped Copilot service request ID")
+	}
+	if headers.Get("X-GitHub-Copilot-Request-Te") != " TRUE " {
+		t.Fatal("public API dropped Copilot request telemetry ID")
 	}
 	if headers.Get("Authorization") != "" || headers.Get("Set-Cookie") != "" {
 		t.Fatal("public API leaked private upstream headers")

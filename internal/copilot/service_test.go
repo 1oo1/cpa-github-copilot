@@ -13,8 +13,13 @@ func TestConfigureAppliesDefaultsAndRejectsUnsafeHost(t *testing.T) {
 	}
 	config := service.loadedConfig()
 	if config.ClientID != defaultClientID || config.GitHubHost != "github.com" || !config.EnableModels ||
-		config.WebSearchModel != "gpt-5.6-terra" || config.EnableResponsesContextManagement {
+		config.WebSearchModel != "gpt-6" || config.EnableResponsesContextManagement {
 		t.Fatalf("default config = %#v", config)
+	}
+	legacyWebSearch := defaultSettings()
+	legacyWebSearch.WebSearchModel = "gpt-5.6-terra"
+	if errConfigure := service.configureSettings(legacyWebSearch); errConfigure == nil {
+		t.Fatal("retired GPT web_search_model was accepted")
 	}
 	for _, host := range []string{"http://github.com", "127.0.0.1", "https://github.com/path"} {
 		cfg := defaultSettings()

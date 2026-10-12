@@ -92,14 +92,27 @@ type remoteModel struct {
 	} `json:"capabilities"`
 }
 
+// knownCopilotModels only contains model IDs that satisfy the project's current
+// Claude/GPT eligibility rules. Account /models remains authoritative for all
+// capabilities and for models not listed here.
 var knownCopilotModels = []string{
-	"claude-fable-5", "claude-haiku-4.5", "claude-opus-4.5", "claude-opus-4.6",
-	"claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "claude-sonnet-4", "claude-sonnet-4.5",
-	"claude-sonnet-4.6", "claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
-	"gemini-3.6-flash", "gpt-4.1", "gpt-5-mini", "gpt-5.2",
-	"gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-	"gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
+	"claude-fable-5-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
+	"gemini-3.6-flash", "gpt-6", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
 	"mai-code-1-flash-picker",
+}
+
+// IsSupportedCopilotModelID reports whether a model ID is eligible for this
+// service. Unknown families stay eligible because the account catalog remains
+// authoritative; Claude and GPT IDs are version-gated explicitly.
+func IsSupportedCopilotModelID(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if strings.HasPrefix(id, "claude-") {
+		return isCopilotClaude(id)
+	}
+	if strings.HasPrefix(id, "gpt-") {
+		return isCopilotGPT(id)
+	}
+	return true
 }
 
 func (s *service) modelsForAuthRequest(ctx context.Context, callbackID string, req contract.AuthModelRequest) (contract.ModelResponse, error) {
@@ -115,7 +128,7 @@ func (s *service) modelsForAuthRequest(ctx context.Context, callbackID string, r
 		return contract.ModelResponse{}, failure
 	}
 	client := s.client(ctx, callbackID)
-	models := storage.Models
+	models := supportedStoredModels(storage.Models)
 	storageChanged := false
 	cacheFresh := s.modelCacheFresh(storage)
 	source := "cache"
@@ -160,7 +173,9 @@ func (s *service) modelsForAuthRequest(ctx context.Context, callbackID string, r
 }
 
 func (s *service) modelCacheFresh(storage copilotStorage) bool {
-	if len(storage.Models) == 0 || storage.ModelsFetchedAt <= 0 {
+	// A cache containing only retired Claude/GPT IDs is not a usable catalog;
+	// force discovery instead of returning an empty model list forever.
+	if len(supportedStoredModels(storage.Models)) == 0 || storage.ModelsFetchedAt <= 0 {
 		return false
 	}
 	ttl := s.loadedConfig().ModelCacheTTL
@@ -219,7 +234,8 @@ func parseDiscoveredModels(raw []byte, includeEnabledPolicyModels bool) ([]store
 			continue
 		}
 		model.ID = strings.TrimSpace(model.ID)
-		if model.ID == "" || (model.Capabilities.Supports.ToolCalls != nil && !*model.Capabilities.Supports.ToolCalls) {
+		if model.ID == "" || !IsSupportedCopilotModelID(model.ID) ||
+			(model.Capabilities.Supports.ToolCalls != nil && !*model.Capabilities.Supports.ToolCalls) {
 			continue
 		}
 		policyState := strings.TrimSpace(model.Policy.State)
@@ -275,6 +291,9 @@ func parseDiscoveredModels(raw []byte, includeEnabledPolicyModels bool) ([]store
 }
 
 func selectModelFormat(modelID string, endpoints []string) string {
+	if !IsSupportedCopilotModelID(modelID) {
+		return ""
+	}
 	available := make(map[string]bool)
 	hadDeclaredEndpoint := false
 	for _, endpoint := range endpoints {
@@ -308,27 +327,93 @@ func selectModelFormat(modelID string, endpoints []string) string {
 }
 
 func inferModelFormat(modelID string) string {
+	if !IsSupportedCopilotModelID(modelID) {
+		return ""
+	}
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	if isCopilotClaude(id) {
 		return formatClaude
 	}
-	if strings.HasPrefix(id, "grok-") || strings.HasPrefix(id, "gpt-5") || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
+	if strings.HasPrefix(id, "grok-") || isCopilotGPT(id) || strings.HasPrefix(id, "oswe") || strings.HasPrefix(id, "mai-") {
 		return formatOpenAIResponse
 	}
 	return formatOpenAI
 }
 
+// Claude model versions are canonicalized with '-' inside the model ID. The
+// project only supports 5.1 and newer: 5.0 and all 4.x generations are out,
+// while 5.1+ and later major versions remain eligible.
 func isCopilotClaude(modelID string) bool {
-	id := strings.ToLower(strings.TrimSpace(modelID))
-	for _, family := range []string{"haiku", "sonnet", "opus", "fable"} {
-		version, found := strings.CutPrefix(id, "claude-"+family+"-")
-		if !found || version == "" {
-			continue
-		}
-		majorMatches := version[0] == '4' || version[0] == '5'
-		return majorMatches && (len(version) == 1 || version[1] == '.' || version[1] == '-')
+	rest, found := strings.CutPrefix(strings.ToLower(strings.TrimSpace(modelID)), "claude-")
+	if !found || rest == "" {
+		return false
 	}
-	return false
+	segments := strings.Split(rest, "-")
+	versionStart := -1
+	for i, segment := range segments {
+		if i > 0 && segment != "" && segment[0] >= '0' && segment[0] <= '9' {
+			versionStart = i
+			break
+		}
+	}
+	if versionStart < 0 {
+		return false
+	}
+	version := strings.Join(segments[versionStart:], "-")
+	// Canonical names never use '.' in the version portion.
+	if strings.Contains(version, ".") {
+		return false
+	}
+	major, majorRest, ok := leadingNumber(version)
+	if !ok {
+		return false
+	}
+	if major > 5 {
+		return majorRest == "" || strings.HasPrefix(majorRest, "-")
+	}
+	if major < 5 || !strings.HasPrefix(majorRest, "-") {
+		return false
+	}
+	minor, minorRest, ok := leadingNumber(majorRest[1:])
+	if !ok || minor < 1 {
+		return false
+	}
+	return minorRest == "" || strings.HasPrefix(minorRest, "-")
+}
+
+// GPT IDs keep their normal dotted minor versions, but only GPT-6 and newer
+// generations are supported by this service.
+func isCopilotGPT(modelID string) bool {
+	version, found := strings.CutPrefix(strings.ToLower(strings.TrimSpace(modelID)), "gpt-")
+	if !found || version == "" {
+		return false
+	}
+	major, rest, ok := leadingNumber(version)
+	if !ok {
+		return false
+	}
+	return major >= 6 && (rest == "" || strings.HasPrefix(rest, ".") || strings.HasPrefix(rest, "-"))
+}
+
+func leadingNumber(value string) (int, string, bool) {
+	if value == "" {
+		return 0, "", false
+	}
+	end := 0
+	for end < len(value) && value[end] >= '0' && value[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, value, false
+	}
+	major := 0
+	for _, digit := range value[:end] {
+		major = major*10 + int(digit-'0')
+		if major > 1_000_000 {
+			return 0, value, false
+		}
+	}
+	return major, value[end:], true
 }
 
 func endpointPath(format string) string {
@@ -344,10 +429,20 @@ func endpointPath(format string) string {
 	}
 }
 
+func supportedStoredModels(models []storedModel) []storedModel {
+	out := make([]storedModel, 0, len(models))
+	for _, model := range models {
+		if IsSupportedCopilotModelID(model.ID) {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
 func modelInfos(models []storedModel) []contract.ModelInfo {
 	out := make([]contract.ModelInfo, 0, len(models))
 	for _, model := range models {
-		if strings.TrimSpace(model.ID) == "" {
+		if strings.TrimSpace(model.ID) == "" || !IsSupportedCopilotModelID(model.ID) {
 			continue
 		}
 		format := model.Format
@@ -412,6 +507,9 @@ func (s *service) setModelRoutes(authID string, models []storedModel) {
 }
 
 func (s *service) resolveModelRoute(authID, modelID string, storage copilotStorage) modelRoute {
+	if !IsSupportedCopilotModelID(modelID) {
+		return modelRoute{}
+	}
 	for _, model := range storage.Models {
 		if model.ID == modelID {
 			return routeForStoredModel(model)
@@ -503,15 +601,20 @@ func (s *service) enableKnownModels(client hostClient, storage copilotStorage) {
 			}
 		}()
 	}
+	attempted := 0
 	for _, modelID := range knownCopilotModels {
+		if !IsSupportedCopilotModelID(modelID) {
+			continue
+		}
+		attempted++
 		jobs <- modelID
 	}
 	close(jobs)
 	wait.Wait()
 	s.logEvent(client.callbackID, "debug", "models.policy_enable.completed", map[string]any{
-		"attempted_count": len(knownCopilotModels),
+		"attempted_count": attempted,
 		"enabled_count":   enabled.Load(),
-		"failed_count":    int64(len(knownCopilotModels)) - enabled.Load(),
+		"failed_count":    int64(attempted) - enabled.Load(),
 	})
 }
 

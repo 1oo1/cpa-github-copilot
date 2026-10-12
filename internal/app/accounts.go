@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/1oo1/cpa-github-copilot/internal/contract"
+	"github.com/1oo1/cpa-github-copilot/internal/copilot"
 	"github.com/1oo1/cpa-github-copilot/internal/transport"
 )
 
@@ -215,7 +216,7 @@ func modelIDs(raw map[string]any) []string {
 	if models, ok := raw["models"].([]any); ok {
 		for _, model := range models {
 			if m, ok := model.(map[string]any); ok {
-				if id, ok := m["id"].(string); ok {
+				if id, ok := m["id"].(string); ok && copilot.IsSupportedCopilotModelID(id) {
 					out = append(out, id)
 				}
 			}
@@ -605,7 +606,9 @@ func (s *Server) catalog(ctx context.Context, a *account, force bool) error {
 				continue
 			}
 		}
-		if !force && !a.nextModels.IsZero() && time.Now().Before(a.nextModels) {
+		// A fresh timestamp over a catalog made entirely from retired model IDs is
+		// not a usable cache; fall through and discover a replacement immediately.
+		if !force && !a.nextModels.IsZero() && time.Now().Before(a.nextModels) && len(modelIDs(a.raw)) > 0 {
 			a.mu.Unlock()
 			return nil
 		}

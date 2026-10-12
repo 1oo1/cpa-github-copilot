@@ -123,10 +123,10 @@ copilot:
   max_stream_buffer_bytes: 4194304
 
   # Anthropic 原生 web_search 工具独占请求所使用的同账号 Responses 模型。
-  # 默认 gpt-5.6-terra；目标必须出现在账户目录中并支持所需 endpoint。
+  # 默认 gpt-6；目标必须出现在账户目录中并支持所需 endpoint。
   # 空字符串禁用该分流；普通对话不受影响。
   # 普通工具与原生 Web Search 混用的请求不会被静默改写成别的模型。
-  web_search_model: "gpt-5.6-terra"
+  web_search_model: "gpt-6"
 
   # 默认 false。对符合条件的原生 Responses 请求，选择性注入服务端
   # context_management（inline compaction）。不是独立 /responses/compact API。

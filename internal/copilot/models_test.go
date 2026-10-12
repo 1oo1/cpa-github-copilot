@@ -17,8 +17,8 @@ func TestParseDiscoveredModelsFiltersAndMapsCapabilities(t *testing.T) {
 	toolFalse := false
 	_ = toolFalse
 	raw := mustJSON(t, map[string]any{"data": []any{
-		remoteModelFixture("gpt-5.4", true, "", true, []string{"/responses"}),
-		remoteModelFixture("claude-sonnet-4.6", true, "", true, []string{"/v1/messages"}),
+		remoteModelFixture("gpt-6", true, "", true, []string{"/responses"}),
+		remoteModelFixture("claude-sonnet-5-1", true, "", true, []string{"/v1/messages"}),
 		remoteModelFixture("disabled", true, "disabled", true, []string{"/chat/completions"}),
 		remoteModelFixture("hidden", false, "", true, []string{"/chat/completions"}),
 		remoteModelFixture("no-tools", true, "", false, []string{"/chat/completions"}),
@@ -27,7 +27,7 @@ func TestParseDiscoveredModelsFiltersAndMapsCapabilities(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	if len(models) != 2 || models[0].ID != "claude-sonnet-4.6" || models[0].Format != formatClaude || models[1].Format != formatOpenAIResponse {
+	if len(models) != 2 || models[0].ID != "claude-sonnet-5-1" || models[0].Format != formatClaude || models[1].Format != formatOpenAIResponse {
 		t.Fatalf("models = %#v", models)
 	}
 	infos := modelInfos(models)
@@ -36,14 +36,59 @@ func TestParseDiscoveredModelsFiltersAndMapsCapabilities(t *testing.T) {
 	}
 }
 
+func TestCopilotModelIDCompatibilityVersionGates(t *testing.T) {
+	for _, test := range []struct {
+		id   string
+		want bool
+	}{
+		{id: "claude-fable-5-5", want: true},
+		{id: "claude-fable-5-1", want: true},
+		{id: "claude-custom-5-1", want: true},
+		{id: "claude-opus-6", want: true},
+		{id: "claude-fable-5.5", want: false},
+		{id: "claude-fable-5", want: false},
+		{id: "claude-fable-5-0", want: false},
+		{id: "claude-opus-4-8", want: false},
+		{id: "gpt-6", want: true},
+		{id: "gpt-6.1-mini", want: true},
+		{id: "gpt-6-codex", want: true},
+		{id: "gpt-5.9", want: false},
+		{id: "gpt-5.6-terra", want: false},
+		{id: "gpt-4.1", want: false},
+		{id: "gemini-3.6-flash", want: true},
+	} {
+		t.Run(test.id, func(t *testing.T) {
+			if got := IsSupportedCopilotModelID(test.id); got != test.want {
+				t.Fatalf("IsSupportedCopilotModelID(%q) = %v, want %v", test.id, got, test.want)
+			}
+		})
+	}
+}
+
+func TestInferModelFormatUsesCurrentVersionGates(t *testing.T) {
+	for _, test := range []struct {
+		id   string
+		want string
+	}{
+		{id: "claude-fable-5-5", want: formatClaude},
+		{id: "claude-fable-5.5", want: ""},
+		{id: "claude-fable-4-8", want: ""},
+		{id: "gpt-6", want: formatOpenAIResponse},
+		{id: "gpt-6.1-mini", want: formatOpenAIResponse},
+		{id: "gpt-5.6-terra", want: ""},
+		{id: "unknown-model", want: formatOpenAI},
+	} {
+		if got := inferModelFormat(test.id); got != test.want {
+			t.Fatalf("inferModelFormat(%q) = %q, want %q", test.id, got, test.want)
+		}
+	}
+}
+
 func TestKnownCopilotModelsMatchPolicyEnableCatalog(t *testing.T) {
 	want := []string{
-		"claude-fable-5", "claude-haiku-4.5", "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7",
-		"claude-opus-4.8", "claude-opus-5", "claude-sonnet-4", "claude-sonnet-4.5", "claude-sonnet-4.6",
-		"claude-sonnet-5", "gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-3.6-flash", "gpt-4.1",
-		"gpt-5-mini", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini",
-		"gpt-5.4-nano", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6",
-		"kimi-k2.7-code", "mai-code-1-flash-picker",
+		"claude-fable-5-5", "gemini-3.1-pro-preview", "gemini-3.5-flash",
+		"gemini-3.6-flash", "gpt-6", "grok-4.5", "grok-4.6", "kimi-k2.7-code",
+		"mai-code-1-flash-picker",
 	}
 	if strings.Join(knownCopilotModels, ",") != strings.Join(want, ",") {
 		t.Fatalf("known models = %v, want %v", knownCopilotModels, want)
@@ -72,7 +117,7 @@ func TestEnableKnownModelsUsesCurrentAPIIdentity(t *testing.T) {
 }
 
 func TestParseDiscoveredModelsUsesCatalogThinkingCapabilities(t *testing.T) {
-	model := remoteModelFixture("claude-opus-4.8", true, "", true, []string{"/v1/messages"})
+	model := remoteModelFixture("claude-opus-5-1", true, "", true, []string{"/v1/messages"})
 	capabilities := model["capabilities"].(map[string]any)
 	supports := capabilities["supports"].(map[string]any)
 	supports["adaptive_thinking"] = false
@@ -92,7 +137,7 @@ func TestParseDiscoveredModelsUsesCatalogThinkingCapabilities(t *testing.T) {
 		t.Fatalf("model infos = %#v", infos)
 	}
 
-	for _, modelID := range []string{"gemini-3.6-flash", "gpt-4.1", "kimi-k2.7-code"} {
+	for _, modelID := range []string{"gemini-3.6-flash", "gpt-6", "kimi-k2.7-code"} {
 		infos := modelInfos([]storedModel{{
 			ID: modelID, Format: formatOpenAI, ReasoningLevels: []string{"high"}, ReasoningLevelsDeclared: true,
 		}})
@@ -104,7 +149,7 @@ func TestParseDiscoveredModelsUsesCatalogThinkingCapabilities(t *testing.T) {
 }
 
 func TestReasoningLevelsAndContextComeOnlyFromCopilotCatalog(t *testing.T) {
-	model := remoteModelFixture("gpt-5.6-terra", true, "", true, []string{"/responses"})
+	model := remoteModelFixture("gpt-6", true, "", true, []string{"/responses"})
 	supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
 	supports["reasoning_effort"] = []string{"minimal", "low", "ultra"}
 	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
@@ -127,18 +172,18 @@ func TestSelectModelFormatUsesSupportedEndpointAndInference(t *testing.T) {
 		endpoints []string
 		want      string
 	}{
-		{id: "gpt-5.4", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
+		{id: "gpt-6", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
 		{id: "grok-4.5", endpoints: []string{"/responses", "/chat/completions"}, want: formatOpenAIResponse},
 		{id: "grok-4.6", endpoints: nil, want: formatOpenAIResponse},
-		{id: "claude-opus-5", endpoints: []string{"/responses", "/v1/messages"}, want: formatOpenAIResponse},
-		{id: "claude-fable-5", endpoints: []string{"/v1/messages", "/chat/completions"}, want: formatClaude},
-		{id: "claude-sonnet-4.6", endpoints: []string{"/v1/messages"}, want: formatClaude},
-		{id: "claude-fable-5", endpoints: nil, want: formatClaude},
-		{id: "claude-custom-5", endpoints: nil, want: formatOpenAI},
-		{id: "claude-fable-6", endpoints: nil, want: formatOpenAI},
-		{id: "gpt-4.1", endpoints: []string{"/responses"}, want: formatOpenAIResponse},
-		{id: "gpt-4.1", endpoints: nil, want: formatOpenAI},
-		{id: "gpt-4.1", endpoints: []string{"/embeddings"}, want: ""},
+		{id: "claude-opus-5-1", endpoints: []string{"/responses", "/v1/messages"}, want: formatOpenAIResponse},
+		{id: "claude-fable-5-5", endpoints: []string{"/v1/messages", "/chat/completions"}, want: formatClaude},
+		{id: "claude-sonnet-5-1", endpoints: []string{"/v1/messages"}, want: formatClaude},
+		{id: "claude-fable-5-5", endpoints: nil, want: formatClaude},
+		{id: "claude-custom-5", endpoints: nil, want: ""},
+		{id: "claude-fable-6", endpoints: nil, want: formatClaude},
+		{id: "gpt-6", endpoints: []string{"/responses"}, want: formatOpenAIResponse},
+		{id: "gpt-6", endpoints: nil, want: formatOpenAIResponse},
+		{id: "gpt-6", endpoints: []string{"/embeddings"}, want: ""},
 	} {
 		if got := selectModelFormat(test.id, test.endpoints); got != test.want {
 			t.Fatalf("selectModelFormat(%q, %#v) = %q, want %q", test.id, test.endpoints, got, test.want)
@@ -148,8 +193,8 @@ func TestSelectModelFormatUsesSupportedEndpointAndInference(t *testing.T) {
 
 func TestResolveModelRouteRejectsModelOutsideDiscoveredCatalog(t *testing.T) {
 	service := newService(nil)
-	storage := copilotStorage{Models: []storedModel{{ID: "gpt-4.1", Format: formatOpenAI}}}
-	if route := service.resolveModelRoute("auth", "gpt-5.4", storage); route.Path != "" {
+	storage := copilotStorage{Models: []storedModel{{ID: "gpt-6", Format: formatOpenAI}}}
+	if route := service.resolveModelRoute("auth", "gpt-6.1", storage); route.Path != "" {
 		t.Fatalf("unexpected inferred route outside account catalog: %#v", route)
 	}
 }
@@ -157,14 +202,25 @@ func TestResolveModelRouteRejectsModelOutsideDiscoveredCatalog(t *testing.T) {
 func TestResolveModelRouteRejectsInferenceAfterEmptyDiscovery(t *testing.T) {
 	service := newService(nil)
 	storage := copilotStorage{ModelsFetchedAt: time.Now().UnixMilli()}
-	if route := service.resolveModelRoute("auth", "gpt-5.4", storage); route.Path != "" {
+	if route := service.resolveModelRoute("auth", "gpt-6", storage); route.Path != "" {
 		t.Fatalf("unexpected inferred route after empty discovery: %#v", route)
+	}
+}
+
+func TestModelCacheFreshRejectsRetiredOnlyCatalog(t *testing.T) {
+	service := newService(nil)
+	storage := copilotStorage{
+		Models:          []storedModel{{ID: "gpt-5.6-terra", Format: formatOpenAIResponse}},
+		ModelsFetchedAt: time.Now().UnixMilli(),
+	}
+	if service.modelCacheFresh(storage) {
+		t.Fatal("retired-only model cache was treated as fresh")
 	}
 }
 
 func TestCachedRouteUsesStoredMetadataWithoutModelNameOverrides(t *testing.T) {
 	service := newService(nil)
-	legacy := storedModel{ID: "claude-fable-5", Format: formatOpenAI}
+	legacy := storedModel{ID: "claude-fable-5-5", Format: formatOpenAI}
 	storage := copilotStorage{Models: []storedModel{legacy}}
 
 	route := service.resolveModelRoute("auth", legacy.ID, storage)
@@ -191,16 +247,16 @@ func TestModelsForAuthUsesFreshCredentialCache(t *testing.T) {
 		CopilotSessionToken: "tid=session;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 		ModelsFetchedAt:     service.now().UnixMilli(),
-		Models:              []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
+		Models:              []storedModel{{ID: "gpt-6", Name: "GPT 4.1", Format: formatOpenAI}},
 	}
 	result, errModels := service.modelsForAuthRequest(context.Background(), "", contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)})
 	if errModels != nil {
 		t.Fatal(errModels)
 	}
-	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" || len(result.AuthUpdate.StorageJSON) != 0 {
+	if len(result.Models) != 1 || result.Models[0].ID != "gpt-6" || len(result.AuthUpdate.StorageJSON) != 0 {
 		t.Fatalf("model response = %#v", result)
 	}
-	if route := service.resolveModelRoute("auth-1", "gpt-4.1", copilotStorage{}); route.Format != formatOpenAI {
+	if route := service.resolveModelRoute("auth-1", "gpt-6", copilotStorage{}); route.Format != formatOpenAI {
 		t.Fatalf("cached route = %#v", route)
 	}
 }
@@ -217,13 +273,13 @@ func TestModelsForAuthFallsBackToStaleNonEmptyCache(t *testing.T) {
 	storage := copilotStorage{
 		Type: providerIdentifier, GitHubAccessToken: "ghu", CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost: "github.com", ModelsFetchedAt: service.now().Add(-time.Hour).UnixMilli(),
-		Models: []storedModel{{ID: "gpt-4.1", Name: "GPT 4.1", Format: formatOpenAI}},
+		Models: []storedModel{{ID: "gpt-6", Name: "GPT 4.1", Format: formatOpenAI}},
 	}
 	result, errModels := service.modelsForAuthRequest(context.Background(), "models", contract.AuthModelRequest{AuthID: "auth-1", StorageJSON: mustJSON(t, storage)})
 	if errModels != nil {
 		t.Fatal(errModels)
 	}
-	if len(result.Models) != 1 || result.Models[0].ID != "gpt-4.1" {
+	if len(result.Models) != 1 || result.Models[0].ID != "gpt-6" {
 		t.Fatalf("fallback response = %#v", result)
 	}
 	logEntry := findLogEvent(t, fake.snapshotLogs(), "models.discovery.fallback")
@@ -249,7 +305,7 @@ func TestDiscoverModelsAcceptsValidEmptyCatalog(t *testing.T) {
 
 func TestDiscoverModelsFallsBackToEnabledPoliciesForIndividualAccounts(t *testing.T) {
 	raw := mustJSON(t, map[string]any{"data": []any{
-		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("gpt-6", false, "enabled", true, []string{"/chat/completions"}),
 		remoteModelFixture("disabled", false, "disabled", true, []string{"/chat/completions"}),
 		remoteModelFixture("no-tools", false, "enabled", false, []string{"/chat/completions"}),
 	}})
@@ -261,15 +317,15 @@ func TestDiscoverModelsFallsBackToEnabledPoliciesForIndividualAccounts(t *testin
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
-	if failure != nil || len(models) != 1 || models[0].ID != "gpt-4.1" {
+	if failure != nil || len(models) != 1 || models[0].ID != "gpt-6" {
 		t.Fatalf("models = %#v, failure = %#v", models, failure)
 	}
 }
 
 func TestDiscoverModelsIncludesEnabledPoliciesAlongsidePickerCatalogForIndividualAccounts(t *testing.T) {
 	raw := mustJSON(t, map[string]any{"data": []any{
-		remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"}),
-		remoteModelFixture("gpt-5.6-terra", false, "enabled", true, []string{"/responses"}),
+		remoteModelFixture("gpt-6", true, "", true, []string{"/chat/completions"}),
+		remoteModelFixture("gpt-6.1", false, "enabled", true, []string{"/responses"}),
 	}})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
@@ -279,14 +335,14 @@ func TestDiscoverModelsIncludesEnabledPoliciesAlongsidePickerCatalogForIndividua
 		CopilotSessionToken: "tid=x;proxy-ep=proxy.individual.githubcopilot.com",
 		GitHubHost:          "github.com",
 	})
-	if failure != nil || len(models) != 2 || models[0].ID != "gpt-4.1" || models[1].ID != "gpt-5.6-terra" {
+	if failure != nil || len(models) != 2 || models[0].ID != "gpt-6" || models[1].ID != "gpt-6.1" {
 		t.Fatalf("models = %#v, failure = %#v", models, failure)
 	}
 }
 
 func TestDiscoverModelsKeepsStrictPickerSemanticsForBusinessAccounts(t *testing.T) {
 	raw := mustJSON(t, map[string]any{"data": []any{
-		remoteModelFixture("gpt-4.1", false, "enabled", true, []string{"/chat/completions"}),
+		remoteModelFixture("gpt-6", false, "enabled", true, []string{"/chat/completions"}),
 	}})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: 200, Body: raw}, nil
@@ -320,7 +376,7 @@ func remoteModelFixture(id string, picker bool, policy string, tools bool, endpo
 }
 
 func TestStoredModelsJSONContainsNoSessionOutsideStorageBoundary(t *testing.T) {
-	model := storedModel{ID: "gpt-4.1", Name: "GPT", Format: formatOpenAI}
+	model := storedModel{ID: "gpt-6", Name: "GPT", Format: formatOpenAI}
 	raw, _ := json.Marshal(model)
 	if strings.Contains(string(raw), "token") {
 		t.Fatalf("model route unexpectedly has credential field: %s", raw)
@@ -328,7 +384,7 @@ func TestStoredModelsJSONContainsNoSessionOutsideStorageBoundary(t *testing.T) {
 }
 
 func TestParseDiscoveredModelsCapturesStreamingToolSearchAndContextEditing(t *testing.T) {
-	model := remoteModelFixture("gpt-5.4", true, "", true, []string{"/responses"})
+	model := remoteModelFixture("gpt-6", true, "", true, []string{"/responses"})
 	supports := model["capabilities"].(map[string]any)["supports"].(map[string]any)
 	supports["streaming"] = true
 	supports["tool_search"] = true
@@ -345,7 +401,7 @@ func TestParseDiscoveredModelsCapturesStreamingToolSearchAndContextEditing(t *te
 }
 
 func TestParseDiscoveredModelsDefaultsMissingOptionalCapabilitiesToDisabled(t *testing.T) {
-	model := remoteModelFixture("gpt-4.1", true, "", true, []string{"/chat/completions"})
+	model := remoteModelFixture("gpt-6", true, "", true, []string{"/chat/completions"})
 	models, errParse := parseDiscoveredModels(mustJSON(t, map[string]any{"data": []any{model}}), false)
 	if errParse != nil || len(models) != 1 {
 		t.Fatalf("models = %#v, error = %v", models, errParse)
@@ -369,7 +425,7 @@ func TestModelInfosAdvertiseStreamOnlyWhenExplicitlySupported(t *testing.T) {
 		{name: "omitted"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			infos := modelInfos([]storedModel{{ID: "gpt-4.1", Format: formatOpenAI, Streaming: test.streaming}})
+			infos := modelInfos([]storedModel{{ID: "gpt-6", Format: formatOpenAI, Streaming: test.streaming}})
 			if len(infos) != 1 {
 				t.Fatalf("model infos = %#v", infos)
 			}
@@ -411,7 +467,7 @@ func TestRouteForStoredModelCarriesRequestConstructionCapabilities(t *testing.T)
 }
 
 func TestStoredModelBackwardCompatibleWithoutNewCapabilityFields(t *testing.T) {
-	legacy := []byte(`{"id":"gpt-5.4","format":"openai-response","reasoning_levels":["minimal","low","medium","high"]}`)
+	legacy := []byte(`{"id":"gpt-6","format":"openai-response","reasoning_levels":["minimal","low","medium","high"]}`)
 	var model storedModel
 	if errUnmarshal := json.Unmarshal(legacy, &model); errUnmarshal != nil {
 		t.Fatalf("decode legacy stored model: %v", errUnmarshal)
@@ -493,7 +549,7 @@ func TestModelsForAuthPropagatesCapabilitiesFromDiscoveryToRoute(t *testing.T) {
 	}
 }
 
-// GPT-6 names recognized by Copilot Chat 0.67 are not a proxy-side capability
+// GPT-6 names recognized by Copilot Chat 0.69 are not a proxy-side capability
 // allowlist: declared endpoints and limits must still come from this account.
 func TestGPT6CatalogKeepsDeclaredCapabilitiesAndIndependentLimits(t *testing.T) {
 	for _, family := range []string{"gpt-6", "gpt-6-astra", "gpt-6.1-mini"} {

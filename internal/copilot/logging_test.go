@@ -24,7 +24,7 @@ func TestAuthParseLogsExpiredCredentialStateWithoutSecrets(t *testing.T) {
 		RefreshAfter:        now.Add(-10 * time.Minute).UnixMilli(),
 		ExpiresAt:           now.Add(-5 * time.Minute).UnixMilli(),
 		GitHubHost:          "github.com",
-		Models:              []storedModel{{ID: "gpt-5.6-sol", Format: formatOpenAIResponse}},
+		Models:              []storedModel{{ID: "gpt-6", Format: formatOpenAIResponse}},
 	}
 	if _, errParse := service.parseAuthRequest(contract.AuthParseRequest{
 		FileName: "github-copilot-test.json",
@@ -51,11 +51,11 @@ func TestExpiredInferenceLogsStableFailureWithoutSecrets(t *testing.T) {
 		RefreshAfter:        now.Add(-10 * time.Minute).UnixMilli(),
 		ExpiresAt:           now.Add(-5 * time.Minute).UnixMilli(),
 		GitHubHost:          "github.com",
-		Models:              []storedModel{{ID: "claude-opus-4.8", Format: formatClaude}},
+		Models:              []storedModel{{ID: "claude-opus-5-1", Format: formatClaude}},
 	}
-	payload := []byte(`{"model":"claude-opus-4.8","messages":[{"role":"user","content":"PRIVATE_PROMPT_SENTINEL"}]}`)
+	payload := []byte(`{"model":"claude-opus-5-1","messages":[{"role":"user","content":"PRIVATE_PROMPT_SENTINEL"}]}`)
 	_, failure := service.executeRequest(context.Background(), "callback-inference", contract.ExecutorRequest{
-		AuthID: "auth-1", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth-1", Model: "claude-opus-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		Payload: payload, StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).code != "reauth_required" {
@@ -72,13 +72,13 @@ func TestLogEventFiltersSensitiveKeysAndValues(t *testing.T) {
 	fake := newFakeHost(t, nil)
 	service := newService(fake)
 	service.logEvent("callback", "info", "test.security", map[string]any{
-		"model":         "gpt-5.6-sol",
+		"model":         "gpt-6",
 		"authorization": "Bearer AUTH_LOG_SENTINEL",
 		"storage_json":  "STORAGE_LOG_SENTINEL",
 		"safe_but_bad":  "tid=SESSION_LOG_SENTINEL",
 	})
 	entry := findLogEvent(t, fake.snapshotLogs(), "test.security")
-	if entry.Fields["model"] != "gpt-5.6-sol" {
+	if entry.Fields["model"] != "gpt-6" {
 		t.Fatalf("safe log field missing: %#v", entry.Fields)
 	}
 	assertLogsExclude(t, fake.snapshotLogs(), "AUTH_LOG_SENTINEL", "STORAGE_LOG_SENTINEL", "SESSION_LOG_SENTINEL")

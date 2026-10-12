@@ -281,7 +281,7 @@ func TestGrokResponsesResponseNormalizerRestoresCustomStreamEvents(t *testing.T)
 
 func TestNormalizeOpenAIResponsesLeavesCodexToolsOutsideGrok(t *testing.T) {
 	payload := map[string]any{
-		"model":        "gpt-5.6-sol",
+		"model":        "gpt-6",
 		"service_tier": "priority",
 		"tools": []any{
 			map[string]any{"type": "custom", "name": "apply_patch"},

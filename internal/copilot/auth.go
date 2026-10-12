@@ -183,7 +183,7 @@ func decodeCopilotStorage(raw []byte) (copilotStorage, error) {
 	if len(storage.Models) == 0 && len(storage.LegacyAvailableModel) > 0 {
 		for _, id := range storage.LegacyAvailableModel {
 			id = strings.TrimSpace(id)
-			if id != "" {
+			if id != "" && IsSupportedCopilotModelID(id) {
 				storage.Models = append(storage.Models, storedModel{ID: id, Name: id, Format: inferModelFormat(id)})
 			}
 		}

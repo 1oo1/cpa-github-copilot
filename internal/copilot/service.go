@@ -11,7 +11,7 @@ func defaultSettings() settings {
 		EnableModels:                     true,
 		ModelCacheTTL:                    300,
 		MaxStreamBytes:                   4 << 20,
-		WebSearchModel:                   "gpt-5.6-terra",
+		WebSearchModel:                   "gpt-6-luna",
 		EnableResponsesContextManagement: false,
 	}
 }
@@ -21,6 +21,9 @@ func (s *service) configureSettings(cfg settings) error {
 	cfg.WebSearchModel = normalizeModelID(cfg.WebSearchModel)
 	if cfg.ClientID == "" {
 		return &serviceError{code: "invalid_config", message: "client_id is required"}
+	}
+	if cfg.WebSearchModel != "" && !IsSupportedCopilotModelID(cfg.WebSearchModel) {
+		return &serviceError{code: "invalid_config", message: "web_search_model is not supported"}
 	}
 	host, errHost := normalizeGitHubHost(cfg.GitHubHost)
 	if errHost != nil {

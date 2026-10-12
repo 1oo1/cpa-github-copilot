@@ -109,7 +109,7 @@ func (f *streamFakeHost) openStream(_ context.Context, callbackID string, req co
 	f.upstream = append(f.upstream, newHostHTTPCall(callbackID, req))
 	return hostHTTPStreamResponse{
 		StatusCode: 200,
-		Headers:    http.Header{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}},
+		Headers:    http.Header{"Content-Type": []string{"text/event-stream"}, "x-copilot-service-request-id": []string{"synthetic-stream-service"}, "x-github-copilot-request-te": []string{" TRUE "}},
 		StreamID:   "upstream-1",
 	}, nil
 }
@@ -184,16 +184,16 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 	service := newService(fake)
 	now := time.Unix(100_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	headers, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-1", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
 	}
-	if headers.Get("Content-Type") != "text/event-stream" || headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" {
+	if headers.Get("Content-Type") != "text/event-stream" || headers.Get("X-Copilot-Service-Request-Id") != "synthetic-stream-service" || headers.Get("X-GitHub-Copilot-Request-Te") != " TRUE " {
 		t.Fatalf("stream headers = %#v", headers)
 	}
 	fake.wait(t)
@@ -210,7 +210,7 @@ func TestExecuteStreamPassThroughNormalizesChatChunksAndClosesAtDone(t *testing.
 		t.Fatalf("upstream stream request = %#v", fake.upstream)
 	}
 	var upstreamBody map[string]any
-	if json.Unmarshal(fake.upstream[0].Body, &upstreamBody) != nil || upstreamBody["model"] != "gpt-4.1" || upstreamBody["stream"] != true {
+	if json.Unmarshal(fake.upstream[0].Body, &upstreamBody) != nil || upstreamBody["model"] != "gpt-6" || upstreamBody["stream"] != true {
 		t.Fatalf("upstream stream body = %s", fake.upstream[0].Body)
 	}
 	if got := fake.upstream[0].Headers.Get("Authorization"); got != "Bearer tid=session;proxy-ep=proxy.individual.githubcopilot.com" {
@@ -243,11 +243,11 @@ func TestExecuteStreamPassThroughAcceptsSingleNewlineChatEvents(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(102_500, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-single-newline-chat", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -270,11 +270,11 @@ func TestExecuteStreamPassThroughFramesSplitSSEData(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(105_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.6-sol","input":"hi","stream":true}`)
+	payload := []byte(`{"model":"gpt-6","input":"hi","stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-split-sse", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.6-sol", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.6-sol", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -367,11 +367,11 @@ func TestExecuteStreamNativeClaudeClosesAtMessageStop(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(107_500, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"claude-sonnet-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"claude-sonnet-5-1","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-native-claude", contract.ExecutorRequest{
-		AuthID: "auth", Model: "claude-sonnet-4.6", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "claude-sonnet-4.6", Format: formatClaude})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "claude-sonnet-5-1", Format: formatClaude})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -387,8 +387,8 @@ func TestExecuteStreamNativeClaudeClosesAtMessageStop(t *testing.T) {
 }
 
 func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
-	first := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
-	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	first := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
 	fake := newStreamHost(
 		hostHTTPStreamReadResponse{Payload: []byte(first[:31])},
@@ -397,11 +397,11 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(110_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-2", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth", Model: "gpt-6", Format: formatClaude, SourceFormat: formatClaude,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -421,7 +421,7 @@ func TestExecuteStreamTranslatesSplitSSEFrames(t *testing.T) {
 
 func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 	frames := []string{
-		`data: {"type":"response.created","response":{"id":"resp-search","model":"gpt-5.6-terra"}}` + "\n\n",
+		`data: {"type":"response.created","response":{"id":"resp-search","model":"gpt-6"}}` + "\n\n",
 		`data: {"type":"response.output_item.added","item":{"id":"ws_123","type":"web_search_call","status":"in_progress"}}` + "\n\n",
 		`data: {"type":"response.web_search_call.searching","item_id":"ws_123"}` + "\n\n",
 		`data: {"type":"response.web_search_call.completed","item_id":"ws_123"}` + "\n\n",
@@ -437,18 +437,18 @@ func TestExecuteStreamRoutesAnthropicWebSearchToResponses(t *testing.T) {
 	now := time.Unix(115_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
-		"model":"claude-sonnet-5",
+		"model":"claude-sonnet-5-1",
 		"max_tokens":64000,
 		"messages":[{"role":"user","content":"Perform a web search"}],
 		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
 		"tool_choice":{"type":"tool","name":"web_search"}
 	}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-web-search", "downstream-web-search", contract.ExecutorRequest{
-		AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		Payload: payload, OriginalRequest: payload,
 		StorageJSON: mustJSON(t, executorStorage(now,
-			storedModel{ID: "claude-sonnet-5", Format: formatClaude},
-			storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse},
+			storedModel{ID: "claude-sonnet-5-1", Format: formatClaude},
+			storedModel{ID: "gpt-6", Format: formatOpenAIResponse},
 		)),
 	})
 	if errStream != nil {
@@ -478,10 +478,10 @@ func TestExecuteStreamDownstreamFailureStillClosesUpstream(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(120_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-3", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -499,11 +499,11 @@ func TestShutdownCancelsAndWaitsForForwardingTasks(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(122_500, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", "downstream-shutdown-wait", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -555,10 +555,10 @@ func TestExecuteStreamUpstreamErrorStillClosesBothStreams(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(125_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-upstream-error", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -654,10 +654,10 @@ func executeOpenAIStream(t *testing.T, fake *streamFakeHost, streamID string, at
 	t.Helper()
 	service := newService(fake)
 	service.now = func() time.Time { return at }
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "callback-stream", streamID, contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
-		Payload: payload, StorageJSON: mustJSON(t, executorStorage(at, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		Payload: payload, StorageJSON: mustJSON(t, executorStorage(at, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -901,11 +901,11 @@ func TestResponsesPassthroughRequiresTerminalEvent(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(190_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-missing-terminal", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -948,11 +948,11 @@ func TestResponsesPassthroughAcceptsEachTerminalType(t *testing.T) {
 			service := newService(fake)
 			now := time.Unix(191_000, 0).UTC()
 			service.now = func() time.Time { return now }
-			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+			payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-terminal-ok", contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 				Payload: payload, OriginalRequest: payload,
-				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 			})
 			if errStream != nil {
 				t.Fatal(errStream)
@@ -975,11 +975,11 @@ func TestResponsesStreamLogsTerminalStatus(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(196_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-terminal-status-log", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1005,11 +1005,11 @@ func TestResponsesStreamLogsNeverContainCompactionOrPromptContent(t *testing.T) 
 	service := newService(fake)
 	now := time.Unix(197_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"` + promptSentinel + `"}]}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"` + promptSentinel + `"}]}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-log-content-sentinel", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1036,11 +1036,11 @@ func TestResponsesPassthroughPreservesCompactionEventsBeforeTerminal(t *testing.
 	service := newService(fake)
 	now := time.Unix(192_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-compaction-before-terminal", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1062,8 +1062,8 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 	// Chat 的 [DONE] 只是传输哨兵；没有非空 finish_reason 时不能把 translator 合成的
 	// response.completed 当成真实 Responses 终态。
 	const sentinel = "PRIVATE_TRANSLATED_STREAM_FAILURE"
-	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
-	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
 	errorFrame := `data: {"error":{"message":"` + sentinel + `","type":"server_error"}}` + "\n\n"
 	for _, test := range []struct {
@@ -1079,11 +1079,11 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 			service := newService(fake)
 			now := time.Unix(193_000, 0).UTC()
 			service.now = func() time.Time { return now }
-			payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
+			payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}],"stream":true}`)
 			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-translated-missing-terminal", contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 				Payload: payload, OriginalRequest: payload,
-				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 			})
 			if errStream != nil {
 				t.Fatal(errStream)
@@ -1108,18 +1108,18 @@ func TestExecuteStreamTranslatedResponsesRejectsDoneWithoutAuthoritativeFinish(t
 }
 
 func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
-	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
-	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	chunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	finish := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
 	done := "data: [DONE]\n\n"
 	fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(chunk + finish + done)})
 	service := newService(fake)
 	now := time.Unix(194_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-4.1","input":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-translated-terminal", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1138,13 +1138,13 @@ func TestExecuteStreamTranslatedResponsesAcceptsTerminalEvent(t *testing.T) {
 }
 
 func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
-	chatChunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
+	chatChunk := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}` + "\n\n"
 	chatFinish := func(reason string) string {
-		return `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{},"finish_reason":"` + reason + `"}]}` + "\n\ndata: [DONE]\n\n"
+		return `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-6","choices":[{"index":0,"delta":{},"finish_reason":"` + reason + `"}]}` + "\n\ndata: [DONE]\n\n"
 	}
 	claudeFrames := func(reason string) string {
 		return strings.Join([]string{
-			`data: {"type":"message_start","message":{"id":"msg-1","model":"claude-sonnet-4.6","usage":{"input_tokens":1,"output_tokens":0}}}`,
+			`data: {"type":"message_start","message":{"id":"msg-1","model":"claude-sonnet-5-1","usage":{"input_tokens":1,"output_tokens":0}}}`,
 			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
 			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}`,
 			`data: {"type":"content_block_stop","index":0}`,
@@ -1160,13 +1160,13 @@ func TestExecuteStreamTranslatedResponsesPreservesIncompleteReasons(t *testing.T
 		wantStatus     string
 		wantReason     string
 	}{
-		{name: "chat length", model: "gpt-4.1", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("length"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
-		{name: "chat content filter", model: "gpt-4.1", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("content_filter"), wantStatus: "response.incomplete", wantReason: "content_filter"},
-		{name: "claude max tokens", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("max_tokens"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
-		{name: "claude context window", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("model_context_window_exceeded"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
-		{name: "claude end turn", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("end_turn"), wantStatus: "response.completed"},
-		{name: "claude tool use", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("tool_use"), wantStatus: "response.completed"},
-		{name: "claude refusal", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, frames: claudeFrames("refusal"), wantStatus: "response.completed"},
+		{name: "chat length", model: "gpt-6", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("length"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "chat content filter", model: "gpt-6", upstreamFormat: formatOpenAI, frames: chatChunk + chatFinish("content_filter"), wantStatus: "response.incomplete", wantReason: "content_filter"},
+		{name: "claude max tokens", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, frames: claudeFrames("max_tokens"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "claude context window", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, frames: claudeFrames("model_context_window_exceeded"), wantStatus: "response.incomplete", wantReason: "max_output_tokens"},
+		{name: "claude end turn", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, frames: claudeFrames("end_turn"), wantStatus: "response.completed"},
+		{name: "claude tool use", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, frames: claudeFrames("tool_use"), wantStatus: "response.completed"},
+		{name: "claude refusal", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, frames: claudeFrames("refusal"), wantStatus: "response.completed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fake := newStreamHost(hostHTTPStreamReadResponse{Payload: []byte(test.frames)})
@@ -1223,11 +1223,11 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 			service := newService(fake)
 			now := time.Unix(194_500, 0).UTC()
 			service.now = func() time.Time { return now }
-			payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+			payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 			_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-responses-to-chat-failure", contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 				Payload: payload, OriginalRequest: payload,
-				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 			})
 			if errStream != nil {
 				t.Fatal(errStream)
@@ -1250,7 +1250,7 @@ func TestExecuteStreamResponsesToChatRejectsFailureAndMissingTerminal(t *testing
 
 func TestExecuteStreamResponsesToChatAcceptsEventsWithoutSSESeparators(t *testing.T) {
 	delta := `{"type":"response.output_text.delta","response_id":"resp_1","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}`
-	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
+	completed := `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-6","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`
 	fake := newStreamHost(
 		hostHTTPStreamReadResponse{Payload: []byte("data: " + delta)},
 		hostHTTPStreamReadResponse{Payload: []byte("data: " + completed)},
@@ -1258,11 +1258,11 @@ func TestExecuteStreamResponsesToChatAcceptsEventsWithoutSSESeparators(t *testin
 	service := newService(fake)
 	now := time.Unix(194_750, 0).UTC()
 	service.now = func() time.Time { return now }
-	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}],"stream":true}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-responses-to-chat-no-separator", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, OriginalRequest: payload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1297,11 +1297,11 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 	service := newService(fake)
 	now := time.Unix(195_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	firstPayload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
+	firstPayload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
 	_, errStream := service.executeStreamRequest(context.Background(), "", "downstream-compaction-1", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: firstPayload, OriginalRequest: firstPayload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errStream != nil {
 		t.Fatal(errStream)
@@ -1321,7 +1321,7 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 	}
 
 	secondPayload := mustJSON(t, map[string]any{
-		"model":                "gpt-5.4",
+		"model":                "gpt-6",
 		"previous_response_id": responseID,
 		"input": []any{
 			map[string]any{"type": "compaction", "id": latestID, "encrypted_content": latestEncrypted},
@@ -1336,9 +1336,9 @@ func TestResponsesCompactionRoundTripPreservesClientManagedState(t *testing.T) {
 	service2 := newService(fake2)
 	service2.now = func() time.Time { return now }
 	_, errExecute := service2.executeRequest(context.Background(), "", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: secondPayload, OriginalRequest: secondPayload,
-		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+		StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 	})
 	if errExecute != nil {
 		t.Fatal(errExecute)

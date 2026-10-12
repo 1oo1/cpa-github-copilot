@@ -16,7 +16,7 @@ import (
 func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(50_000, 0).UTC() }
-	storage := executorStorage(service.now(), storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+	storage := executorStorage(service.now(), storedModel{ID: "gpt-6", Format: formatOpenAI})
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if req.CallbackID != "callback-execute" || req.URL != "https://api.individual.githubcopilot.com/chat/completions" {
 			t.Fatalf("upstream request = %#v", req)
@@ -31,20 +31,20 @@ func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
 			t.Fatalf("versioned identity headers = %#v", headers)
 		}
 		var body map[string]any
-		if json.Unmarshal(req.Body, &body) != nil || body["model"] != "gpt-4.1" || body["stream"] != false {
+		if json.Unmarshal(req.Body, &body) != nil || body["model"] != "gpt-6" || body["stream"] != false {
 			t.Fatalf("upstream body = %s", req.Body)
 		}
 		return contract.HTTPResponse{
 			StatusCode: 200,
-			Headers:    http.Header{"Content-Type": []string{"application/json"}, "X-GitHub-Request-Id": []string{"request-1"}, "x-copilot-service-request-id": []string{"synthetic-service-1"}},
-			Body:       []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`),
+			Headers:    http.Header{"Content-Type": []string{"application/json"}, "X-GitHub-Request-Id": []string{"request-1"}, "x-copilot-service-request-id": []string{"synthetic-service-1"}, "x-github-copilot-request-te": []string{" TRUE "}},
+			Body:       []byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-6","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`),
 		}, nil
 	})
 	service.host = fake
-	payload := []byte(`{"model":"github-copilot/gpt-4.1","messages":[{"role":"user","content":"hello"}]}`)
+	payload := []byte(`{"model":"github-copilot/gpt-6","messages":[{"role":"user","content":"hello"}]}`)
 	result, errExecute := service.executeRequest(context.Background(), "callback-execute", contract.ExecutorRequest{
 		AuthID:          "auth-1",
-		Model:           "github-copilot/gpt-4.1",
+		Model:           "github-copilot/gpt-6",
 		Format:          formatOpenAI,
 		SourceFormat:    formatOpenAI,
 		OriginalRequest: payload,
@@ -55,7 +55,7 @@ func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
 	if errExecute != nil {
 		t.Fatal(errExecute)
 	}
-	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-1" {
+	if !strings.Contains(string(result.Payload), `"content":"hello"`) || result.Headers.Get("X-GitHub-Request-Id") != "request-1" || result.Headers.Get("X-Copilot-Service-Request-Id") != "synthetic-service-1" || result.Headers.Get("X-GitHub-Copilot-Request-Te") != " TRUE " {
 		t.Fatalf("executor result = %#v", result)
 	}
 }
@@ -63,7 +63,7 @@ func TestExecuteUsesHostRuntimeAndCopilotHeaders(t *testing.T) {
 func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(60_000, 0).UTC() }
-	storage := executorStorage(service.now(), storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
+	storage := executorStorage(service.now(), storedModel{ID: "gpt-6", Format: formatOpenAIResponse})
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if !strings.HasSuffix(req.URL, "/responses") {
 			t.Fatalf("URL = %s", req.URL)
@@ -72,7 +72,7 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 		if errDecode := json.Unmarshal(req.Body, &body); errDecode != nil {
 			t.Fatalf("decode translated body: %v", errDecode)
 		}
-		if _, ok := body["input"]; !ok || body["model"] != "gpt-5.4" {
+		if _, ok := body["input"]; !ok || body["model"] != "gpt-6" {
 			t.Fatalf("translated Responses body = %s", req.Body)
 		}
 		return contract.HTTPResponse{StatusCode: 200, Body: []byte(`{
@@ -80,15 +80,15 @@ func TestExecuteTranslatesChatCompletionsToResponsesAndBack(t *testing.T) {
 			"object":"response",
 			"created_at":1,
 			"status":"completed",
-			"model":"gpt-5.4",
+			"model":"gpt-6",
 			"output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"translated hello","annotations":[]}]}],
 			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
 		}`)}, nil
 	})
 	service.host = fake
-	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hello"}]}`)
 	result, errExecute := service.executeRequest(context.Background(), "callback-responses", contract.ExecutorRequest{
-		AuthID: "auth-1", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth-1", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
 	})
 	if errExecute != nil {
@@ -107,7 +107,7 @@ func TestExecuteRejectsFailedResponsesBeforeChatTranslation(t *testing.T) {
 	const sentinel = "PRIVATE_RESPONSES_FAILURE"
 	service := newService(nil)
 	service.now = func() time.Time { return time.Unix(65_000, 0).UTC() }
-	storage := executorStorage(service.now(), storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
+	storage := executorStorage(service.now(), storedModel{ID: "gpt-6", Format: formatOpenAIResponse})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{
 			"id":"resp_failed","object":"response","status":"failed",
@@ -115,9 +115,9 @@ func TestExecuteRejectsFailedResponsesBeforeChatTranslation(t *testing.T) {
 		}`)}, nil
 	})
 	service.host = fake
-	payload := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hello"}]}`)
 	_, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).code != "upstream_response_failed" {
@@ -163,11 +163,11 @@ func TestExecuteNativeResponsesRequiresAndPreservesTerminalStatus(t *testing.T) 
 			})
 			service := newService(fake)
 			service.now = func() time.Time { return now }
-			payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`)
+			payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hello"}]}`)
 			result, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 				OriginalRequest: payload, Payload: payload,
-				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})),
+				StorageJSON: mustJSON(t, executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})),
 			})
 			if test.wantFailure != "" {
 				if failure == nil || failure.(*serviceError).code != test.wantFailure {
@@ -240,8 +240,8 @@ func TestExecuteRejectsTranslatedSourceErrorsBeforeResponsesConversion(t *testin
 		upstreamFormat string
 		body           string
 	}{
-		{name: "chat", model: "gpt-4.1", upstreamFormat: formatOpenAI, body: `{"error":{"type":"server_error","message":"` + sentinel + `"}}`},
-		{name: "claude", model: "claude-sonnet-4.6", upstreamFormat: formatClaude, body: `{"type":"error","error":{"type":"api_error","message":"` + sentinel + `"}}`},
+		{name: "chat", model: "gpt-6", upstreamFormat: formatOpenAI, body: `{"error":{"type":"server_error","message":"` + sentinel + `"}}`},
+		{name: "claude", model: "claude-sonnet-5-1", upstreamFormat: formatClaude, body: `{"type":"error","error":{"type":"api_error","message":"` + sentinel + `"}}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, failure, fake := executeSourceResponseAsResponses(t, test.model, test.upstreamFormat, []byte(test.body))
@@ -266,28 +266,28 @@ func TestExecuteTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
 		wantReason     string
 	}{
 		{
-			name: "chat length", model: "gpt-4.1", upstreamFormat: formatOpenAI,
-			body:       `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"length"}]}`,
+			name: "chat length", model: "gpt-6", upstreamFormat: formatOpenAI,
+			body:       `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-6","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"length"}]}`,
 			wantStatus: "incomplete", wantReason: "max_output_tokens",
 		},
 		{
-			name: "chat content filter", model: "gpt-4.1", upstreamFormat: formatOpenAI,
-			body:       `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"content_filter"}]}`,
+			name: "chat content filter", model: "gpt-6", upstreamFormat: formatOpenAI,
+			body:       `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-6","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"content_filter"}]}`,
 			wantStatus: "incomplete", wantReason: "content_filter",
 		},
 		{
-			name: "claude max tokens", model: "claude-sonnet-4.6", upstreamFormat: formatClaude,
-			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-4.6","content":[{"type":"text","text":"hello"}],"stop_reason":"max_tokens","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+			name: "claude max tokens", model: "claude-sonnet-5-1", upstreamFormat: formatClaude,
+			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-5-1","content":[{"type":"text","text":"hello"}],"stop_reason":"max_tokens","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantStatus: "incomplete", wantReason: "max_output_tokens",
 		},
 		{
-			name: "claude context window", model: "claude-sonnet-4.6", upstreamFormat: formatClaude,
-			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-4.6","content":[{"type":"text","text":"hello"}],"stop_reason":"model_context_window_exceeded","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+			name: "claude context window", model: "claude-sonnet-5-1", upstreamFormat: formatClaude,
+			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-5-1","content":[{"type":"text","text":"hello"}],"stop_reason":"model_context_window_exceeded","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantStatus: "incomplete", wantReason: "max_output_tokens",
 		},
 		{
-			name: "claude end turn", model: "claude-sonnet-4.6", upstreamFormat: formatClaude,
-			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-4.6","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+			name: "claude end turn", model: "claude-sonnet-5-1", upstreamFormat: formatClaude,
+			body:       `{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-5-1","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
 			wantStatus: "completed",
 		},
 	} {
@@ -316,7 +316,7 @@ func TestExecuteTranslatedResponsesPreservesIncompleteReasons(t *testing.T) {
 
 func TestExecuteTranslatedClaudeNonStreamPreservesStructuredContent(t *testing.T) {
 	body := []byte(`{
-		"id":"msg-structured","type":"message","role":"assistant","model":"claude-sonnet-4.6",
+		"id":"msg-structured","type":"message","role":"assistant","model":"claude-sonnet-5-1",
 		"content":[
 			{"type":"thinking","thinking":"consider","signature":"signed-reasoning"},
 			{"type":"text","text":"hello"},
@@ -325,7 +325,7 @@ func TestExecuteTranslatedClaudeNonStreamPreservesStructuredContent(t *testing.T
 		"stop_reason":"tool_use","stop_sequence":null,
 		"usage":{"input_tokens":7,"output_tokens":5}
 	}`)
-	result, failure, _ := executeSourceResponseAsResponses(t, "claude-sonnet-4.6", formatClaude, body)
+	result, failure, _ := executeSourceResponseAsResponses(t, "claude-sonnet-5-1", formatClaude, body)
 	if failure != nil {
 		t.Fatal(failure)
 	}
@@ -386,9 +386,9 @@ func TestPrepareInferenceSelectsAllProtocolEndpoints(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{model: "gpt-4.1", format: formatOpenAI, path: "/chat/completions", body: `{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`},
-		{model: "gpt-5.4", format: formatOpenAIResponse, path: "/responses", body: `{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`},
-		{model: "claude-sonnet-4.6", format: formatClaude, path: "/v1/messages", body: `{"model":"claude-sonnet-4.6","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`},
+		{model: "gpt-6", format: formatOpenAI, path: "/chat/completions", body: `{"model":"gpt-6","messages":[{"role":"user","content":"hi"}]}`},
+		{model: "gpt-6", format: formatOpenAIResponse, path: "/responses", body: `{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`},
+		{model: "claude-sonnet-5-1", format: formatClaude, path: "/v1/messages", body: `{"model":"claude-sonnet-5-1","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`},
 	} {
 		t.Run(test.model, func(t *testing.T) {
 			storage := executorStorage(now, storedModel{ID: test.model, Format: test.format})
@@ -411,24 +411,24 @@ func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testin
 	now := time.Unix(71_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now,
-		storedModel{ID: "claude-sonnet-5", Format: formatClaude},
-		storedModel{ID: "gpt-5.6-terra", Format: formatOpenAIResponse, Family: "gpt-5.6-terra", MaxPromptTokens: 922_000},
+		storedModel{ID: "claude-sonnet-5-1", Format: formatClaude},
+		storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6", MaxPromptTokens: 922_000},
 	)
 	payload := []byte(`{
-		"model":"claude-sonnet-5",
+		"model":"claude-sonnet-5-1",
 		"max_tokens":64000,
 		"messages":[{"role":"user","content":"Perform a web search"}],
 		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
 		"tool_choice":{"type":"tool","name":"web_search"}
 	}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		OriginalRequest: payload, Payload: payload, StorageJSON: mustJSON(t, storage),
 	}, true)
 	if failure != nil {
 		t.Fatal(failure)
 	}
-	if prepared.model != "gpt-5.6-terra" || prepared.upstreamFormat != formatOpenAIResponse ||
+	if prepared.model != "gpt-6" || prepared.upstreamFormat != formatOpenAIResponse ||
 		prepared.translatorFormat != string(sdktranslator.FormatCodex) || prepared.outputFormat != formatClaude ||
 		!strings.HasSuffix(prepared.upstreamURL, "/responses") {
 		t.Fatalf("prepared route = %#v", prepared)
@@ -441,18 +441,18 @@ func TestPrepareInferenceRoutesStandaloneAnthropicWebSearchToResponses(t *testin
 		t.Fatal(errDecode)
 	}
 	tools, ok := upstream["tools"].([]any)
-	if !ok || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" || upstream["model"] != "gpt-5.6-terra" {
+	if !ok || len(tools) != 1 || tools[0].(map[string]any)["type"] != "web_search" || upstream["model"] != "gpt-6" {
 		t.Fatalf("upstream payload = %s", prepared.upstreamPayload)
 	}
 	fields := preparedInferenceLogFields(prepared, true)
-	if fields["requested_model"] != "claude-sonnet-5" || fields["web_search_routed"] != true {
+	if fields["requested_model"] != "claude-sonnet-5-1" || fields["web_search_routed"] != true {
 		t.Fatalf("prepared log fields = %#v", fields)
 	}
 }
 
 func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 	now := time.Unix(71_500, 0).UTC()
-	standalone := `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
+	standalone := `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20260209","name":"web_search"}]}`
 	for _, test := range []struct {
 		name       string
 		configure  func(*settings)
@@ -463,25 +463,25 @@ func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 		wantFormat string
 	}{
 		{
-			name: "ordinary Anthropic tool stays on Claude", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
-			payload:   `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`,
-			wantModel: "claude-sonnet-5", wantFormat: formatClaude,
+			name: "ordinary Anthropic tool stays on Claude", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
+			payload:   `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"lookup"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]}`,
+			wantModel: "claude-sonnet-5-1", wantFormat: formatClaude,
 		},
 		{
-			name: "mixed tools fail closed", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
-			payload:  `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup","input_schema":{"type":"object"}}]}`,
+			name: "mixed tools fail closed", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
+			payload:  `{"model":"claude-sonnet-5-1","messages":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"lookup","input_schema":{"type":"object"}}]}`,
 			wantCode: "unsupported_feature",
 		},
 		{
-			name: "disabled route fails closed", configure: func(cfg *settings) { cfg.WebSearchModel = "" }, models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			name: "disabled route fails closed", configure: func(cfg *settings) { cfg.WebSearchModel = "" }, models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
 			payload: standalone, wantCode: "unsupported_feature",
 		},
 		{
-			name: "missing configured model fails closed", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}},
+			name: "missing configured model fails closed", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}},
 			payload: standalone, wantCode: "model_not_supported",
 		},
 		{
-			name: "configured model must use Responses", models: []storedModel{{ID: "claude-sonnet-5", Format: formatClaude}, {ID: "gpt-5.6-terra", Format: formatOpenAI}},
+			name: "configured model must use Responses", models: []storedModel{{ID: "claude-sonnet-5-1", Format: formatClaude}, {ID: "gpt-6", Format: formatOpenAI}},
 			payload: standalone, wantCode: "unsupported_feature",
 		},
 	} {
@@ -496,7 +496,7 @@ func TestPrepareInferenceAnthropicWebSearchRoutingGuards(t *testing.T) {
 				}
 			}
 			prepared, failure := service.prepareInference(contract.ExecutorRequest{
-				AuthID: "auth", Model: "claude-sonnet-5", Format: formatClaude, SourceFormat: formatClaude,
+				AuthID: "auth", Model: "claude-sonnet-5-1", Format: formatClaude, SourceFormat: formatClaude,
 				Payload: []byte(test.payload), StorageJSON: mustJSON(t, executorStorage(now, test.models...)),
 			}, true)
 			if test.wantCode != "" {
@@ -541,16 +541,16 @@ func TestPrepareInferencePreservesNativeAnthropicXHighEffort(t *testing.T) {
 	now := time.Unix(72_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
-		"model":"claude-opus-4.8",
+		"model":"claude-opus-5-1",
 		"max_tokens":64000,
 		"reasoning_effort":"xhigh",
 		"messages":[{"role":"user","content":"hi"}]
 	}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "claude-opus-4.8", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "claude-opus-5-1", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		OriginalRequest: payload, Payload: payload,
 		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
-			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
 		})),
 	}, false)
@@ -591,10 +591,10 @@ func TestPrepareInferenceForwardsCatalogCapabilitiesToRequestTranslation(t *test
 
 	t.Run("max output tokens clamps translated max_tokens", func(t *testing.T) {
 		upstream := prepare(t, `{
-			"model":"claude-opus-4.8",
+			"model":"claude-opus-5-1",
 			"max_tokens":100000,
 			"messages":[{"role":"user","content":"hi"}]
-		}`, storedModel{ID: "claude-opus-4.8", Format: formatClaude, MaxOutputTokens: 32_000})
+		}`, storedModel{ID: "claude-opus-5-1", Format: formatClaude, MaxOutputTokens: 32_000})
 		if upstream["max_tokens"] != float64(32_000) {
 			t.Fatalf("max_tokens = %#v, want 32000", upstream["max_tokens"])
 		}
@@ -602,11 +602,11 @@ func TestPrepareInferenceForwardsCatalogCapabilitiesToRequestTranslation(t *test
 
 	t.Run("max level maps xhigh to adaptive max effort", func(t *testing.T) {
 		upstream := prepare(t, `{
-			"model":"claude-opus-4.8",
+			"model":"claude-opus-5-1",
 			"reasoning_effort":"xhigh",
 			"messages":[{"role":"user","content":"hi"}]
 		}`, storedModel{
-			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
 		})
 		thinking, _ := upstream["thinking"].(map[string]any)
@@ -618,11 +618,11 @@ func TestPrepareInferenceForwardsCatalogCapabilitiesToRequestTranslation(t *test
 
 	t.Run("without max level xhigh downgrades to high", func(t *testing.T) {
 		upstream := prepare(t, `{
-			"model":"claude-opus-4.8",
+			"model":"claude-opus-5-1",
 			"reasoning_effort":"xhigh",
 			"messages":[{"role":"user","content":"hi"}]
 		}`, storedModel{
-			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 			ReasoningLevels: []string{"low", "medium", "high", "xhigh"}, ReasoningLevelsDeclared: true,
 		})
 		thinking, _ := upstream["thinking"].(map[string]any)
@@ -638,17 +638,17 @@ func TestPrepareInferenceKeepsNativeClaudeXHighEffort(t *testing.T) {
 	now := time.Unix(72_800, 0).UTC()
 	service.now = func() time.Time { return now }
 	payload := []byte(`{
-		"model":"claude-opus-4.8",
+		"model":"claude-opus-5-1",
 		"max_tokens":64000,
 		"thinking":{"type":"adaptive"},
 		"output_config":{"effort":"xhigh"},
 		"messages":[{"role":"user","content":"hi"}]
 	}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
+		AuthID: "auth", Model: "claude-opus-5-1", Format: formatClaude, SourceFormat: formatClaude,
 		OriginalRequest: payload, Payload: payload,
 		StorageJSON: mustJSON(t, executorStorage(now, storedModel{
-			ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+			ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 			ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, ReasoningLevelsDeclared: true,
 		})),
 	}, false)
@@ -680,13 +680,13 @@ func TestResponsesReasoningEffortUsesCatalogLevels(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw := []byte(`{
-				"model":"gpt-5.4",
+				"model":"gpt-6",
 				"store":true,
 				"reasoning":{"effort":"` + test.reasoning + `"},
 				"input":[{"role":"user","content":"hi"}]
 			}`)
 			route := modelRoute{Format: formatOpenAIResponse, ReasoningLevels: []string{"low", "high", "ultra"}, ReasoningLevelsDeclared: true}
-			normalized, errNormalize := normalizeInferencePayloadForRoute(raw, "gpt-5.4", route, false, true)
+			normalized, errNormalize := normalizeInferencePayloadForRoute(raw, "gpt-6", route, false, true)
 			if errNormalize != nil {
 				t.Fatal(errNormalize)
 			}
@@ -716,7 +716,7 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	prepare := func(t *testing.T, model, payload string) preparedInference {
 		t.Helper()
 		stored := storedModel{ID: model, Format: formatClaude}
-		if model == "claude-opus-4.8" {
+		if model == "claude-opus-5-1" {
 			stored.AdaptiveThinking = true
 			stored.ReasoningLevels = []string{"low", "medium", "high", "xhigh"}
 			stored.ReasoningLevelsDeclared = true
@@ -740,8 +740,8 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	}
 
 	t.Run("does not invent eager input streaming or undeclared context editing", func(t *testing.T) {
-		prepared := prepare(t, "claude-opus-4.8", `{
-			"model":"claude-opus-4.8",
+		prepared := prepare(t, "claude-opus-5-1", `{
+			"model":"claude-opus-5-1",
 			"messages":[
 				{"role":"user","content":"Use the tool"},
 				{"role":"system","content":"keep this message in place"}
@@ -779,8 +779,8 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	})
 
 	t.Run("removes unsupported strict tool metadata", func(t *testing.T) {
-		prepared := prepare(t, "claude-opus-4.8", `{
-			"model":"claude-opus-4.8",
+		prepared := prepare(t, "claude-opus-5-1", `{
+			"model":"claude-opus-5-1",
 			"messages":[{"role":"user","content":"Use the tool"}],
 			"tools":[{
 				"name":"lookup",
@@ -811,9 +811,9 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	t.Run("converts Claude Code enabled thinking for adaptive models", func(t *testing.T) {
 		contextEditing := true
 		prepared, failure := service.prepareInference(contract.ExecutorRequest{
-			AuthID: "auth", Model: "claude-opus-4.8", Format: formatClaude, SourceFormat: formatClaude,
+			AuthID: "auth", Model: "claude-opus-5-1", Format: formatClaude, SourceFormat: formatClaude,
 			Payload: []byte(`{
-				"model":"claude-opus-4.8",
+				"model":"claude-opus-5-1",
 				"max_tokens":32000,
 				"messages":[{"role":"user","content":"Hello"}],
 				"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
@@ -821,7 +821,7 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 				"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}
 			}`),
 			StorageJSON: mustJSON(t, executorStorage(now, storedModel{
-				ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+				ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 				ReasoningLevels: []string{"xhigh"}, ReasoningLevelsDeclared: true,
 				SupportsContextEditing: &contextEditing,
 			})),
@@ -855,7 +855,7 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	})
 
 	t.Run("sends interleaved thinking beta unconditionally for non-adaptive routes", func(t *testing.T) {
-		for _, model := range []string{"claude-haiku-4.5", "claude-sonnet-4", "claude-sonnet-4.5"} {
+		for _, model := range []string{"claude-haiku-5-1", "claude-sonnet-5-1", "claude-sonnet-5-1"} {
 			t.Run(model, func(t *testing.T) {
 				prepared := prepare(t, model, `{
 					"model":"`+model+`",
@@ -882,8 +882,8 @@ func TestAnthropicMessagesNormalizationUsesCatalogCapabilities(t *testing.T) {
 	})
 
 	t.Run("omits empty tools and still sends interleaved thinking beta for non-adaptive routes", func(t *testing.T) {
-		prepared := prepare(t, "claude-haiku-4.5", `{
-			"model":"claude-haiku-4.5",
+		prepared := prepare(t, "claude-haiku-5-1", `{
+			"model":"claude-haiku-5-1",
 			"messages":[{"role":"user","content":"Hello"}],
 			"tools":[]
 		}`)
@@ -901,9 +901,9 @@ func TestBudgetThinkingNormalizesFromCatalogCapabilities(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(77_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	const model = "claude-haiku-4.5"
+	const model = "claude-haiku-5-1"
 	payload := []byte(`{
-		"model":"claude-haiku-4.5",
+		"model":"claude-haiku-5-1",
 		"max_tokens":32000,
 		"system":[{"type":"text","text":"top-level system"}],
 		"messages":[
@@ -1046,7 +1046,7 @@ func TestAnthropicMessagesOmitsTemperatureLikeVSCodeBuilder(t *testing.T) {
 }
 
 func TestGitHubCopilotOpenAICompatibility(t *testing.T) {
-	for _, model := range []string{"gemini-3.6-flash", "gpt-4.1", "kimi-k2.7-code"} {
+	for _, model := range []string{"gemini-3.6-flash", "gpt-6", "kimi-k2.7-code"} {
 		t.Run(model, func(t *testing.T) {
 			raw := []byte(`{
 				"model":"` + model + `",
@@ -1078,14 +1078,14 @@ func TestExecuteUpstreamErrorDoesNotExposeBodyOrToken(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(80_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(sentinel)}, nil
 	})
 	service.host = fake
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}]}`)
 	_, failure := service.executeRequest(context.Background(), "", contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || strings.Contains(failure.Error(), sentinel) || strings.Contains(failure.Error(), storage.CopilotSessionToken) {
@@ -1102,13 +1102,13 @@ func TestExecuteHTTPRequestEnforcesCredentialOrigin(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(90_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	})
 	service.host = fake
 	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
-		URL: "https://attacker.example/collect", Method: http.MethodPost, Body: []byte(`{"model":"gpt-4.1"}`), StorageJSON: mustJSON(t, storage),
+		URL: "https://attacker.example/collect", Method: http.MethodPost, Body: []byte(`{"model":"gpt-6"}`), StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).httpStatus != http.StatusBadRequest {
 		t.Fatalf("failure = %#v", failure)
@@ -1122,7 +1122,7 @@ func TestExecuteHTTPRequestRejectsResponsesCompactWithoutHostCall(t *testing.T) 
 	service := newService(nil)
 	now := time.Unix(91_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6"})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	})
@@ -1130,7 +1130,7 @@ func TestExecuteHTTPRequestRejectsResponsesCompactWithoutHostCall(t *testing.T) 
 	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://api.individual.githubcopilot.com/responses/compact",
 		Method:      http.MethodPost,
-		Body:        []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`),
+		Body:        []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`),
 		StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).code != "unsupported_feature" {
@@ -1145,7 +1145,7 @@ func TestExecuteHTTPRequestRejectsInferenceNonPOSTWithoutHostCall(t *testing.T) 
 	service := newService(nil)
 	now := time.Unix(91_500, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6"})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	})
@@ -1155,7 +1155,7 @@ func TestExecuteHTTPRequestRejectsInferenceNonPOSTWithoutHostCall(t *testing.T) 
 			_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				URL:         "https://api.individual.githubcopilot.com/responses",
 				Method:      method,
-				Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
+				Body:        []byte(`{"model":"gpt-6","input":[]}`),
 				StorageJSON: mustJSON(t, storage),
 			})
 			if failure == nil || failure.(*serviceError).code != "invalid_request" {
@@ -1172,7 +1172,7 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 	service := newService(nil)
 	now := time.Unix(91_750, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4"})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6"})
 	fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 		return contract.HTTPResponse{StatusCode: http.StatusOK}, nil
 	})
@@ -1193,7 +1193,7 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 			_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				URL:         "https://api.individual.githubcopilot.com" + endpoint,
 				Method:      http.MethodPost,
-				Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
+				Body:        []byte(`{"model":"gpt-6","input":[]}`),
 				StorageJSON: mustJSON(t, storage),
 			})
 			if failure == nil || failure.(*serviceError).code != "invalid_request" {
@@ -1204,7 +1204,7 @@ func TestExecuteHTTPRequestRejectsNoncanonicalInferencePathsWithoutHostCall(t *t
 	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL:         "https://API.INDIVIDUAL.GITHUBCOPILOT.COM/responses",
 		Method:      http.MethodPost,
-		Body:        []byte(`{"model":"gpt-5.4","input":[]}`),
+		Body:        []byte(`{"model":"gpt-6","input":[]}`),
 		StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).code != "invalid_request" {
@@ -1221,7 +1221,7 @@ func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 	now := time.Unix(92_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{
-		ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4", MaxPromptTokens: 100_000,
+		ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6", MaxPromptTokens: 100_000,
 	})
 	var upstreamBody map[string]any
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
@@ -1235,7 +1235,7 @@ func TestExecuteHTTPRequestAppliesResponsesBodyPolicy(t *testing.T) {
 		AuthID:      "auth",
 		URL:         "https://api.individual.githubcopilot.com/responses",
 		Method:      http.MethodPost,
-		Body:        []byte(`{"model":"gpt-5.4","store":true,"input":[{"role":"user","content":"hi"}]}`),
+		Body:        []byte(`{"model":"gpt-6","store":true,"input":[{"role":"user","content":"hi"}]}`),
 		StorageJSON: mustJSON(t, storage),
 	})
 	if failure != nil {
@@ -1282,13 +1282,13 @@ func TestExecuteHTTPRequestNativeResponsesRequiresTerminalStatus(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Unix(92_500, 0).UTC()
-			storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
+			storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})
 			fake := newFakeHost(t, func(hostHTTPCall) (contract.HTTPResponse, error) {
 				return contract.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(test.body)}, nil
 			})
 			service := newService(fake)
 			service.now = func() time.Time { return now }
-			requestBody := fmt.Sprintf(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}],"stream":%t}`, test.stream)
+			requestBody := fmt.Sprintf(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}],"stream":%t}`, test.stream)
 			result, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 				AuthID: "auth", URL: individualCopilotAPIURL + "/responses", Method: http.MethodPost,
 				Body:        []byte(requestBody),
@@ -1314,7 +1314,7 @@ func TestExecuteHTTPRequestAppliesChatBodyPolicy(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(93_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})
 	var upstreamBody map[string]any
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if errDecode := json.Unmarshal(req.Body, &upstreamBody); errDecode != nil {
@@ -1325,7 +1325,7 @@ func TestExecuteHTTPRequestAppliesChatBodyPolicy(t *testing.T) {
 	service.host = fake
 	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		AuthID: "auth", URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
-		Body:        []byte(`{"model":"gpt-4.1","store":true,"reasoning_effort":"high","messages":[{"role":"developer","content":"rules"}]}`),
+		Body:        []byte(`{"model":"gpt-6","store":true,"reasoning_effort":"high","messages":[{"role":"developer","content":"rules"}]}`),
 		StorageJSON: mustJSON(t, storage),
 	})
 	if failure != nil {
@@ -1371,8 +1371,8 @@ func TestExecuteHTTPRequestPreservesClaudeBodyOnSameOriginNonInferenceRequest(t 
 	service := newService(nil)
 	now := time.Unix(94_500, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
-	const requestBody = `{ "model":"claude-haiku-4.5", "max_tokens":0, "tools":[{"name":"lookup","eager_input_streaming":true}] }`
+	storage := executorStorage(now, storedModel{ID: "claude-haiku-5-1", Format: formatClaude})
+	const requestBody = `{ "model":"claude-haiku-5-1", "max_tokens":0, "tools":[{"name":"lookup","eager_input_streaming":true}] }`
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		if string(req.Body) != requestBody {
 			t.Fatalf("non-inference Claude body changed: got=%s want=%s", req.Body, requestBody)
@@ -1395,7 +1395,7 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	service := newService(nil)
 	now := time.Unix(95_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "claude-haiku-4.5", Format: formatClaude})
+	storage := executorStorage(now, storedModel{ID: "claude-haiku-5-1", Format: formatClaude})
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
 		var body map[string]any
 		if errDecode := json.Unmarshal(req.Body, &body); errDecode != nil {
@@ -1416,7 +1416,7 @@ func TestExecuteHTTPRequestAppliesAnthropicEagerToolCompatibility(t *testing.T) 
 	})
 	service.host = fake
 	body := []byte(`{
-		"model":"claude-haiku-4.5",
+		"model":"claude-haiku-5-1",
 		"messages":[{"role":"user","content":"Use the tool"}],
 		"tools":[{"name":"lookup","eager_input_streaming":true,"input_schema":{"type":"object"}}]
 	}`)
@@ -1436,7 +1436,7 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 	now := time.Unix(96_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	storage := executorStorage(now, storedModel{
-		ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+		ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 		ReasoningLevels: []string{"low", "medium", "high"}, ReasoningLevelsDeclared: true,
 	})
 	fake := newFakeHost(t, func(req hostHTTPCall) (contract.HTTPResponse, error) {
@@ -1459,7 +1459,7 @@ func TestExecuteHTTPRequestAppliesDiscoveredAdaptiveThinking(t *testing.T) {
 	})
 	service.host = fake
 	body := []byte(`{
-		"model":"claude-opus-4.8",
+		"model":"claude-opus-5-1",
 		"max_tokens":32000,
 		"messages":[{"role":"user","content":"Hello"}],
 		"temperature":0.7,
@@ -1482,12 +1482,12 @@ func TestExecuteHTTPRequestUsesDiscoveredAnthropicCapabilities(t *testing.T) {
 	service.now = func() time.Time { return now }
 	contextEditing := true
 	storage := executorStorage(now, storedModel{
-		ID: "claude-opus-4.8", Format: formatClaude, AdaptiveThinking: true,
+		ID: "claude-opus-5-1", Format: formatClaude, AdaptiveThinking: true,
 		ReasoningLevels: []string{"low", "medium", "high", "xhigh"}, ReasoningLevelsDeclared: true,
 		SupportsContextEditing: &contextEditing,
 	})
 	body := []byte(`{
-		"model":"claude-opus-4.8",
+		"model":"claude-opus-5-1",
 		"messages":[{"role":"user","content":"Use the tool"}],
 		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"thinking":{"type":"adaptive","display":"omitted"},
@@ -1552,10 +1552,10 @@ func TestPrepareInferenceRejectsResponsesCompactAlt(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(150_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
-	payload := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`)
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 	_, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, StorageJSON: mustJSON(t, storage), Alt: "responses/compact",
 	}, false)
 	if failure == nil || failure.code != "unsupported_feature" {
@@ -1569,7 +1569,7 @@ func TestPrepareInferenceRequiresExplicitStreamingCapability(t *testing.T) {
 	service.now = func() time.Time { return now }
 	trueValue := true
 	falseValue := false
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}]}`)
 	for _, test := range []struct {
 		name      string
 		streaming *bool
@@ -1580,10 +1580,10 @@ func TestPrepareInferenceRequiresExplicitStreamingCapability(t *testing.T) {
 		{name: "omitted", wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI, Streaming: test.streaming})
+			storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI, Streaming: test.streaming})
 			storage.Models[0].Streaming = test.streaming
 			_, failure := service.prepareInference(contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 				Payload: payload, StorageJSON: mustJSON(t, storage),
 			}, true)
 			if (failure != nil) != test.wantError {
@@ -1601,7 +1601,7 @@ func TestExecuteHTTPRequestRejectsUnsupportedStreamingBody(t *testing.T) {
 	now := time.Unix(150_750, 0).UTC()
 	service.now = func() time.Time { return now }
 	falseValue := false
-	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI, Streaming: &falseValue})
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI, Streaming: &falseValue})
 	fake := newFakeHost(t, func(call hostHTTPCall) (contract.HTTPResponse, error) {
 		t.Fatalf("unexpected host HTTP call %s %s", call.Method, call.URL)
 		return contract.HTTPResponse{}, nil
@@ -1609,7 +1609,7 @@ func TestExecuteHTTPRequestRejectsUnsupportedStreamingBody(t *testing.T) {
 	service.host = fake
 	_, failure := service.executeProviderHTTPRequest(context.Background(), "", contract.ExecutorHTTPRequest{
 		URL: "https://api.individual.githubcopilot.com/chat/completions", Method: http.MethodPost,
-		Body: []byte(`{"model":"gpt-4.1","stream":true,"messages":[]}`), StorageJSON: mustJSON(t, storage),
+		Body: []byte(`{"model":"gpt-6","stream":true,"messages":[]}`), StorageJSON: mustJSON(t, storage),
 	})
 	if failure == nil || failure.(*serviceError).code != "unsupported_feature" {
 		t.Fatalf("failure = %#v", failure)
@@ -1627,19 +1627,19 @@ func TestPrepareInferenceRejectsCrossFormatWithResponsesStatefulMarkers(t *testi
 		name    string
 		payload string
 	}{
-		{name: "previous_response_id", payload: `{"model":"gpt-4.1","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`},
-		{name: "context_management", payload: `{"model":"gpt-4.1","context_management":[{"type":"compaction","compact_threshold":1000}],"input":[{"role":"user","content":"hi"}]}`},
-		{name: "compaction input item", payload: `{"model":"gpt-4.1","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
-		{name: "opaque reasoning ID", payload: `{"model":"gpt-4.1","input":[{"type":"reasoning","id":"CzDhIBSZ31VSyW6rYILnFerwKDkArecaC","encrypted_content":"synthetic-enc"},{"role":"user","content":"hi"}]}`},
-		{name: "encrypted reasoning input item", payload: `{"model":"gpt-4.1","input":[{"type":"reasoning","id":"rs_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
+		{name: "previous_response_id", payload: `{"model":"gpt-6","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`},
+		{name: "context_management", payload: `{"model":"gpt-6","context_management":[{"type":"compaction","compact_threshold":1000}],"input":[{"role":"user","content":"hi"}]}`},
+		{name: "compaction input item", payload: `{"model":"gpt-6","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
+		{name: "opaque reasoning ID", payload: `{"model":"gpt-6","input":[{"type":"reasoning","id":"CzDhIBSZ31VSyW6rYILnFerwKDkArecaC","encrypted_content":"synthetic-enc"},{"role":"user","content":"hi"}]}`},
+		{name: "encrypted reasoning input item", payload: `{"model":"gpt-6","input":[{"type":"reasoning","id":"rs_1","encrypted_content":"enc"},{"role":"user","content":"hi"}]}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			// The model routes to Chat Completions, so a Responses-shaped payload forces
 			// cross-format translation, which cannot be trusted to preserve Responses opaque
 			// continuation state.
-			storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
+			storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})
 			_, failure := service.prepareInference(contract.ExecutorRequest{
-				AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+				AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 				Payload: []byte(test.payload), StorageJSON: mustJSON(t, storage),
 			}, false)
 			if failure == nil || failure.code != "format_mismatch" {
@@ -1653,10 +1653,10 @@ func TestPrepareInferenceAllowsNativeResponsesStatefulMarkers(t *testing.T) {
 	service := newService(nil)
 	now := time.Unix(152_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse})
-	payload := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`)
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse})
+	payload := []byte(`{"model":"gpt-6","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, StorageJSON: mustJSON(t, storage),
 	}, false)
 	if failure != nil {
@@ -1761,14 +1761,14 @@ func TestPrepareInferenceLegacyResponsesWithoutFamilyDoesNotEnableCompaction(t *
 	now := time.Unix(154_000, 0).UTC()
 	service.now = func() time.Time { return now }
 	var legacyModel storedModel
-	if errUnmarshal := json.Unmarshal([]byte(`{"id":"gpt-5.2","format":"openai-response"}`), &legacyModel); errUnmarshal != nil {
+	if errUnmarshal := json.Unmarshal([]byte(`{"id":"gpt-6","format":"openai-response"}`), &legacyModel); errUnmarshal != nil {
 		t.Fatal(errUnmarshal)
 	}
 	storage := executorStorage(now)
 	storage.Models = []storedModel{legacyModel}
-	payload := []byte(`{"model":"gpt-5.2","input":[{"role":"user","content":"hi"}]}`)
+	payload := []byte(`{"model":"gpt-6","input":[{"role":"user","content":"hi"}]}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.2", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, StorageJSON: mustJSON(t, storage),
 	}, false)
 	if failure != nil {
@@ -1782,9 +1782,9 @@ func TestPrepareInferenceLegacyResponsesWithoutFamilyDoesNotEnableCompaction(t *
 		t.Fatalf("legacy route without family unexpectedly enabled compaction: %#v", body["context_management"])
 	}
 
-	callerPayload := []byte(`{"model":"gpt-5.2","context_management":[{"type":"compaction","compact_threshold":42}],"input":[]}`)
+	callerPayload := []byte(`{"model":"gpt-6","context_management":[{"type":"compaction","compact_threshold":42}],"input":[]}`)
 	prepared, failure = service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.2", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: callerPayload, StorageJSON: mustJSON(t, storage),
 	}, false)
 	if failure != nil {
@@ -1969,10 +1969,10 @@ func TestPreparedInferenceLogFieldsIncludeResponsesDiagnostics(t *testing.T) {
 	service.config.EnableResponsesContextManagement = true
 	now := time.Unix(200_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-5.4", Format: formatOpenAIResponse, Family: "gpt-5.4", MaxPromptTokens: 200_000})
-	payload := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`)
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAIResponse, Family: "gpt-6", MaxPromptTokens: 200_000})
+	payload := []byte(`{"model":"gpt-6","previous_response_id":"resp_1","input":[{"role":"user","content":"hi"}]}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-5.4", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAIResponse, SourceFormat: formatOpenAIResponse,
 		Payload: payload, OriginalRequest: payload, StorageJSON: mustJSON(t, storage),
 	}, false)
 	if failure != nil {
@@ -1994,10 +1994,10 @@ func TestPreparedInferenceLogFieldsOmitResponsesDiagnosticsForOtherFormats(t *te
 	service := newService(nil)
 	now := time.Unix(201_000, 0).UTC()
 	service.now = func() time.Time { return now }
-	storage := executorStorage(now, storedModel{ID: "gpt-4.1", Format: formatOpenAI})
-	payload := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}`)
+	storage := executorStorage(now, storedModel{ID: "gpt-6", Format: formatOpenAI})
+	payload := []byte(`{"model":"gpt-6","messages":[{"role":"user","content":"hi"}]}`)
 	prepared, failure := service.prepareInference(contract.ExecutorRequest{
-		AuthID: "auth", Model: "gpt-4.1", Format: formatOpenAI, SourceFormat: formatOpenAI,
+		AuthID: "auth", Model: "gpt-6", Format: formatOpenAI, SourceFormat: formatOpenAI,
 		Payload: payload, OriginalRequest: payload, StorageJSON: mustJSON(t, storage),
 	}, false)
 	if failure != nil {
@@ -2012,7 +2012,7 @@ func TestPreparedInferenceLogFieldsOmitResponsesDiagnosticsForOtherFormats(t *te
 	}
 }
 
-// VS Code 1.139.1 replays Responses-origin reasoning even without an rs prefix.
+// VS Code 1.141.0 replays Responses-origin reasoning even without an rs prefix.
 // This proxy already knows the native wire format; it must not infer origin from IDs
 // or interpret the encrypted payload as a foreign thinking signature.
 func TestPrepareInferencePreservesNativeResponsesOpaqueReasoning(t *testing.T) {

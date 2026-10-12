@@ -20,6 +20,8 @@
 
 `GET /v1/models` 来自当前 Copilot 账号的模型目录。Copilot 提供的 Claude、GPT、Gemini、Grok 等模型仍可用；保留模型名、协议转换及签名验证不代表开放相应厂商的独立登录或服务。
 
+模型目录还会执行本服务的版本门槛：Claude 仅接受 5.1 及以上，且模型 ID 中的版本分隔符使用 `-`（例如 `claude-fable-5-5`，不是 `claude-fable-5.5`）；GPT 仅接受 6 及以上。版本门槛不替代账户 `/models` 的 endpoint 和能力声明。
+
 ## 部署
 
 从发布产物选择对应平台的 `copilot-proxy` 二进制：
@@ -213,9 +215,9 @@ UUID，也兼容旧式 `user_…_account_…_session_<UUID>`。Responses 请求�
 
 ## 协议边界
 
-- HTTP 兼容基线为 VS Code `1.139.1` / Copilot Chat `0.67.0`，模型和能力仍由当前账户 `/models` 决定。
+- HTTP 兼容基线为 VS Code `1.141.0` / Copilot Chat `0.69.0`，模型和能力仍由当前账户 `/models` 决定。
 - 跨协议转换使用当前模型的输出 token 上限和 thinking 能力；超出上限的 `max_tokens`/`max_output_tokens` 会裁剪，reasoning effort 会按模型声明的级别映射或降级。
-- 流式和非流式请求均支持；Responses 必须出现真实终态，不会把 EOF 伪造成成功。JSON/SSE 响应保留上游 `X-Copilot-Service-Request-Id`，便于关联故障请求。
+- 流式和非流式请求均支持；Responses 必须出现真实终态，不会把 EOF 伪造成成功。JSON/SSE 响应保留上游 `X-Copilot-Service-Request-Id` 和 `X-GitHub-Copilot-Request-Te`，便于关联故障请求。
 - 会话历史、Responses continuation 和 compaction 重放由客户端负责。原生 Responses 保留包括非 `rs` 前缀 ID 在内的加密推理状态；无法安全转换的 opaque state 仍拒绝跨协议转换。
 - 不提供独立 `/v1/responses/compact` 或 token counting。
 - Copilot 原生 Web Search 的专用分流和原有请求头、同源、规范路径及 token 校验继续保留。

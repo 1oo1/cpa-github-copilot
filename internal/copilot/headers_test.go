@@ -92,10 +92,10 @@ func TestInferenceHeadersProtectCanonicalIdentity(t *testing.T) {
 	}
 }
 
-func TestInferenceHeadersUseVSCode1139Identity(t *testing.T) {
+func TestInferenceHeadersUseVSCode1141Identity(t *testing.T) {
 	headers := inferenceHeaders("session", formatOpenAI, []byte(`{}`), nil)
-	if headers.Get("User-Agent") != "GitHubCopilotChat/0.67.0" || headers.Get("Editor-Version") != "vscode/1.139.1" ||
-		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.67.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
+	if headers.Get("User-Agent") != "GitHubCopilotChat/0.69.0" || headers.Get("Editor-Version") != "vscode/1.141.0" ||
+		headers.Get("Editor-Plugin-Version") != "copilot-chat/0.69.0" || headers.Get("Copilot-Integration-Id") != "vscode-chat" ||
 		headers.Get("X-GitHub-Api-Version") != "2026-08-01" {
 		t.Fatalf("identity headers = %#v", headers)
 	}
@@ -237,28 +237,39 @@ func TestAnthropicBetaHeaderIsSourceProven(t *testing.T) {
 	}
 }
 
-// Copilot Chat 0.67 reads this response-only correlation ID case-insensitively.
-func TestCloneResponseHeadersPreservesCopilotServiceRequestID(t *testing.T) {
-	for _, name := range []string{"x-copilot-service-request-id", "X-Copilot-Service-Request-Id", "X-COPILOT-SERVICE-REQUEST-ID"} {
+// Copilot Chat 0.69 reads these response-only correlation IDs case-insensitively.
+func TestCloneResponseHeadersPreservesCopilotCorrelationIDs(t *testing.T) {
+	for _, header := range []struct {
+		inputName string
+		canonical string
+		value     string
+	}{
+		{inputName: "x-copilot-service-request-id", canonical: "X-Copilot-Service-Request-Id", value: "synthetic-service-request"},
+		{inputName: "X-Copilot-Service-Request-Id", canonical: "X-Copilot-Service-Request-Id", value: "synthetic-service-request"},
+		{inputName: "X-COPILOT-SERVICE-REQUEST-ID", canonical: "X-Copilot-Service-Request-Id", value: "synthetic-service-request"},
+		{inputName: "x-github-copilot-request-te", canonical: "X-GitHub-Copilot-Request-Te", value: " TRUE "},
+		{inputName: "X-GitHub-Copilot-Request-Te", canonical: "X-GitHub-Copilot-Request-Te", value: " TRUE "},
+		{inputName: "X-GITHUB-COPILOT-REQUEST-TE", canonical: "X-GitHub-Copilot-Request-Te", value: " TRUE "},
+	} {
 		for _, contentType := range []string{"application/json", "text/event-stream"} {
-			t.Run(name+"/"+contentType, func(t *testing.T) {
+			t.Run(header.inputName+"/"+contentType, func(t *testing.T) {
 				input := http.Header{
-					name:                  {"synthetic-service-request"},
+					header.inputName:      {header.value},
 					"X-GitHub-Request-Id": {"synthetic-github-request"},
 					"Authorization":       {"Bearer synthetic-secret"},
 					"Set-Cookie":          {"synthetic-cookie"},
 					"X-Unknown":           {"not-allowed"},
 				}
 				out := cloneResponseHeaders(input, contentType)
-				if out.Get("X-Copilot-Service-Request-Id") != "synthetic-service-request" ||
+				if out.Get(header.canonical) != header.value ||
 					out.Get("X-GitHub-Request-Id") != "synthetic-github-request" || out.Get("Content-Type") != contentType {
 					t.Fatalf("response correlation headers were not preserved: %#v", out)
 				}
 				if len(out) != 3 {
 					t.Fatalf("unexpected response headers: %#v", out)
 				}
-				out.Set("X-Copilot-Service-Request-Id", "changed")
-				if input[name][0] != "synthetic-service-request" {
+				out.Set(header.canonical, "changed")
+				if input[header.inputName][0] != header.value {
 					t.Fatal("response headers share mutable state")
 				}
 			})
@@ -266,13 +277,14 @@ func TestCloneResponseHeadersPreservesCopilotServiceRequestID(t *testing.T) {
 	}
 }
 
-func TestInferenceDoesNotReplayCopilotServiceRequestID(t *testing.T) {
+func TestInferenceDoesNotReplayCopilotResponseCorrelationIDs(t *testing.T) {
 	for _, format := range []string{formatOpenAI, formatOpenAIResponse, formatClaude} {
 		headers := inferenceHeaders("synthetic-session", format, []byte(`{}`), http.Header{
 			"X-Copilot-Service-Request-Id": {"caller-supplied"},
+			"X-GitHub-Copilot-Request-Te":  {"caller-supplied"},
 		})
-		if headers.Get("X-Copilot-Service-Request-Id") != "" {
-			t.Fatal("response-only service request ID was forwarded upstream")
+		if headers.Get("X-Copilot-Service-Request-Id") != "" || headers.Get("X-GitHub-Copilot-Request-Te") != "" {
+			t.Fatal("response-only correlation ID was forwarded upstream")
 		}
 	}
 }
